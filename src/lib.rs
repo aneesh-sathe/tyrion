@@ -1,3 +1,4 @@
+mod artifact;
 mod client;
 mod daemon;
 mod domain;

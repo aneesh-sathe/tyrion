@@ -372,7 +372,7 @@ impl Store {
                 result_id,
                 attempt_id,
                 candidate.output,
-                candidate.artifact_revision,
+                candidate.artifact_revision.as_str(),
                 ResultStatus::Candidate.as_str(),
                 result_created_at,
             ],
@@ -394,14 +394,18 @@ impl Store {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let artifact_revision_is_current = candidate
+            .artifact_revision
+            .matches_content(&candidate.output);
         let mut every_criterion_passed = true;
         for (criterion_id, expected) in criteria {
-            let verification = verification::exact_match(
-                &expected,
-                &candidate.output,
-                &candidate.artifact_revision,
-            );
-            every_criterion_passed &= verification.outcome == EvidenceOutcome::Passed;
+            let verification = verification::exact_match(&expected, &candidate.output);
+            let evidence_outcome = if artifact_revision_is_current {
+                verification.outcome
+            } else {
+                EvidenceOutcome::Failed
+            };
+            every_criterion_passed &= evidence_outcome == EvidenceOutcome::Passed;
             let evidence_id = Uuid::new_v4().to_string();
             transaction.execute(
                 "INSERT INTO evidence (
@@ -414,8 +418,8 @@ impl Store {
                     criterion_id,
                     result_id,
                     ready.mandate_revision,
-                    candidate.artifact_revision,
-                    verification.outcome.as_str(),
+                    candidate.artifact_revision.as_str(),
+                    evidence_outcome.as_str(),
                     verification.observed,
                     expected,
                     unix_timestamp()?,
@@ -426,7 +430,7 @@ impl Store {
                 params![
                     commission_id,
                     criterion_id,
-                    verification.outcome.criterion_status().as_str()
+                    evidence_outcome.criterion_status().as_str()
                 ],
             )?;
             record_event(
@@ -465,7 +469,7 @@ impl Store {
                     CommissionStatus::VerifiedComplete.as_str(),
                     completion_revision,
                     completed_at,
-                    candidate.artifact_revision,
+                    candidate.artifact_revision.as_str(),
                 ],
             )?;
             transaction.execute(
@@ -474,7 +478,7 @@ impl Store {
                 params![
                     commission_id,
                     format!("Verified Complete: {}", ready.goal),
-                    candidate.artifact_revision,
+                    candidate.artifact_revision.as_str(),
                     completed_at,
                 ],
             )?;

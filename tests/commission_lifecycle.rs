@@ -145,32 +145,40 @@ fn proposal() -> Value {
     })
 }
 
-#[test]
-fn proposal_is_reviewable_inert_and_durable_across_restart() {
-    let temp = TempDir::new().expect("temporary directory should be created");
-    let proposal_path = temp.path().join("proposal.json");
+fn write_proposal(path: &Path, proposal: &Value) {
     fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
+        path,
+        serde_json::to_vec_pretty(proposal).expect("proposal should serialize"),
     )
     .expect("proposal fixture should be written");
+}
 
-    let daemon = RunningDaemon::start(temp.path());
+fn create_proposal(daemon: &RunningDaemon, proposal_path: &Path, idempotency_key: &str) -> String {
     let created = run_cli(
         &daemon.socket_path,
         &[
             "proposal",
             "create",
             "--file",
-            path_text(&proposal_path),
+            path_text(proposal_path),
             "--idempotency-key",
-            "proposal-create-1",
+            idempotency_key,
         ],
     );
-    let commission_id = created["commission"]["id"]
+    created["commission"]["id"]
         .as_str()
         .expect("proposal should have an id")
-        .to_owned();
+        .to_owned()
+}
+
+#[test]
+fn proposal_is_reviewable_inert_and_durable_across_restart() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let proposal_path = temp.path().join("proposal.json");
+    write_proposal(&proposal_path, &proposal());
+
+    let daemon = RunningDaemon::start(temp.path());
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-1");
 
     let before_restart = run_cli(
         &daemon.socket_path,
@@ -210,34 +218,17 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
             "verifier": {"kind": "exact_match", "expected": "return a deterministic greeting"}
         }
     ]);
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&accepted_proposal).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &accepted_proposal);
 
     let daemon = RunningDaemon::start(temp.path());
-    let created = run_cli(
-        &daemon.socket_path,
-        &[
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "proposal-create-completing",
-        ],
-    );
-    let commission_id = created["commission"]["id"]
-        .as_str()
-        .expect("proposal should have an id");
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-completing");
 
     let accepted = run_cli(
         &daemon.socket_path,
         &[
             "commission",
             "accept",
-            commission_id,
+            &commission_id,
             "--expected-revision",
             "0",
             "--idempotency-key",
@@ -256,7 +247,7 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
 
     let completed = run_cli(
         &daemon.socket_path,
-        &["commission", "inspect", commission_id],
+        &["commission", "inspect", &commission_id],
     );
     assert_eq!(completed["commission"]["status"], "verified_complete");
     assert_eq!(completed["commission"]["revision"], 2);
@@ -324,33 +315,16 @@ fn failed_evidence_cannot_establish_completion() {
     let proposal_path = temp.path().join("proposal.json");
     let mut failing_proposal = proposal();
     failing_proposal["criteria"][0]["verifier"]["expected"] = json!("a different worker result");
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&failing_proposal).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &failing_proposal);
 
     let daemon = RunningDaemon::start(temp.path());
-    let created = run_cli(
-        &daemon.socket_path,
-        &[
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "proposal-create-failing",
-        ],
-    );
-    let commission_id = created["commission"]["id"]
-        .as_str()
-        .expect("proposal should have an id");
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-failing");
     let accepted = run_cli(
         &daemon.socket_path,
         &[
             "commission",
             "accept",
-            commission_id,
+            &commission_id,
             "--expected-revision",
             "0",
             "--idempotency-key",
@@ -361,7 +335,7 @@ fn failed_evidence_cannot_establish_completion() {
     assert_eq!(accepted["assignments"][0]["status"], "ready");
     let inspected = run_cli(
         &daemon.socket_path,
-        &["commission", "inspect", commission_id],
+        &["commission", "inspect", &commission_id],
     );
     assert_eq!(inspected["commission"]["status"], "active");
     assert_eq!(inspected["commission"]["revision"], 1);
@@ -378,33 +352,16 @@ fn failed_evidence_cannot_establish_completion() {
 fn forged_worker_artifact_revision_cannot_establish_completion() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let proposal_path = temp.path().join("proposal.json");
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &proposal());
 
     let daemon = RunningDaemon::start_with_corrupted_artifact_revision(temp.path());
-    let created = run_cli(
-        &daemon.socket_path,
-        &[
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "proposal-create-forged-artifact",
-        ],
-    );
-    let commission_id = created["commission"]["id"]
-        .as_str()
-        .expect("proposal should have an id");
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-forged-artifact");
     let accepted = run_cli(
         &daemon.socket_path,
         &[
             "commission",
             "accept",
-            commission_id,
+            &commission_id,
             "--expected-revision",
             "0",
             "--idempotency-key",
@@ -415,7 +372,7 @@ fn forged_worker_artifact_revision_cannot_establish_completion() {
     assert_eq!(accepted["assignments"][0]["status"], "ready");
     let inspected = run_cli(
         &daemon.socket_path,
-        &["commission", "inspect", commission_id],
+        &["commission", "inspect", &commission_id],
     );
     assert_eq!(inspected["commission"]["status"], "active");
     assert_eq!(inspected["assignments"][0]["status"], "verification_failed");
@@ -428,28 +385,10 @@ fn forged_worker_artifact_revision_cannot_establish_completion() {
 fn mutation_replay_is_durable_and_stale_revision_is_rejected() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let proposal_path = temp.path().join("proposal.json");
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &proposal());
 
     let daemon = RunningDaemon::start(temp.path());
-    let created = run_cli(
-        &daemon.socket_path,
-        &[
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "proposal-create-replay",
-        ],
-    );
-    let commission_id = created["commission"]["id"]
-        .as_str()
-        .expect("proposal should have an id")
-        .to_owned();
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-replay");
     let first_acceptance = run_cli(
         &daemon.socket_path,
         &[
@@ -515,11 +454,7 @@ fn proposal_rejects_a_result_that_cannot_fit_its_storage_ceiling() {
     let proposal_path = temp.path().join("proposal.json");
     let mut undersized = proposal();
     undersized["resource_ceilings"]["max_storage_bytes"] = json!(1);
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&undersized).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &undersized);
     let daemon = RunningDaemon::start(temp.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
@@ -549,28 +484,10 @@ fn proposal_rejects_a_result_that_cannot_fit_its_storage_ceiling() {
 fn restart_resumes_a_durably_ready_assignment() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let proposal_path = temp.path().join("proposal.json");
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &proposal());
 
     let daemon = RunningDaemon::start_with_deferred_dispatch(temp.path());
-    let created = run_cli(
-        &daemon.socket_path,
-        &[
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "proposal-create-recovery",
-        ],
-    );
-    let commission_id = created["commission"]["id"]
-        .as_str()
-        .expect("proposal should have an id")
-        .to_owned();
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-recovery");
     let accepted = run_cli(
         &daemon.socket_path,
         &[
@@ -605,28 +522,10 @@ fn expired_ceiling_blocks_only_its_assignment_after_restart() {
     let proposal_path = temp.path().join("expiring-proposal.json");
     let mut expiring = proposal();
     expiring["resource_ceilings"]["max_elapsed_seconds"] = json!(1);
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&expiring).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&proposal_path, &expiring);
 
     let daemon = RunningDaemon::start_with_deferred_dispatch(temp.path());
-    let created = run_cli(
-        &daemon.socket_path,
-        &[
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "proposal-create-expiring",
-        ],
-    );
-    let commission_id = created["commission"]["id"]
-        .as_str()
-        .expect("proposal should have an id")
-        .to_owned();
+    let commission_id = create_proposal(&daemon, &proposal_path, "proposal-create-expiring");
     run_cli(
         &daemon.socket_path,
         &[
@@ -657,11 +556,7 @@ fn expired_ceiling_blocks_only_its_assignment_after_restart() {
         .contains("new Commission"));
 
     let healthy_path = temp.path().join("healthy-proposal.json");
-    fs::write(
-        &healthy_path,
-        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
-    )
-    .expect("proposal fixture should be written");
+    write_proposal(&healthy_path, &proposal());
     let healthy = run_cli(
         &restarted.socket_path,
         &[

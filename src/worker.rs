@@ -1,10 +1,10 @@
-use sha2::{Digest, Sha256};
+use crate::artifact::ArtifactRevision;
 
 pub const ACTION: &str = "deterministic.echo";
 
 pub struct CandidateResult {
     pub output: String,
-    pub artifact_revision: String,
+    pub artifact_revision: ArtifactRevision,
 }
 
 pub(crate) trait Worker {
@@ -21,7 +21,7 @@ impl Worker for DeterministicLocalWorker {
 
     fn execute(&self, goal: &str) -> CandidateResult {
         let output = goal.to_owned();
-        let artifact_revision = format!("sha256:{:x}", Sha256::digest(output.as_bytes()));
+        let artifact_revision = ArtifactRevision::for_content(&output);
         CandidateResult {
             output,
             artifact_revision,
@@ -38,7 +38,7 @@ impl Worker for CorruptArtifactRevisionWorker {
 
     fn execute(&self, goal: &str) -> CandidateResult {
         let mut candidate = DeterministicLocalWorker.execute(goal);
-        candidate.artifact_revision = "sha256:forged".to_owned();
+        candidate.artifact_revision = ArtifactRevision::from_claim("sha256:forged");
         candidate
     }
 }
