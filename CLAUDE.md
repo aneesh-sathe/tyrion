@@ -15,3 +15,4 @@
 - A stale socket remains after forced test shutdown. Startup may replace a socket file only after acquiring data-directory ownership and must refuse to replace any non-socket path.
 - Daemon startup resumes durable ready Assignments. Recovery of Attempts that were already running when the process stopped belongs to the later failure-recovery slice.
 - Keep lifecycle transactions in `store.rs`, read projections in `store/projection.rs`, and schema invariants in `store/schema.rs`.
+- After completing each tracker ticket, commit and push the current branch to `origin` before handoff.
