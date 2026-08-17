@@ -15,6 +15,19 @@ use crate::TyrionError;
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 
 pub fn run_daemon(data_dir: &Path, socket_path: &Path) -> Result<(), TyrionError> {
+    run_daemon_with_options(data_dir, socket_path, DaemonOptions::default())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DaemonOptions {
+    pub defer_ready_dispatch: bool,
+}
+
+pub fn run_daemon_with_options(
+    data_dir: &Path,
+    socket_path: &Path,
+    options: DaemonOptions,
+) -> Result<(), TyrionError> {
     fs::create_dir_all(data_dir)?;
     fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))?;
     let _ownership = acquire_ownership(data_dir)?;
@@ -22,12 +35,22 @@ pub fn run_daemon(data_dir: &Path, socket_path: &Path) -> Result<(), TyrionError
     let listener = UnixListener::bind(socket_path)?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     let mut store = Store::open(&data_dir.join("state.sqlite3"))?;
+    if !options.defer_ready_dispatch {
+        resume_ready_assignments(&mut store)?;
+    }
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => serve_connection(stream, &mut store),
+            Ok(stream) => serve_connection(stream, &mut store, options),
             Err(error) => eprintln!("failed to accept local connection: {error}"),
         }
+    }
+    Ok(())
+}
+
+fn resume_ready_assignments(store: &mut Store) -> Result<(), TyrionError> {
+    for commission_id in store.ready_commission_ids()? {
+        store.run_ready_assignment(&commission_id)?;
     }
     Ok(())
 }
@@ -73,7 +96,7 @@ fn prepare_socket(socket_path: &Path) -> Result<(), TyrionError> {
     Ok(())
 }
 
-fn serve_connection(mut stream: UnixStream, store: &mut Store) {
+fn serve_connection(mut stream: UnixStream, store: &mut Store, options: DaemonOptions) {
     let outcome = read_request(&stream).and_then(|request| dispatch(store, &request));
     let (response, follow_up) = match outcome {
         Ok(outcome) => (Response::success(outcome.data), outcome.follow_up),
@@ -91,7 +114,10 @@ fn serve_connection(mut stream: UnixStream, store: &mut Store) {
     }
     drop(stream);
 
-    if let Some(FollowUp::RunReadyAssignment(commission_id)) = follow_up {
+    if !options.defer_ready_dispatch {
+        let Some(FollowUp::RunReadyAssignment(commission_id)) = follow_up else {
+            return;
+        };
         if let Err(error) = store.run_ready_assignment(&commission_id) {
             eprintln!("failed to run ready Assignment for Commission {commission_id}: {error}");
         }

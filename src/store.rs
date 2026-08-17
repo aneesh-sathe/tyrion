@@ -103,6 +103,14 @@ impl Store {
         inspect_commission(&self.connection, commission_id)
     }
 
+    pub fn ready_commission_ids(&self) -> Result<Vec<String>, TyrionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT commission_id FROM assignments WHERE status = ?1 ORDER BY commission_id",
+        )?;
+        let rows = statement.query_map([AssignmentStatus::Ready.as_str()], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn accept_commission(
         &mut self,
         request: &Request,
@@ -278,12 +286,7 @@ impl Store {
                 "the max_elapsed_seconds resource ceiling is exhausted".into(),
             ));
         }
-        if goal.len() as u64 > max_storage_bytes {
-            return Err(TyrionError::InvalidRequest(format!(
-                "max_storage_bytes is {max_storage_bytes}, but the deterministic Result requires {} bytes",
-                goal.len()
-            )));
-        }
+        ensure_result_fits_storage_ceiling(&goal, max_storage_bytes)?;
 
         let attempt_id = Uuid::new_v4().to_string();
         transaction.execute(
@@ -472,13 +475,10 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
             "attempt, elapsed-time, concurrency, and storage ceilings must be positive".into(),
         ));
     }
-    if proposal.goal.len() as u64 > proposal.resource_ceilings.max_storage_bytes {
-        return Err(TyrionError::InvalidRequest(format!(
-            "max_storage_bytes is {}, but the deterministic Result requires {} bytes",
-            proposal.resource_ceilings.max_storage_bytes,
-            proposal.goal.len()
-        )));
-    }
+    ensure_result_fits_storage_ceiling(
+        &proposal.goal,
+        proposal.resource_ceilings.max_storage_bytes,
+    )?;
     let sqlite_integer_max = i64::MAX as u64;
     if proposal.resource_ceilings.max_elapsed_seconds > sqlite_integer_max
         || proposal.resource_ceilings.max_storage_bytes > sqlite_integer_max
@@ -488,6 +488,19 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
         return Err(TyrionError::InvalidRequest(
             "resource ceilings must fit in a signed 64-bit integer".into(),
         ));
+    }
+    Ok(())
+}
+
+fn ensure_result_fits_storage_ceiling(
+    goal: &str,
+    max_storage_bytes: u64,
+) -> Result<(), TyrionError> {
+    if goal.len() as u64 > max_storage_bytes {
+        return Err(TyrionError::InvalidRequest(format!(
+            "max_storage_bytes is {max_storage_bytes}, but the deterministic Result requires {} bytes",
+            goal.len()
+        )));
     }
     Ok(())
 }

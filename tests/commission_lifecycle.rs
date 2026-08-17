@@ -18,16 +18,25 @@ struct RunningDaemon {
 
 impl RunningDaemon {
     fn start(data_dir: &Path) -> Self {
+        Self::start_with_arguments(data_dir, &[])
+    }
+
+    fn start_with_deferred_dispatch(data_dir: &Path) -> Self {
+        Self::start_with_arguments(data_dir, &["--fault-defer-ready-dispatch"])
+    }
+
+    fn start_with_arguments(data_dir: &Path, extra_arguments: &[&str]) -> Self {
         let socket_path = data_dir.join("tyrion.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_tyriond"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tyriond"));
+        command
             .args([
                 "--data-dir",
                 path_text(data_dir),
                 "--socket",
                 path_text(&socket_path),
             ])
-            .spawn()
-            .expect("daemon should start");
+            .args(extra_arguments);
+        let child = command.spawn().expect("daemon should start");
         let mut daemon = Self { child, socket_path };
         daemon.wait_until_ready();
         daemon
@@ -480,6 +489,60 @@ fn proposal_rejects_a_result_that_cannot_fit_its_storage_ceiling() {
         .as_str()
         .unwrap()
         .contains("max_storage_bytes"));
+}
+
+#[test]
+fn restart_resumes_a_durably_ready_assignment() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let proposal_path = temp.path().join("proposal.json");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
+    )
+    .expect("proposal fixture should be written");
+
+    let daemon = RunningDaemon::start_with_deferred_dispatch(temp.path());
+    let created = run_cli(
+        &daemon.socket_path,
+        &[
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "proposal-create-recovery",
+        ],
+    );
+    let commission_id = created["commission"]["id"]
+        .as_str()
+        .expect("proposal should have an id")
+        .to_owned();
+    let accepted = run_cli(
+        &daemon.socket_path,
+        &[
+            "commission",
+            "accept",
+            &commission_id,
+            "--expected-revision",
+            "0",
+            "--idempotency-key",
+            "commission-accept-recovery",
+        ],
+    );
+    assert_eq!(accepted["assignments"][0]["status"], "ready");
+    assert_eq!(accepted["attempts"], json!([]));
+
+    daemon.stop();
+    let restarted = RunningDaemon::start(temp.path());
+    let recovered = run_cli(
+        &restarted.socket_path,
+        &["commission", "inspect", &commission_id],
+    );
+
+    assert_eq!(recovered["commission"]["status"], "verified_complete");
+    assert_eq!(recovered["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered["results"][0]["status"], "accepted");
+    assert_eq!(recovered["evidence"][0]["outcome"], "passed");
 }
 
 #[test]

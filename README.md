@@ -81,7 +81,7 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --idempotency-key accept-1
 ```
 
-Acceptance returns the durably committed active Commission and its ready Assignment. The daemon dispatches only after returning that response. Inspect the Commission again to read its candidate Result, Evidence, and terminal briefing.
+Acceptance returns the durably committed active Commission and its ready Assignment. The daemon closes the response path before dispatch and resumes any still-ready Assignment on restart. Inspect the Commission again to read its candidate Result, Evidence, and terminal briefing.
 
 Reusing an idempotency key with the identical mutation returns its original response. A new mutation against an obsolete revision fails with a structured `stale_revision` error.
 
