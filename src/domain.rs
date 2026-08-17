@@ -1,0 +1,129 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommissionStatus {
+    Proposed,
+    Active,
+    VerifiedComplete,
+}
+
+impl CommissionStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Active => "active",
+            Self::VerifiedComplete => "verified_complete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CriterionStatus {
+    Pending,
+    Passed,
+    Failed,
+}
+
+impl CriterionStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AssignmentStatus {
+    Ready,
+    Running,
+    Accepted,
+    VerificationFailed,
+}
+
+impl AssignmentStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Accepted => "accepted",
+            Self::VerificationFailed => "verification_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttemptStatus {
+    Running,
+    Succeeded,
+}
+
+impl AttemptStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResultStatus {
+    Candidate,
+    Accepted,
+}
+
+impl ResultStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EvidenceOutcome {
+    Passed,
+    Failed,
+}
+
+impl EvidenceOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) const fn criterion_status(self) -> CriterionStatus {
+        match self {
+            Self::Passed => CriterionStatus::Passed,
+            Self::Failed => CriterionStatus::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EventKind {
+    CommissionProposed,
+    CommissionAccepted,
+    AssignmentReady,
+    AttemptStarted,
+    ResultSubmitted,
+    EvidenceRecorded,
+    CommissionVerifiedComplete,
+}
+
+impl EventKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CommissionProposed => "commission_proposed",
+            Self::CommissionAccepted => "commission_accepted",
+            Self::AssignmentReady => "assignment_ready",
+            Self::AttemptStarted => "attempt_started",
+            Self::ResultSubmitted => "result_submitted",
+            Self::EvidenceRecorded => "evidence_recorded",
+            Self::CommissionVerifiedComplete => "commission_verified_complete",
+        }
+    }
+}

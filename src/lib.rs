@@ -1,5 +1,6 @@
 mod client;
 mod daemon;
+mod domain;
 mod error;
 pub mod protocol;
 mod store;

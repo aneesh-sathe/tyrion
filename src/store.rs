@@ -3,13 +3,22 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::domain::{
+    AssignmentStatus, AttemptStatus, CommissionStatus, CriterionStatus, EventKind, EvidenceOutcome,
+    ResultStatus,
+};
 use crate::protocol::{CommissionProposal, Request, ResourceCeilings, Verifier};
 use crate::TyrionError;
 use crate::{verification, worker};
+
+mod projection;
+mod schema;
+
+use projection::inspect_commission;
 
 pub struct Store {
     connection: Connection,
@@ -21,7 +30,7 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(schema::SCHEMA)?;
         Ok(Self { connection })
     }
 
@@ -41,8 +50,13 @@ impl Store {
 
         let commission_id = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO commissions (id, goal, status, revision, created_at) VALUES (?1, ?2, 'proposed', 0, ?3)",
-            params![commission_id, proposal.goal, unix_timestamp()?],
+            "INSERT INTO commissions (id, goal, status, revision, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
+            params![
+                commission_id,
+                proposal.goal,
+                CommissionStatus::Proposed.as_str(),
+                unix_timestamp()?
+            ],
         )?;
 
         for (position, criterion) in proposal.criteria.iter().enumerate() {
@@ -51,7 +65,7 @@ impl Store {
             };
             transaction.execute(
                 "INSERT INTO criteria (commission_id, criterion_id, position, description, verifier_kind, expected, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     commission_id,
                     criterion.id,
@@ -59,6 +73,7 @@ impl Store {
                     criterion.description,
                     verifier_kind,
                     expected,
+                    CriterionStatus::Pending.as_str(),
                 ],
             )?;
         }
@@ -71,7 +86,12 @@ impl Store {
                 params![commission_id, position as i64, uncertainty],
             )?;
         }
-        record_event(&transaction, &commission_id, "commission_proposed", 0)?;
+        record_event(
+            &transaction,
+            &commission_id,
+            EventKind::CommissionProposed,
+            0,
+        )?;
 
         let result = inspect_commission(&transaction, &commission_id)?;
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
@@ -101,30 +121,24 @@ impl Store {
             return Ok(prior);
         }
 
-        let commission = transaction
+        let (status, current_revision) = transaction
             .query_row(
-                "SELECT goal, status, revision FROM commissions WHERE id = ?1",
+                "SELECT status, revision FROM commissions WHERE id = ?1",
                 [commission_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?
             .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
-        if commission.2 != expected_revision {
+        if current_revision != expected_revision {
             return Err(TyrionError::StaleRevision {
                 expected: expected_revision,
-                actual: commission.2,
+                actual: current_revision,
             });
         }
-        if commission.1 != "proposed" {
+        if status != CommissionStatus::Proposed.as_str() {
             return Err(TyrionError::InvalidRequest(format!(
                 "commission {commission_id} is already {}",
-                commission.1
+                status
             )));
         }
         let may_execute = transaction.query_row(
@@ -142,71 +156,179 @@ impl Store {
         }
 
         let accepted_at = unix_timestamp()?;
-        let mandate_revision = commission.2 + 1;
+        let mandate_revision = current_revision + 1;
         transaction.execute(
-            "UPDATE commissions SET status = 'active', revision = ?2, accepted_at = ?3 WHERE id = ?1",
-            params![commission_id, mandate_revision, accepted_at],
+            "UPDATE commissions SET status = ?2, revision = ?3, accepted_at = ?4 WHERE id = ?1",
+            params![
+                commission_id,
+                CommissionStatus::Active.as_str(),
+                mandate_revision,
+                accepted_at
+            ],
         )?;
         record_event(
             &transaction,
             commission_id,
-            "commission_accepted",
+            EventKind::CommissionAccepted,
             mandate_revision,
         )?;
 
         let assignment_id = Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO assignments (id, commission_id, plan_revision, status, created_at)
-             VALUES (?1, ?2, ?3, 'ready', ?4)",
-            params![assignment_id, commission_id, mandate_revision, accepted_at],
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                assignment_id,
+                commission_id,
+                mandate_revision,
+                AssignmentStatus::Ready.as_str(),
+                accepted_at
+            ],
         )?;
         record_event(
             &transaction,
             commission_id,
-            "assignment_ready",
+            EventKind::AssignmentReady,
             mandate_revision,
         )?;
+
+        let result = inspect_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn run_ready_assignment(&mut self, commission_id: &str) -> Result<(), TyrionError> {
+        let transaction = self.connection.transaction()?;
+        let ready = transaction
+            .query_row(
+                "SELECT assignments.id, commissions.goal, commissions.revision,
+                        commissions.accepted_at, resource_ceilings.max_attempts,
+                        resource_ceilings.max_elapsed_seconds,
+                        resource_ceilings.max_worker_concurrency,
+                        resource_ceilings.max_storage_bytes
+                 FROM assignments
+                 JOIN commissions ON commissions.id = assignments.commission_id
+                 JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
+                 WHERE assignments.commission_id = ?1
+                   AND assignments.status = ?2
+                   AND commissions.status = ?3
+                 ORDER BY assignments.created_at, assignments.id
+                 LIMIT 1",
+                params![
+                    commission_id,
+                    AssignmentStatus::Ready.as_str(),
+                    CommissionStatus::Active.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, u32>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, u32>(6)?,
+                        row.get::<_, u64>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            assignment_id,
+            goal,
+            mandate_revision,
+            accepted_at,
+            max_attempts,
+            max_elapsed_seconds,
+            max_worker_concurrency,
+            max_storage_bytes,
+        )) = ready
+        else {
+            return Ok(());
+        };
+
+        let attempt_count = transaction.query_row(
+            "SELECT COUNT(*) FROM attempts
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             WHERE assignments.commission_id = ?1",
+            [commission_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if attempt_count >= max_attempts {
+            return Err(TyrionError::InvalidRequest(
+                "the max_attempts resource ceiling is exhausted".into(),
+            ));
+        }
+        let running_count = transaction.query_row(
+            "SELECT COUNT(*) FROM attempts
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             WHERE assignments.commission_id = ?1 AND attempts.status = ?2",
+            params![commission_id, AttemptStatus::Running.as_str()],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if running_count >= max_worker_concurrency {
+            return Err(TyrionError::InvalidRequest(
+                "the max_worker_concurrency resource ceiling is exhausted".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        if now.saturating_sub(accepted_at) as u64 >= max_elapsed_seconds {
+            return Err(TyrionError::InvalidRequest(
+                "the max_elapsed_seconds resource ceiling is exhausted".into(),
+            ));
+        }
+        if goal.len() as u64 > max_storage_bytes {
+            return Err(TyrionError::InvalidRequest(format!(
+                "max_storage_bytes is {max_storage_bytes}, but the deterministic Result requires {} bytes",
+                goal.len()
+            )));
+        }
 
         let attempt_id = Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO attempts (id, assignment_id, worker_configuration, status, started_at)
-             VALUES (?1, ?2, ?3, 'running', ?4)",
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 attempt_id,
                 assignment_id,
                 worker::CONFIGURATION,
-                accepted_at
+                AttemptStatus::Running.as_str(),
+                now
             ],
         )?;
         transaction.execute(
-            "UPDATE assignments SET status = 'running' WHERE id = ?1",
-            [&assignment_id],
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![assignment_id, AssignmentStatus::Running.as_str()],
         )?;
         record_event(
             &transaction,
             commission_id,
-            "attempt_started",
+            EventKind::AttemptStarted,
             mandate_revision,
         )?;
+        transaction.commit()?;
 
-        let candidate = worker::execute(&commission.0);
+        let candidate = worker::execute(&goal);
+        let transaction = self.connection.transaction()?;
         let result_id = Uuid::new_v4().to_string();
         let result_created_at = unix_timestamp()?;
         transaction.execute(
             "INSERT INTO results (id, attempt_id, output, artifact_revision, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'candidate', ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 result_id,
                 attempt_id,
                 candidate.output,
                 candidate.artifact_revision,
+                ResultStatus::Candidate.as_str(),
                 result_created_at,
             ],
         )?;
         record_event(
             &transaction,
             commission_id,
-            "result_submitted",
+            EventKind::ResultSubmitted,
             mandate_revision,
         )?;
 
@@ -223,7 +345,7 @@ impl Store {
         let mut every_criterion_passed = true;
         for (criterion_id, expected) in criteria {
             let verification = verification::exact_match(&expected, &candidate.output);
-            every_criterion_passed &= verification.outcome == "passed";
+            every_criterion_passed &= verification.outcome == EvidenceOutcome::Passed;
             let evidence_id = Uuid::new_v4().to_string();
             transaction.execute(
                 "INSERT INTO evidence (
@@ -237,7 +359,7 @@ impl Store {
                     result_id,
                     mandate_revision,
                     candidate.artifact_revision,
-                    verification.outcome,
+                    verification.outcome.as_str(),
                     verification.observed,
                     expected,
                     unix_timestamp()?,
@@ -245,37 +367,46 @@ impl Store {
             )?;
             transaction.execute(
                 "UPDATE criteria SET status = ?3 WHERE commission_id = ?1 AND criterion_id = ?2",
-                params![commission_id, criterion_id, verification.outcome],
+                params![
+                    commission_id,
+                    criterion_id,
+                    verification.outcome.criterion_status().as_str()
+                ],
             )?;
             record_event(
                 &transaction,
                 commission_id,
-                "evidence_recorded",
+                EventKind::EvidenceRecorded,
                 mandate_revision,
             )?;
         }
 
         transaction.execute(
-            "UPDATE attempts SET status = 'succeeded', completed_at = ?2 WHERE id = ?1",
-            params![attempt_id, unix_timestamp()?],
+            "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+            params![
+                attempt_id,
+                AttemptStatus::Succeeded.as_str(),
+                unix_timestamp()?
+            ],
         )?;
         if every_criterion_passed {
             transaction.execute(
-                "UPDATE assignments SET status = 'accepted' WHERE id = ?1",
-                [&assignment_id],
+                "UPDATE assignments SET status = ?2 WHERE id = ?1",
+                params![assignment_id, AssignmentStatus::Accepted.as_str()],
             )?;
             transaction.execute(
-                "UPDATE results SET status = 'accepted' WHERE id = ?1",
-                [&result_id],
+                "UPDATE results SET status = ?2 WHERE id = ?1",
+                params![result_id, ResultStatus::Accepted.as_str()],
             )?;
             let completion_revision = mandate_revision + 1;
             let completed_at = unix_timestamp()?;
             transaction.execute(
                 "UPDATE commissions
-                 SET status = 'verified_complete', revision = ?2, completed_at = ?3, artifact_revision = ?4
+                 SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
                  WHERE id = ?1",
                 params![
                     commission_id,
+                    CommissionStatus::VerifiedComplete.as_str(),
                     completion_revision,
                     completed_at,
                     candidate.artifact_revision,
@@ -286,7 +417,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     commission_id,
-                    format!("Verified Complete: {}", commission.0),
+                    format!("Verified Complete: {goal}"),
                     candidate.artifact_revision,
                     completed_at,
                 ],
@@ -294,20 +425,18 @@ impl Store {
             record_event(
                 &transaction,
                 commission_id,
-                "commission_verified_complete",
+                EventKind::CommissionVerifiedComplete,
                 completion_revision,
             )?;
         } else {
             transaction.execute(
-                "UPDATE assignments SET status = 'verification_failed' WHERE id = ?1",
-                [&assignment_id],
+                "UPDATE assignments SET status = ?2 WHERE id = ?1",
+                params![assignment_id, AssignmentStatus::VerificationFailed.as_str()],
             )?;
         }
 
-        let result = inspect_commission(&transaction, commission_id)?;
-        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
         transaction.commit()?;
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -341,6 +470,23 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     {
         return Err(TyrionError::InvalidRequest(
             "attempt, elapsed-time, concurrency, and storage ceilings must be positive".into(),
+        ));
+    }
+    if proposal.goal.len() as u64 > proposal.resource_ceilings.max_storage_bytes {
+        return Err(TyrionError::InvalidRequest(format!(
+            "max_storage_bytes is {}, but the deterministic Result requires {} bytes",
+            proposal.resource_ceilings.max_storage_bytes,
+            proposal.goal.len()
+        )));
+    }
+    let sqlite_integer_max = i64::MAX as u64;
+    if proposal.resource_ceilings.max_elapsed_seconds > sqlite_integer_max
+        || proposal.resource_ceilings.max_storage_bytes > sqlite_integer_max
+        || proposal.resource_ceilings.max_model_spend_cents > sqlite_integer_max
+        || proposal.resource_ceilings.max_paid_service_spend_cents > sqlite_integer_max
+    {
+        return Err(TyrionError::InvalidRequest(
+            "resource ceilings must fit in a signed 64-bit integer".into(),
         ));
     }
     Ok(())
@@ -444,277 +590,14 @@ fn insert_resource_ceilings(
 fn record_event(
     transaction: &Transaction<'_>,
     commission_id: &str,
-    event_type: &str,
+    event_kind: EventKind,
     revision: i64,
 ) -> Result<(), TyrionError> {
     transaction.execute(
         "INSERT INTO events (commission_id, event_type, commission_revision, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![commission_id, event_type, revision, unix_timestamp()?],
+        params![commission_id, event_kind.as_str(), revision, unix_timestamp()?],
     )?;
     Ok(())
-}
-
-fn inspect_commission(connection: &Connection, commission_id: &str) -> Result<Value, TyrionError> {
-    let commission = connection
-        .query_row(
-            "SELECT id, goal, status, revision, accepted_at, completed_at, artifact_revision
-             FROM commissions WHERE id = ?1",
-            [commission_id],
-            |row| {
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "goal": row.get::<_, String>(1)?,
-                    "status": row.get::<_, String>(2)?,
-                    "revision": row.get::<_, i64>(3)?,
-                    "accepted_at": row.get::<_, Option<i64>>(4)?,
-                    "completed_at": row.get::<_, Option<i64>>(5)?,
-                    "artifact_revision": row.get::<_, Option<String>>(6)?,
-                }))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
-
-    let authority = json!({
-        "repositories": scope_values(connection, commission_id, "repository")?,
-        "paths": scope_values(connection, commission_id, "path")?,
-        "actions": scope_values(connection, commission_id, "action")?,
-        "destinations": scope_values(connection, commission_id, "destination")?,
-        "effects": scope_values(connection, commission_id, "effect")?,
-    });
-    let resource_ceilings = connection.query_row(
-        "SELECT max_attempts, max_elapsed_seconds, max_worker_concurrency, max_storage_bytes,
-                max_model_spend_cents, max_paid_service_spend_cents
-         FROM resource_ceilings WHERE commission_id = ?1",
-        [commission_id],
-        |row| {
-            Ok(json!({
-                "max_attempts": row.get::<_, u32>(0)?,
-                "max_elapsed_seconds": row.get::<_, u64>(1)?,
-                "max_worker_concurrency": row.get::<_, u32>(2)?,
-                "max_storage_bytes": row.get::<_, u64>(3)?,
-                "max_model_spend_cents": row.get::<_, u64>(4)?,
-                "max_paid_service_spend_cents": row.get::<_, u64>(5)?,
-            }))
-        },
-    )?;
-    let criteria = query_values(
-        connection,
-        "SELECT criterion_id, description, verifier_kind, expected, status
-         FROM criteria WHERE commission_id = ?1 ORDER BY position",
-        commission_id,
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "description": row.get::<_, String>(1)?,
-                "verifier": {
-                    "kind": row.get::<_, String>(2)?,
-                    "expected": row.get::<_, String>(3)?,
-                },
-                "status": row.get::<_, String>(4)?,
-            }))
-        },
-    )?;
-    let known_uncertainties = query_values(
-        connection,
-        "SELECT description FROM known_uncertainties WHERE commission_id = ?1 ORDER BY position",
-        commission_id,
-        |row| Ok(Value::String(row.get(0)?)),
-    )?;
-
-    let mut commission = commission;
-    commission["authority"] = authority;
-    commission["resource_ceilings"] = resource_ceilings;
-    commission["known_uncertainties"] = Value::Array(known_uncertainties);
-
-    let assignments = query_values(
-        connection,
-        "SELECT id, plan_revision, status, created_at
-         FROM assignments WHERE commission_id = ?1 ORDER BY created_at, id",
-        commission_id,
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "plan_revision": row.get::<_, i64>(1)?,
-                "status": row.get::<_, String>(2)?,
-                "created_at": row.get::<_, i64>(3)?,
-            }))
-        },
-    )?;
-    let attempts = query_values(
-        connection,
-        "SELECT attempts.id, attempts.assignment_id, attempts.worker_configuration,
-                attempts.status, attempts.started_at, attempts.completed_at
-         FROM attempts
-         JOIN assignments ON assignments.id = attempts.assignment_id
-         WHERE assignments.commission_id = ?1 ORDER BY attempts.started_at, attempts.id",
-        commission_id,
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "assignment_id": row.get::<_, String>(1)?,
-                "worker_configuration": row.get::<_, String>(2)?,
-                "status": row.get::<_, String>(3)?,
-                "started_at": row.get::<_, i64>(4)?,
-                "completed_at": row.get::<_, Option<i64>>(5)?,
-            }))
-        },
-    )?;
-    let results = query_values(
-        connection,
-        "SELECT results.id, results.attempt_id, results.output, results.artifact_revision,
-                results.status, results.created_at
-         FROM results
-         JOIN attempts ON attempts.id = results.attempt_id
-         JOIN assignments ON assignments.id = attempts.assignment_id
-         WHERE assignments.commission_id = ?1 ORDER BY results.created_at, results.id",
-        commission_id,
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "attempt_id": row.get::<_, String>(1)?,
-                "output": row.get::<_, String>(2)?,
-                "artifact_revision": row.get::<_, String>(3)?,
-                "status": row.get::<_, String>(4)?,
-                "created_at": row.get::<_, i64>(5)?,
-            }))
-        },
-    )?;
-    let evidence = query_values(
-        connection,
-        "SELECT id, criterion_id, result_id, mandate_revision, artifact_revision,
-                verifier_kind, outcome, observed, expected, created_at
-         FROM evidence WHERE commission_id = ?1 ORDER BY created_at, criterion_id",
-        commission_id,
-        evidence_value,
-    )?;
-    let briefing = completion_briefing(connection, commission_id)?;
-    let events = query_values(
-        connection,
-        "SELECT sequence, event_type, commission_revision, created_at
-         FROM events WHERE commission_id = ?1 ORDER BY sequence",
-        commission_id,
-        |row| {
-            Ok(json!({
-                "sequence": row.get::<_, i64>(0)?,
-                "type": row.get::<_, String>(1)?,
-                "commission_revision": row.get::<_, i64>(2)?,
-                "created_at": row.get::<_, i64>(3)?,
-            }))
-        },
-    )?;
-
-    Ok(json!({
-        "commission": commission,
-        "criteria": criteria,
-        "assignments": assignments,
-        "attempts": attempts,
-        "results": results,
-        "evidence": evidence,
-        "briefing": briefing,
-        "events": events,
-    }))
-}
-
-fn evidence_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    Ok(json!({
-        "id": row.get::<_, String>(0)?,
-        "criterion_id": row.get::<_, String>(1)?,
-        "result_id": row.get::<_, String>(2)?,
-        "mandate_revision": row.get::<_, i64>(3)?,
-        "artifact_revision": row.get::<_, String>(4)?,
-        "verifier_kind": row.get::<_, String>(5)?,
-        "outcome": row.get::<_, String>(6)?,
-        "observed": row.get::<_, String>(7)?,
-        "expected": row.get::<_, String>(8)?,
-        "created_at": row.get::<_, i64>(9)?,
-    }))
-}
-
-fn completion_briefing(
-    connection: &Connection,
-    commission_id: &str,
-) -> Result<Option<Value>, TyrionError> {
-    let row = connection
-        .query_row(
-            "SELECT summary, artifact_revision FROM completion_briefings WHERE commission_id = ?1",
-            [commission_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((summary, artifact_revision)) = row else {
-        return Ok(None);
-    };
-    let criteria = query_values(
-        connection,
-        "SELECT criteria.criterion_id, criteria.description, criteria.status,
-                evidence.id, evidence.result_id, evidence.mandate_revision,
-                evidence.artifact_revision, evidence.verifier_kind, evidence.outcome,
-                evidence.observed, evidence.expected, evidence.created_at
-         FROM criteria
-         JOIN evidence ON evidence.commission_id = criteria.commission_id
-                      AND evidence.criterion_id = criteria.criterion_id
-         WHERE criteria.commission_id = ?1 ORDER BY criteria.position",
-        commission_id,
-        |row| {
-            Ok(json!({
-                "criterion_id": row.get::<_, String>(0)?,
-                "description": row.get::<_, String>(1)?,
-                "status": row.get::<_, String>(2)?,
-                "evidence": {
-                    "id": row.get::<_, String>(3)?,
-                    "result_id": row.get::<_, String>(4)?,
-                    "mandate_revision": row.get::<_, i64>(5)?,
-                    "artifact_revision": row.get::<_, String>(6)?,
-                    "verifier_kind": row.get::<_, String>(7)?,
-                    "outcome": row.get::<_, String>(8)?,
-                    "observed": row.get::<_, String>(9)?,
-                    "expected": row.get::<_, String>(10)?,
-                    "created_at": row.get::<_, i64>(11)?,
-                },
-            }))
-        },
-    )?;
-    let completion_revision = connection.query_row(
-        "SELECT revision FROM commissions WHERE id = ?1",
-        [commission_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    Ok(Some(json!({
-        "title": "Verified Completion",
-        "summary": summary,
-        "commission_id": commission_id,
-        "completion_revision": completion_revision,
-        "artifact_revision": artifact_revision,
-        "criteria": criteria,
-    })))
-}
-
-fn scope_values(
-    connection: &Connection,
-    commission_id: &str,
-    scope_type: &str,
-) -> Result<Vec<String>, TyrionError> {
-    let mut statement = connection.prepare(
-        "SELECT value FROM authority_scopes
-         WHERE commission_id = ?1 AND scope_type = ?2 ORDER BY position",
-    )?;
-    let rows = statement.query_map(params![commission_id, scope_type], |row| row.get(0))?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
-}
-
-fn query_values<F>(
-    connection: &Connection,
-    sql: &str,
-    commission_id: &str,
-    map: F,
-) -> Result<Vec<Value>, TyrionError>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Value>,
-{
-    let mut statement = connection.prepare(sql)?;
-    let rows = statement.query_map([commission_id], map)?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 fn unix_timestamp() -> Result<i64, TyrionError> {
@@ -725,115 +608,3 @@ fn unix_timestamp() -> Result<i64, TyrionError> {
         })?;
     Ok(duration.as_secs() as i64)
 }
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS commissions (
-    id TEXT PRIMARY KEY,
-    goal TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('proposed', 'active', 'verified_complete')),
-    revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    accepted_at INTEGER,
-    completed_at INTEGER,
-    artifact_revision TEXT
-);
-
-CREATE TABLE IF NOT EXISTS criteria (
-    commission_id TEXT NOT NULL REFERENCES commissions(id),
-    criterion_id TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    description TEXT NOT NULL,
-    verifier_kind TEXT NOT NULL,
-    expected TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'passed', 'failed')),
-    PRIMARY KEY (commission_id, criterion_id)
-);
-
-CREATE TABLE IF NOT EXISTS authority_scopes (
-    commission_id TEXT NOT NULL REFERENCES commissions(id),
-    scope_type TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    value TEXT NOT NULL,
-    PRIMARY KEY (commission_id, scope_type, position)
-);
-
-CREATE TABLE IF NOT EXISTS resource_ceilings (
-    commission_id TEXT PRIMARY KEY REFERENCES commissions(id),
-    max_attempts INTEGER NOT NULL,
-    max_elapsed_seconds INTEGER NOT NULL,
-    max_worker_concurrency INTEGER NOT NULL,
-    max_storage_bytes INTEGER NOT NULL,
-    max_model_spend_cents INTEGER NOT NULL,
-    max_paid_service_spend_cents INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS known_uncertainties (
-    commission_id TEXT NOT NULL REFERENCES commissions(id),
-    position INTEGER NOT NULL,
-    description TEXT NOT NULL,
-    PRIMARY KEY (commission_id, position)
-);
-
-CREATE TABLE IF NOT EXISTS assignments (
-    id TEXT PRIMARY KEY,
-    commission_id TEXT NOT NULL REFERENCES commissions(id),
-    plan_revision INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS attempts (
-    id TEXT PRIMARY KEY,
-    assignment_id TEXT NOT NULL REFERENCES assignments(id),
-    worker_configuration TEXT NOT NULL,
-    status TEXT NOT NULL,
-    started_at INTEGER NOT NULL,
-    completed_at INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS results (
-    id TEXT PRIMARY KEY,
-    attempt_id TEXT NOT NULL REFERENCES attempts(id),
-    output TEXT NOT NULL,
-    artifact_revision TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS evidence (
-    id TEXT PRIMARY KEY,
-    commission_id TEXT NOT NULL REFERENCES commissions(id),
-    criterion_id TEXT NOT NULL,
-    result_id TEXT NOT NULL REFERENCES results(id),
-    mandate_revision INTEGER NOT NULL,
-    artifact_revision TEXT NOT NULL,
-    verifier_kind TEXT NOT NULL,
-    outcome TEXT NOT NULL,
-    observed TEXT NOT NULL,
-    expected TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (commission_id, criterion_id) REFERENCES criteria(commission_id, criterion_id)
-);
-
-CREATE TABLE IF NOT EXISTS completion_briefings (
-    commission_id TEXT PRIMARY KEY REFERENCES commissions(id),
-    summary TEXT NOT NULL,
-    artifact_revision TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    commission_id TEXT NOT NULL REFERENCES commissions(id),
-    event_type TEXT NOT NULL,
-    commission_revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-    key TEXT PRIMARY KEY,
-    request_hash TEXT NOT NULL,
-    response_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-"#;

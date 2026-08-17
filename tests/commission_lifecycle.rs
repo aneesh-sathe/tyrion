@@ -232,34 +232,47 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
         ],
     );
 
-    assert_eq!(accepted["commission"]["status"], "verified_complete");
-    assert_eq!(accepted["commission"]["revision"], 2);
+    assert_eq!(accepted["commission"]["status"], "active");
+    assert_eq!(accepted["commission"]["revision"], 1);
     assert_eq!(accepted["assignments"].as_array().unwrap().len(), 1);
-    assert_eq!(accepted["assignments"][0]["status"], "accepted");
-    assert_eq!(accepted["attempts"].as_array().unwrap().len(), 1);
-    assert_eq!(accepted["attempts"][0]["status"], "succeeded");
-    assert_eq!(accepted["results"].as_array().unwrap().len(), 1);
-    assert_eq!(accepted["results"][0]["status"], "accepted");
-    assert_eq!(accepted["evidence"].as_array().unwrap().len(), 2);
-    assert!(accepted["evidence"]
+    assert_eq!(accepted["assignments"][0]["status"], "ready");
+    assert_eq!(accepted["attempts"], json!([]));
+    assert_eq!(accepted["results"], json!([]));
+    assert_eq!(accepted["evidence"], json!([]));
+    assert_eq!(accepted["briefing"], Value::Null);
+
+    let completed = run_cli(
+        &daemon.socket_path,
+        &["commission", "inspect", commission_id],
+    );
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    assert_eq!(completed["commission"]["revision"], 2);
+    assert_eq!(completed["assignments"].as_array().unwrap().len(), 1);
+    assert_eq!(completed["assignments"][0]["status"], "accepted");
+    assert_eq!(completed["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(completed["attempts"][0]["status"], "succeeded");
+    assert_eq!(completed["results"].as_array().unwrap().len(), 1);
+    assert_eq!(completed["results"][0]["status"], "accepted");
+    assert_eq!(completed["evidence"].as_array().unwrap().len(), 2);
+    assert!(completed["evidence"]
         .as_array()
         .unwrap()
         .iter()
         .all(|evidence| evidence["outcome"] == "passed"));
 
-    let artifact_revision = accepted["commission"]["artifact_revision"]
+    let artifact_revision = completed["commission"]["artifact_revision"]
         .as_str()
         .expect("completion should bind an artifact revision");
-    assert!(accepted["evidence"]
+    assert!(completed["evidence"]
         .as_array()
         .unwrap()
         .iter()
         .all(|evidence| evidence["mandate_revision"] == 1
             && evidence["artifact_revision"] == artifact_revision));
-    assert_eq!(accepted["briefing"]["title"], "Verified Completion");
-    assert_eq!(accepted["briefing"]["completion_revision"], 2);
+    assert_eq!(completed["briefing"]["title"], "Verified Completion");
+    assert_eq!(completed["briefing"]["completion_revision"], 2);
     assert_eq!(
-        accepted["briefing"]["criteria"]
+        completed["briefing"]["criteria"]
             .as_array()
             .unwrap()
             .iter()
@@ -267,13 +280,13 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
             .collect::<Vec<_>>(),
         vec!["greeting-content", "greeting-repeatability"]
     );
-    assert!(accepted["briefing"]["criteria"]
+    assert!(completed["briefing"]["criteria"]
         .as_array()
         .unwrap()
         .iter()
         .all(|criterion| criterion["evidence"]["outcome"] == "passed"));
     assert_eq!(
-        accepted["events"]
+        completed["events"]
             .as_array()
             .expect("ordered public events should be exposed")
             .iter()
@@ -332,15 +345,20 @@ fn failed_evidence_cannot_establish_completion() {
         ],
     );
 
-    assert_eq!(accepted["commission"]["status"], "active");
-    assert_eq!(accepted["commission"]["revision"], 1);
-    assert_eq!(accepted["commission"]["completed_at"], Value::Null);
-    assert_eq!(accepted["commission"]["artifact_revision"], Value::Null);
-    assert_eq!(accepted["assignments"][0]["status"], "verification_failed");
-    assert_eq!(accepted["attempts"][0]["status"], "succeeded");
-    assert_eq!(accepted["results"][0]["status"], "candidate");
-    assert_eq!(accepted["evidence"][0]["outcome"], "failed");
-    assert_eq!(accepted["briefing"], Value::Null);
+    assert_eq!(accepted["assignments"][0]["status"], "ready");
+    let inspected = run_cli(
+        &daemon.socket_path,
+        &["commission", "inspect", commission_id],
+    );
+    assert_eq!(inspected["commission"]["status"], "active");
+    assert_eq!(inspected["commission"]["revision"], 1);
+    assert_eq!(inspected["commission"]["completed_at"], Value::Null);
+    assert_eq!(inspected["commission"]["artifact_revision"], Value::Null);
+    assert_eq!(inspected["assignments"][0]["status"], "verification_failed");
+    assert_eq!(inspected["attempts"][0]["status"], "succeeded");
+    assert_eq!(inspected["results"][0]["status"], "candidate");
+    assert_eq!(inspected["evidence"][0]["outcome"], "failed");
+    assert_eq!(inspected["briefing"], Value::Null);
 }
 
 #[test]
@@ -381,6 +399,10 @@ fn mutation_replay_is_durable_and_stale_revision_is_rejected() {
             "commission-accept-replay",
         ],
     );
+    let completed_before_restart = run_cli(
+        &daemon.socket_path,
+        &["commission", "inspect", &commission_id],
+    );
 
     daemon.stop();
     let restarted = RunningDaemon::start(temp.path());
@@ -401,7 +423,7 @@ fn mutation_replay_is_durable_and_stale_revision_is_rejected() {
         &restarted.socket_path,
         &["commission", "inspect", &commission_id],
     );
-    assert_eq!(restarted_state, first_acceptance);
+    assert_eq!(restarted_state, completed_before_restart);
 
     let stale = Command::new(env!("CARGO_BIN_EXE_tyrion"))
         .args(["--socket", path_text(&restarted.socket_path)])
@@ -422,6 +444,42 @@ fn mutation_replay_is_durable_and_stale_revision_is_rejected() {
     assert_eq!(error["code"], "stale_revision");
     assert_eq!(error["details"]["expected_revision"], 0);
     assert_eq!(error["details"]["current_revision"], 2);
+}
+
+#[test]
+fn proposal_rejects_a_result_that_cannot_fit_its_storage_ceiling() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let proposal_path = temp.path().join("proposal.json");
+    let mut undersized = proposal();
+    undersized["resource_ceilings"]["max_storage_bytes"] = json!(1);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&undersized).expect("proposal should serialize"),
+    )
+    .expect("proposal fixture should be written");
+    let daemon = RunningDaemon::start(temp.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args(["--socket", path_text(&daemon.socket_path)])
+        .args([
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "proposal-create-too-small",
+        ])
+        .output()
+        .expect("CLI should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    let error: Value =
+        serde_json::from_slice(&output.stderr).expect("CLI error should be structured JSON");
+    assert_eq!(error["code"], "invalid_request");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("max_storage_bytes"));
 }
 
 #[test]

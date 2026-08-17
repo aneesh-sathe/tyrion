@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -73,18 +74,27 @@ fn prepare_socket(socket_path: &Path) -> Result<(), TyrionError> {
 }
 
 fn serve_connection(mut stream: UnixStream, store: &mut Store) {
-    let response = read_request(&stream).and_then(|request| dispatch(store, &request));
-    let response = match response {
-        Ok(data) => Response::success(data),
-        Err(error) => Response::failure(&error),
+    let outcome = read_request(&stream).and_then(|request| dispatch(store, &request));
+    let (response, follow_up) = match outcome {
+        Ok(outcome) => (Response::success(outcome.data), outcome.follow_up),
+        Err(error) => (Response::failure(&error), None),
     };
     let write_result = (|| -> Result<(), TyrionError> {
         serde_json::to_writer(&mut stream, &response)?;
         stream.write_all(b"\n")?;
+        stream.flush()?;
+        stream.shutdown(Shutdown::Write)?;
         Ok(())
     })();
     if let Err(error) = write_result {
         eprintln!("failed to write local response: {error}");
+    }
+    drop(stream);
+
+    if let Some(FollowUp::RunReadyAssignment(commission_id)) = follow_up {
+        if let Err(error) = store.run_ready_assignment(&commission_id) {
+            eprintln!("failed to run ready Assignment for Commission {commission_id}: {error}");
+        }
     }
 }
 
@@ -105,7 +115,7 @@ fn read_request(stream: &UnixStream) -> Result<Request, TyrionError> {
     })
 }
 
-fn dispatch(store: &mut Store, request: &Request) -> Result<Value, TyrionError> {
+fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, TyrionError> {
     if request.protocol_version != PROTOCOL_VERSION {
         return Err(TyrionError::UnsupportedVersion {
             actual: request.protocol_version,
@@ -124,10 +134,33 @@ fn dispatch(store: &mut Store, request: &Request) -> Result<Value, TyrionError> 
     }
 
     match &request.command {
-        Command::CreateProposal { proposal } => store.create_proposal(request, proposal),
-        Command::InspectCommission { commission_id } => store.inspect_commission(commission_id),
-        Command::AcceptCommission { commission_id } => {
-            store.accept_commission(request, commission_id)
+        Command::CreateProposal { proposal } => Ok(DispatchOutcome::complete(
+            store.create_proposal(request, proposal)?,
+        )),
+        Command::InspectCommission { commission_id } => Ok(DispatchOutcome::complete(
+            store.inspect_commission(commission_id)?,
+        )),
+        Command::AcceptCommission { commission_id } => Ok(DispatchOutcome {
+            data: store.accept_commission(request, commission_id)?,
+            follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
+        }),
+    }
+}
+
+struct DispatchOutcome {
+    data: Value,
+    follow_up: Option<FollowUp>,
+}
+
+impl DispatchOutcome {
+    fn complete(data: Value) -> Self {
+        Self {
+            data,
+            follow_up: None,
         }
     }
+}
+
+enum FollowUp {
+    RunReadyAssignment(String),
 }

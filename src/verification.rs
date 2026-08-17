@@ -1,14 +1,16 @@
+use crate::domain::EvidenceOutcome;
+
 pub struct VerificationOutcome {
-    pub outcome: &'static str,
+    pub outcome: EvidenceOutcome,
     pub observed: String,
 }
 
 pub fn exact_match(expected: &str, observed: &str) -> VerificationOutcome {
     VerificationOutcome {
         outcome: if observed == expected {
-            "passed"
+            EvidenceOutcome::Passed
         } else {
-            "failed"
+            EvidenceOutcome::Failed
         },
         observed: observed.to_owned(),
     }
