@@ -11,12 +11,15 @@ struct Arguments {
     socket: PathBuf,
     #[arg(long, hide = true)]
     fault_defer_ready_dispatch: bool,
+    #[arg(long, hide = true)]
+    fault_corrupt_worker_artifact_revision: bool,
 }
 
 fn main() {
     let arguments = Arguments::parse();
     let options = tyrion::DaemonOptions {
         defer_ready_dispatch: arguments.fault_defer_ready_dispatch,
+        corrupt_worker_artifact_revision: arguments.fault_corrupt_worker_artifact_revision,
     };
     if let Err(error) =
         tyrion::run_daemon_with_options(&arguments.data_dir, &arguments.socket, options)

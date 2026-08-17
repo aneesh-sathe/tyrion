@@ -10,7 +10,8 @@ Tyrion is a durable local Control Plane for software-building Commissions. This 
 - Durable acceptance before Worker dispatch, with the ready Assignment returned to the Principal
 - Durable idempotency keys for mutating requests
 - One replaceable deterministic local Worker configuration
-- Criterion-linked deterministic Evidence and a completion briefing
+- Criterion-linked deterministic Evidence with independently validated artifact revisions
+- A criterion-linked Verified Completion briefing
 - Assignment-scoped resource Blockers that preserve Control Plane availability
 - Public ordered lifecycle events, including Assignment readiness before dispatch
 - Black-box end-to-end coverage through the CLI, protocol, daemon, and real restarts

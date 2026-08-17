@@ -25,6 +25,10 @@ impl RunningDaemon {
         Self::start_with_arguments(data_dir, &["--fault-defer-ready-dispatch"])
     }
 
+    fn start_with_corrupted_artifact_revision(data_dir: &Path) -> Self {
+        Self::start_with_arguments(data_dir, &["--fault-corrupt-worker-artifact-revision"])
+    }
+
     fn start_with_arguments(data_dir: &Path, extra_arguments: &[&str]) -> Self {
         let socket_path = data_dir.join("tyrion.sock");
         let mut command = Command::new(env!("CARGO_BIN_EXE_tyriond"));
@@ -365,6 +369,56 @@ fn failed_evidence_cannot_establish_completion() {
     assert_eq!(inspected["commission"]["artifact_revision"], Value::Null);
     assert_eq!(inspected["assignments"][0]["status"], "verification_failed");
     assert_eq!(inspected["attempts"][0]["status"], "succeeded");
+    assert_eq!(inspected["results"][0]["status"], "candidate");
+    assert_eq!(inspected["evidence"][0]["outcome"], "failed");
+    assert_eq!(inspected["briefing"], Value::Null);
+}
+
+#[test]
+fn forged_worker_artifact_revision_cannot_establish_completion() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let proposal_path = temp.path().join("proposal.json");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
+    )
+    .expect("proposal fixture should be written");
+
+    let daemon = RunningDaemon::start_with_corrupted_artifact_revision(temp.path());
+    let created = run_cli(
+        &daemon.socket_path,
+        &[
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "proposal-create-forged-artifact",
+        ],
+    );
+    let commission_id = created["commission"]["id"]
+        .as_str()
+        .expect("proposal should have an id");
+    let accepted = run_cli(
+        &daemon.socket_path,
+        &[
+            "commission",
+            "accept",
+            commission_id,
+            "--expected-revision",
+            "0",
+            "--idempotency-key",
+            "commission-accept-forged-artifact",
+        ],
+    );
+
+    assert_eq!(accepted["assignments"][0]["status"], "ready");
+    let inspected = run_cli(
+        &daemon.socket_path,
+        &["commission", "inspect", commission_id],
+    );
+    assert_eq!(inspected["commission"]["status"], "active");
+    assert_eq!(inspected["assignments"][0]["status"], "verification_failed");
     assert_eq!(inspected["results"][0]["status"], "candidate");
     assert_eq!(inspected["evidence"][0]["outcome"], "failed");
     assert_eq!(inspected["briefing"], Value::Null);

@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::protocol::{Command, Request, Response, PROTOCOL_VERSION};
 use crate::store::Store;
+use crate::worker::{CorruptArtifactRevisionWorker, DeterministicLocalWorker, Worker};
 use crate::TyrionError;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -21,6 +22,7 @@ pub fn run_daemon(data_dir: &Path, socket_path: &Path) -> Result<(), TyrionError
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DaemonOptions {
     pub defer_ready_dispatch: bool,
+    pub corrupt_worker_artifact_revision: bool,
 }
 
 pub fn run_daemon_with_options(
@@ -35,22 +37,27 @@ pub fn run_daemon_with_options(
     let listener = UnixListener::bind(socket_path)?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     let mut store = Store::open(&data_dir.join("state.sqlite3"))?;
+    let worker: Box<dyn Worker> = if options.corrupt_worker_artifact_revision {
+        Box::new(CorruptArtifactRevisionWorker)
+    } else {
+        Box::new(DeterministicLocalWorker)
+    };
     if !options.defer_ready_dispatch {
-        resume_ready_assignments(&mut store)?;
+        resume_ready_assignments(&mut store, worker.as_ref())?;
     }
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => serve_connection(stream, &mut store, options),
+            Ok(stream) => serve_connection(stream, &mut store, options, worker.as_ref()),
             Err(error) => eprintln!("failed to accept local connection: {error}"),
         }
     }
     Ok(())
 }
 
-fn resume_ready_assignments(store: &mut Store) -> Result<(), TyrionError> {
+fn resume_ready_assignments(store: &mut Store, worker: &dyn Worker) -> Result<(), TyrionError> {
     for commission_id in store.ready_commission_ids()? {
-        match store.run_ready_assignment(&commission_id) {
+        match store.run_ready_assignment(&commission_id, worker) {
             Ok(()) => {}
             Err(TyrionError::InvalidRequest(message)) => {
                 eprintln!(
@@ -104,7 +111,12 @@ fn prepare_socket(socket_path: &Path) -> Result<(), TyrionError> {
     Ok(())
 }
 
-fn serve_connection(mut stream: UnixStream, store: &mut Store, options: DaemonOptions) {
+fn serve_connection(
+    mut stream: UnixStream,
+    store: &mut Store,
+    options: DaemonOptions,
+    worker: &dyn Worker,
+) {
     let outcome = read_request(&stream).and_then(|request| dispatch(store, &request));
     let (response, follow_up) = match outcome {
         Ok(outcome) => (Response::success(outcome.data), outcome.follow_up),
@@ -126,7 +138,7 @@ fn serve_connection(mut stream: UnixStream, store: &mut Store, options: DaemonOp
         let Some(FollowUp::RunReadyAssignment(commission_id)) = follow_up else {
             return;
         };
-        if let Err(error) = store.run_ready_assignment(&commission_id) {
+        if let Err(error) = store.run_ready_assignment(&commission_id, worker) {
             eprintln!("failed to run ready Assignment for Commission {commission_id}: {error}");
         }
     }
@@ -168,10 +180,10 @@ fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, Tyr
     }
 
     match &request.command {
-        Command::CreateProposal { proposal } => Ok(DispatchOutcome::complete(
+        Command::CreateProposal { proposal } => Ok(DispatchOutcome::without_follow_up(
             store.create_proposal(request, proposal)?,
         )),
-        Command::InspectCommission { commission_id } => Ok(DispatchOutcome::complete(
+        Command::InspectCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
             store.inspect_commission(commission_id)?,
         )),
         Command::AcceptCommission { commission_id } => Ok(DispatchOutcome {
@@ -187,7 +199,7 @@ struct DispatchOutcome {
 }
 
 impl DispatchOutcome {
-    fn complete(data: Value) -> Self {
+    fn without_follow_up(data: Value) -> Self {
         Self {
             data,
             follow_up: None,

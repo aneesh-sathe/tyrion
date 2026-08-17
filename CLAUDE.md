@@ -9,6 +9,7 @@
 - Validate the deterministic Result against its storage ceiling at proposal time, then recheck attempt, elapsed-time, concurrency, and storage ceilings immediately before dispatch.
 - A hard resource-ceiling failure blocks only its Assignment, records the exact next requirement, and must not prevent the daemon from serving other Commissions.
 - Evidence is immutable and bound to criterion, accepted mandate revision, candidate Result, verifier, and artifact revision. Failed Evidence leaves a candidate Result unaccepted.
+- Evidence uses the Assignment's persisted mandate revision, and the Control Plane independently recomputes deterministic Result artifact hashes before accepting them.
 - Verified Completion, accepted Result status, passed criteria, completion briefing, and the terminal event are committed in one SQLite transaction.
 - Mutating protocol requests require idempotency keys. Identical replay returns the stored response; key reuse with a different request is rejected.
 - Run `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` before committing.

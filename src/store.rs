@@ -24,6 +24,18 @@ pub struct Store {
     connection: Connection,
 }
 
+struct ReadyAssignmentDispatch {
+    assignment_id: String,
+    goal: String,
+    mandate_revision: i64,
+    commission_revision: i64,
+    accepted_at: i64,
+    max_attempts: u32,
+    max_elapsed_seconds: u64,
+    max_worker_concurrency: u32,
+    max_storage_bytes: u64,
+}
+
 impl Store {
     pub fn open(database_path: &Path) -> Result<Self, TyrionError> {
         let connection = Connection::open(database_path)?;
@@ -210,11 +222,16 @@ impl Store {
         Ok(result)
     }
 
-    pub fn run_ready_assignment(&mut self, commission_id: &str) -> Result<(), TyrionError> {
+    pub fn run_ready_assignment(
+        &mut self,
+        commission_id: &str,
+        worker: &dyn worker::Worker,
+    ) -> Result<(), TyrionError> {
         let transaction = self.connection.transaction()?;
         let ready = transaction
             .query_row(
-                "SELECT assignments.id, commissions.goal, commissions.revision,
+                "SELECT assignments.id, commissions.goal, assignments.plan_revision,
+                        commissions.revision,
                         commissions.accepted_at, resource_ceilings.max_attempts,
                         resource_ceilings.max_elapsed_seconds,
                         resource_ceilings.max_worker_concurrency,
@@ -233,32 +250,32 @@ impl Store {
                     CommissionStatus::Active.as_str()
                 ],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, u32>(4)?,
-                        row.get::<_, u64>(5)?,
-                        row.get::<_, u32>(6)?,
-                        row.get::<_, u64>(7)?,
-                    ))
+                    Ok(ReadyAssignmentDispatch {
+                        assignment_id: row.get(0)?,
+                        goal: row.get(1)?,
+                        mandate_revision: row.get(2)?,
+                        commission_revision: row.get(3)?,
+                        accepted_at: row.get(4)?,
+                        max_attempts: row.get(5)?,
+                        max_elapsed_seconds: row.get(6)?,
+                        max_worker_concurrency: row.get(7)?,
+                        max_storage_bytes: row.get(8)?,
+                    })
                 },
             )
             .optional()?;
-        let Some((
-            assignment_id,
-            goal,
-            mandate_revision,
-            accepted_at,
-            max_attempts,
-            max_elapsed_seconds,
-            max_worker_concurrency,
-            max_storage_bytes,
-        )) = ready
-        else {
+        let Some(ready) = ready else {
             return Ok(());
         };
+        if ready.mandate_revision != ready.commission_revision {
+            return Err(TyrionError::InvalidRequest(format!(
+                "ready Assignment {} is bound to mandate revision {}, but Commission {} is at revision {}",
+                ready.assignment_id,
+                ready.mandate_revision,
+                commission_id,
+                ready.commission_revision
+            )));
+        }
 
         let attempt_count = transaction.query_row(
             "SELECT COUNT(*) FROM attempts
@@ -267,12 +284,12 @@ impl Store {
             [commission_id],
             |row| row.get::<_, u32>(0),
         )?;
-        if attempt_count >= max_attempts {
+        if attempt_count >= ready.max_attempts {
             return block_ready_assignment(
                 transaction,
                 commission_id,
-                &assignment_id,
-                mandate_revision,
+                &ready.assignment_id,
+                ready.mandate_revision,
                 "max_attempts",
                 "Start a new Commission with a higher max_attempts ceiling.",
             );
@@ -284,26 +301,26 @@ impl Store {
             params![commission_id, AttemptStatus::Running.as_str()],
             |row| row.get::<_, u32>(0),
         )?;
-        if running_count >= max_worker_concurrency {
+        if running_count >= ready.max_worker_concurrency {
             return Ok(());
         }
         let now = unix_timestamp()?;
-        if now.saturating_sub(accepted_at) as u64 >= max_elapsed_seconds {
+        if now.saturating_sub(ready.accepted_at) as u64 >= ready.max_elapsed_seconds {
             return block_ready_assignment(
                 transaction,
                 commission_id,
-                &assignment_id,
-                mandate_revision,
+                &ready.assignment_id,
+                ready.mandate_revision,
                 "max_elapsed_seconds",
                 "Start a new Commission with a higher max_elapsed_seconds ceiling.",
             );
         }
-        if goal.len() as u64 > max_storage_bytes {
+        if ready.goal.len() as u64 > ready.max_storage_bytes {
             return block_ready_assignment(
                 transaction,
                 commission_id,
-                &assignment_id,
-                mandate_revision,
+                &ready.assignment_id,
+                ready.mandate_revision,
                 "max_storage_bytes",
                 "Start a new Commission with a max_storage_bytes ceiling large enough for the Result.",
             );
@@ -315,26 +332,37 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 attempt_id,
-                assignment_id,
-                worker::CONFIGURATION,
+                ready.assignment_id,
+                worker.configuration(),
                 AttemptStatus::Running.as_str(),
                 now
             ],
         )?;
         transaction.execute(
             "UPDATE assignments SET status = ?2 WHERE id = ?1",
-            params![assignment_id, AssignmentStatus::Running.as_str()],
+            params![ready.assignment_id, AssignmentStatus::Running.as_str()],
         )?;
         record_event(
             &transaction,
             commission_id,
             EventKind::AttemptStarted,
-            mandate_revision,
+            ready.mandate_revision,
         )?;
         transaction.commit()?;
 
-        let candidate = worker::execute(&goal);
+        let candidate = worker.execute(&ready.goal);
         let transaction = self.connection.transaction()?;
+        let current_revision = transaction.query_row(
+            "SELECT revision FROM commissions WHERE id = ?1 AND status = ?2",
+            params![commission_id, CommissionStatus::Active.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if current_revision != ready.mandate_revision {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Assignment {} Result targets mandate revision {}, but Commission {} is at revision {}",
+                ready.assignment_id, ready.mandate_revision, commission_id, current_revision
+            )));
+        }
         let result_id = Uuid::new_v4().to_string();
         let result_created_at = unix_timestamp()?;
         transaction.execute(
@@ -353,7 +381,7 @@ impl Store {
             &transaction,
             commission_id,
             EventKind::ResultSubmitted,
-            mandate_revision,
+            ready.mandate_revision,
         )?;
 
         let criteria = {
@@ -368,7 +396,11 @@ impl Store {
         };
         let mut every_criterion_passed = true;
         for (criterion_id, expected) in criteria {
-            let verification = verification::exact_match(&expected, &candidate.output);
+            let verification = verification::exact_match(
+                &expected,
+                &candidate.output,
+                &candidate.artifact_revision,
+            );
             every_criterion_passed &= verification.outcome == EvidenceOutcome::Passed;
             let evidence_id = Uuid::new_v4().to_string();
             transaction.execute(
@@ -381,7 +413,7 @@ impl Store {
                     commission_id,
                     criterion_id,
                     result_id,
-                    mandate_revision,
+                    ready.mandate_revision,
                     candidate.artifact_revision,
                     verification.outcome.as_str(),
                     verification.observed,
@@ -401,7 +433,7 @@ impl Store {
                 &transaction,
                 commission_id,
                 EventKind::EvidenceRecorded,
-                mandate_revision,
+                ready.mandate_revision,
             )?;
         }
 
@@ -416,13 +448,13 @@ impl Store {
         if every_criterion_passed {
             transaction.execute(
                 "UPDATE assignments SET status = ?2 WHERE id = ?1",
-                params![assignment_id, AssignmentStatus::Accepted.as_str()],
+                params![ready.assignment_id, AssignmentStatus::Accepted.as_str()],
             )?;
             transaction.execute(
                 "UPDATE results SET status = ?2 WHERE id = ?1",
                 params![result_id, ResultStatus::Accepted.as_str()],
             )?;
-            let completion_revision = mandate_revision + 1;
+            let completion_revision = ready.mandate_revision + 1;
             let completed_at = unix_timestamp()?;
             transaction.execute(
                 "UPDATE commissions
@@ -441,7 +473,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     commission_id,
-                    format!("Verified Complete: {goal}"),
+                    format!("Verified Complete: {}", ready.goal),
                     candidate.artifact_revision,
                     completed_at,
                 ],
@@ -455,7 +487,10 @@ impl Store {
         } else {
             transaction.execute(
                 "UPDATE assignments SET status = ?2 WHERE id = ?1",
-                params![assignment_id, AssignmentStatus::VerificationFailed.as_str()],
+                params![
+                    ready.assignment_id,
+                    AssignmentStatus::VerificationFailed.as_str()
+                ],
             )?;
         }
 
