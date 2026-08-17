@@ -1,4 +1,5 @@
 mod artifact;
+mod attachment;
 mod client;
 mod daemon;
 mod domain;

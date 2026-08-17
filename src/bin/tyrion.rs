@@ -2,13 +2,18 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use tyrion::protocol::{Command, CommissionProposal, Request, PROTOCOL_VERSION};
+use tyrion::protocol::{
+    AdapterIdentity, AttachmentHandshake, Command, CommissionProposal, CommissionReplayCursor,
+    Request, PROTOCOL_VERSION,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Review and control Tyrion Commissions")]
 struct Arguments {
     #[arg(long)]
     socket: PathBuf,
+    #[arg(long, global = true)]
+    attachment_token: Option<String>,
     #[command(subcommand)]
     command: TopLevelCommand,
 }
@@ -22,6 +27,70 @@ enum TopLevelCommand {
     Commission {
         #[command(subcommand)]
         command: CommissionCommand,
+    },
+    Attachment {
+        #[command(subcommand)]
+        command: AttachmentCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AttachmentCommand {
+    IssueToken {
+        #[arg(long)]
+        harness: String,
+        #[arg(long)]
+        adapter_identity: String,
+        #[arg(long)]
+        adapter_version: String,
+        #[arg(long, default_value_t = 60)]
+        ttl_seconds: u64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Connect {
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        harness: String,
+        #[arg(long)]
+        adapter_identity: String,
+        #[arg(long)]
+        adapter_version: String,
+        #[arg(long, default_value_t = PROTOCOL_VERSION)]
+        adapter_protocol_version: u16,
+        #[arg(long)]
+        native_session_id: String,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        #[arg(long)]
+        commission_id: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        last_event_sequence: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Resume {
+        commission_id: String,
+        #[arg(long)]
+        harness: String,
+        #[arg(long)]
+        adapter_identity: String,
+        #[arg(long)]
+        adapter_version: String,
+        #[arg(long, default_value_t = PROTOCOL_VERSION)]
+        adapter_protocol_version: u16,
+        #[arg(long)]
+        native_session_id: String,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        last_event_sequence: i64,
+    },
+    Replay {
+        commission_id: String,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: i64,
     },
 }
 
@@ -47,11 +116,20 @@ enum CommissionCommand {
         #[arg(long)]
         idempotency_key: String,
     },
+    TakeControl {
+        commission_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        expected_control_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
 }
 
 fn main() {
     let arguments = Arguments::parse();
-    let request = match build_request(&arguments.command) {
+    let request = match build_request(&arguments) {
         Ok(request) => request,
         Err(error) => {
             eprintln!("{error}");
@@ -81,52 +159,198 @@ fn main() {
     }
 }
 
-fn build_request(command: &TopLevelCommand) -> Result<Request, tyrion::TyrionError> {
-    let (command, idempotency_key, expected_revision) = match command {
-        TopLevelCommand::Proposal {
-            command:
-                ProposalCommand::Create {
-                    file,
-                    idempotency_key,
+fn attachment_handshake(
+    harness: &str,
+    adapter_identity: &str,
+    adapter_version: &str,
+    adapter_protocol_version: u16,
+    native_session_id: &str,
+    capabilities: &[String],
+) -> Box<AttachmentHandshake> {
+    Box::new(AttachmentHandshake {
+        adapter: AdapterIdentity {
+            harness: harness.to_owned(),
+            adapter_identity: adapter_identity.to_owned(),
+            adapter_version: adapter_version.to_owned(),
+        },
+        adapter_protocol_version,
+        native_session_id: native_session_id.to_owned(),
+        capabilities: capabilities.to_owned(),
+    })
+}
+
+fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> {
+    let (command, idempotency_key, expected_revision, expected_control_revision) =
+        match &arguments.command {
+            TopLevelCommand::Proposal {
+                command:
+                    ProposalCommand::Create {
+                        file,
+                        idempotency_key,
+                    },
+            } => {
+                let proposal: CommissionProposal = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::CreateProposal {
+                        proposal: Box::new(proposal),
+                    },
+                    Some(idempotency_key.clone()),
+                    None,
+                    None,
+                )
+            }
+            TopLevelCommand::Commission {
+                command: CommissionCommand::Inspect { commission_id },
+            } => (
+                Command::InspectCommission {
+                    commission_id: commission_id.clone(),
                 },
-        } => {
-            let proposal: CommissionProposal = serde_json::from_slice(&fs::read(file)?)?;
-            (
-                Command::CreateProposal {
-                    proposal: Box::new(proposal),
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::Accept {
+                        commission_id,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::AcceptCommission {
+                    commission_id: commission_id.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::TakeControl {
+                        commission_id,
+                        expected_revision,
+                        expected_control_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::TakeControl {
+                    commission_id: commission_id.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                Some(*expected_control_revision),
+            ),
+            TopLevelCommand::Attachment {
+                command:
+                    AttachmentCommand::IssueToken {
+                        harness,
+                        adapter_identity,
+                        adapter_version,
+                        ttl_seconds,
+                        idempotency_key,
+                    },
+            } => (
+                Command::IssueAttachmentToken {
+                    expected_adapter: AdapterIdentity {
+                        harness: harness.clone(),
+                        adapter_identity: adapter_identity.clone(),
+                        adapter_version: adapter_version.clone(),
+                    },
+                    ttl_seconds: *ttl_seconds,
                 },
                 Some(idempotency_key.clone()),
                 None,
-            )
-        }
-        TopLevelCommand::Commission {
-            command: CommissionCommand::Inspect { commission_id },
-        } => (
-            Command::InspectCommission {
-                commission_id: commission_id.clone(),
-            },
-            None,
-            None,
-        ),
-        TopLevelCommand::Commission {
-            command:
-                CommissionCommand::Accept {
-                    commission_id,
-                    expected_revision,
-                    idempotency_key,
+                None,
+            ),
+            TopLevelCommand::Attachment {
+                command:
+                    AttachmentCommand::Replay {
+                        commission_id,
+                        after_sequence,
+                    },
+            } => (
+                Command::ReplayEvents {
+                    commission_id: commission_id.clone(),
+                    after_sequence: *after_sequence,
                 },
-        } => (
-            Command::AcceptCommission {
-                commission_id: commission_id.clone(),
-            },
-            Some(idempotency_key.clone()),
-            Some(*expected_revision),
-        ),
-    };
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Attachment {
+                command:
+                    AttachmentCommand::Connect {
+                        token,
+                        harness,
+                        adapter_identity,
+                        adapter_version,
+                        adapter_protocol_version,
+                        native_session_id,
+                        capabilities,
+                        commission_id,
+                        last_event_sequence,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ConnectAttachment {
+                    launch_token: token.clone(),
+                    handshake: attachment_handshake(
+                        harness,
+                        adapter_identity,
+                        adapter_version,
+                        *adapter_protocol_version,
+                        native_session_id,
+                        capabilities,
+                    ),
+                    replay: commission_id
+                        .as_ref()
+                        .map(|commission_id| CommissionReplayCursor {
+                            commission_id: commission_id.clone(),
+                            last_event_sequence: *last_event_sequence,
+                        }),
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Attachment {
+                command:
+                    AttachmentCommand::Resume {
+                        commission_id,
+                        harness,
+                        adapter_identity,
+                        adapter_version,
+                        adapter_protocol_version,
+                        native_session_id,
+                        capabilities,
+                        last_event_sequence,
+                    },
+            } => (
+                Command::ResumeAttachment {
+                    handshake: attachment_handshake(
+                        harness,
+                        adapter_identity,
+                        adapter_version,
+                        *adapter_protocol_version,
+                        native_session_id,
+                        capabilities,
+                    ),
+                    replay: CommissionReplayCursor {
+                        commission_id: commission_id.clone(),
+                        last_event_sequence: *last_event_sequence,
+                    },
+                },
+                None,
+                None,
+                None,
+            ),
+        };
     Ok(Request {
         protocol_version: PROTOCOL_VERSION,
+        attachment_token: arguments.attachment_token.clone(),
         idempotency_key,
         expected_revision,
+        expected_control_revision,
         command,
     })
 }

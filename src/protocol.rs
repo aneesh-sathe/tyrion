@@ -55,24 +55,80 @@ pub struct ResourceCeilings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Request {
     pub protocol_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_token: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub expected_revision: Option<i64>,
+    #[serde(default)]
+    pub expected_control_revision: Option<i64>,
     pub command: Command,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdapterIdentity {
+    pub harness: String,
+    pub adapter_identity: String,
+    pub adapter_version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AttachmentHandshake {
+    pub adapter: AdapterIdentity,
+    pub adapter_protocol_version: u16,
+    pub native_session_id: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CommissionReplayCursor {
+    pub commission_id: String,
+    pub last_event_sequence: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    CreateProposal { proposal: Box<CommissionProposal> },
-    InspectCommission { commission_id: String },
-    AcceptCommission { commission_id: String },
+    CreateProposal {
+        proposal: Box<CommissionProposal>,
+    },
+    InspectCommission {
+        commission_id: String,
+    },
+    AcceptCommission {
+        commission_id: String,
+    },
+    IssueAttachmentToken {
+        expected_adapter: AdapterIdentity,
+        ttl_seconds: u64,
+    },
+    ConnectAttachment {
+        launch_token: String,
+        handshake: Box<AttachmentHandshake>,
+        replay: Option<CommissionReplayCursor>,
+    },
+    ResumeAttachment {
+        handshake: Box<AttachmentHandshake>,
+        replay: CommissionReplayCursor,
+    },
+    TakeControl {
+        commission_id: String,
+    },
+    ReplayEvents {
+        commission_id: String,
+        after_sequence: i64,
+    },
 }
 
 impl Command {
     pub fn is_mutating(&self) -> bool {
-        !matches!(self, Self::InspectCommission { .. })
+        !matches!(
+            self,
+            Self::InspectCommission { .. }
+                | Self::ResumeAttachment { .. }
+                | Self::ReplayEvents { .. }
+        )
     }
 }
 

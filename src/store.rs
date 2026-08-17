@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,14 +12,17 @@ use crate::domain::{
     AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus, CriterionStatus,
     EventKind, EvidenceOutcome, ResultStatus,
 };
-use crate::protocol::{CommissionProposal, Request, ResourceCeilings, Verifier};
+use crate::protocol::{
+    AdapterIdentity, AttachmentHandshake, CommissionProposal, CommissionReplayCursor, Request,
+    ResourceCeilings, Verifier, PROTOCOL_VERSION,
+};
 use crate::TyrionError;
-use crate::{verification, worker};
+use crate::{attachment, verification, worker};
 
 mod projection;
 mod schema;
 
-use projection::inspect_commission;
+use projection::{event_value, inspect_commission as project_commission};
 
 pub struct Store {
     connection: Connection,
@@ -42,7 +46,22 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(schema::SCHEMA)?;
+        let backup_path = if schema::migration_required(&connection)? {
+            let backup_path = schema::migration_backup_path(database_path)?;
+            schema::create_backup(&connection, &backup_path)?;
+            Some(backup_path)
+        } else {
+            None
+        };
+        let migration = (|| {
+            connection.execute_batch(schema::SCHEMA)?;
+            schema::migrate(&connection)?;
+            schema::verify(&connection)
+        })();
+        migration?;
+        if let Some(backup_path) = backup_path {
+            fs::remove_file(backup_path)?;
+        }
         Ok(Self { connection })
     }
 
@@ -59,6 +78,8 @@ impl Store {
         if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
             return Ok(prior);
         }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_attachment_capability(&transaction, &attachment_id, attachment::PROPOSAL_CREATION)?;
 
         let commission_id = Uuid::new_v4().to_string();
         transaction.execute(
@@ -104,15 +125,480 @@ impl Store {
             EventKind::CommissionProposed,
             0,
         )?;
+        transaction.execute(
+            "INSERT INTO commission_attachments (commission_id, attachment_id, role, joined_at)
+             VALUES (?1, ?2, 'active', ?3)",
+            params![commission_id, attachment_id, unix_timestamp()?],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            &commission_id,
+            EventKind::AttachmentJoined,
+            0,
+            &serde_json::json!({
+                "attachment_id": attachment_id,
+                "role": "active",
+            }),
+        )?;
+        record_event_with_payload(
+            &transaction,
+            &commission_id,
+            EventKind::ActiveAttachmentChanged,
+            0,
+            &serde_json::json!({
+                "previous_active_attachment_id": Value::Null,
+                "active_attachment_id": attachment_id,
+            }),
+        )?;
 
-        let result = inspect_commission(&transaction, &commission_id)?;
+        let result = project_commission(&transaction, &commission_id)?;
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
         transaction.commit()?;
         Ok(result)
     }
 
-    pub fn inspect_commission(&self, commission_id: &str) -> Result<Value, TyrionError> {
-        inspect_commission(&self.connection, commission_id)
+    pub fn take_control(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+    ) -> Result<Value, TyrionError> {
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest("control takeover requires an expected revision".into())
+        })?;
+        let expected_control_revision = request.expected_control_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "control takeover requires an expected control revision".into(),
+            )
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_commission_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::CONTROL_TAKEOVER,
+        )?;
+        let (current_revision, current_control_revision) = transaction
+            .query_row(
+                "SELECT revision, control_revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if current_revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        if current_control_revision != expected_control_revision {
+            return Err(TyrionError::StaleControlRevision {
+                expected: expected_control_revision,
+                actual: current_control_revision,
+            });
+        }
+        let previous_active_attachment_id = transaction.query_row(
+            "SELECT attachment_id FROM commission_attachments
+             WHERE commission_id = ?1 AND role = 'active'",
+            [commission_id],
+            |row| row.get::<_, String>(0),
+        )?;
+
+        transaction.execute(
+            "UPDATE commission_attachments SET role = 'observer'
+             WHERE commission_id = ?1 AND role = 'active'",
+            [commission_id],
+        )?;
+        transaction.execute(
+            "UPDATE commission_attachments SET role = 'active'
+             WHERE commission_id = ?1 AND attachment_id = ?2",
+            params![commission_id, attachment_id],
+        )?;
+        let next_control_revision = current_control_revision + 1;
+        transaction.execute(
+            "UPDATE commissions SET control_revision = ?2 WHERE id = ?1",
+            params![commission_id, next_control_revision],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::ActiveAttachmentChanged,
+            current_revision,
+            &serde_json::json!({
+                "previous_active_attachment_id": previous_active_attachment_id,
+                "active_attachment_id": attachment_id,
+                "control_revision": next_control_revision,
+            }),
+        )?;
+        let projected = project_commission(&transaction, commission_id)?;
+        let result = serde_json::json!({
+            "commission_id": commission_id,
+            "commission_revision": current_revision,
+            "control_revision": next_control_revision,
+            "active_attachment_id": attachment_id,
+            "attachments": projected["attachments"],
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn issue_attachment_token(
+        &mut self,
+        request: &Request,
+        expected_adapter: &AdapterIdentity,
+        ttl_seconds: u64,
+    ) -> Result<Value, TyrionError> {
+        validate_attachment_identity(expected_adapter)?;
+        if ttl_seconds == 0 || ttl_seconds > 300 {
+            return Err(TyrionError::InvalidRequest(
+                "attachment token TTL must be between 1 and 300 seconds".into(),
+            ));
+        }
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+
+        let launch_token = format!("tlt_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+        let token_hash = attachment_token_hash(&launch_token);
+        let created_at = unix_timestamp()?;
+        let expires_at = created_at.saturating_add(ttl_seconds as i64);
+        transaction.execute(
+            "INSERT INTO attachment_launch_tokens (
+                token_hash, expected_harness, expected_adapter_identity,
+                expected_adapter_version, created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                token_hash,
+                expected_adapter.harness,
+                expected_adapter.adapter_identity,
+                expected_adapter.adapter_version,
+                created_at,
+                expires_at,
+            ],
+        )?;
+        let result = serde_json::json!({
+            "launch_token": launch_token,
+            "expected_harness": expected_adapter.harness,
+            "expected_adapter_identity": expected_adapter.adapter_identity,
+            "expected_adapter_version": expected_adapter.adapter_version,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn connect_attachment(
+        &mut self,
+        request: &Request,
+        launch_token: &str,
+        handshake: &AttachmentHandshake,
+        replay_cursor: Option<&CommissionReplayCursor>,
+    ) -> Result<Value, TyrionError> {
+        validate_attachment_identity(&handshake.adapter)?;
+        if handshake.native_session_id.trim().is_empty() {
+            return Err(TyrionError::AttachmentRejected(
+                "native session identity must not be empty".into(),
+            ));
+        }
+        if replay_cursor.is_some_and(|cursor| cursor.last_event_sequence < 0) {
+            return Err(TyrionError::AttachmentRejected(
+                "last durable event cursor must not be negative".into(),
+            ));
+        }
+        if handshake.adapter_protocol_version != PROTOCOL_VERSION {
+            return Err(TyrionError::AttachmentRejected(format!(
+                "adapter protocol version {} is incompatible with {PROTOCOL_VERSION}",
+                handshake.adapter_protocol_version
+            )));
+        }
+        let negotiated = attachment::negotiate(&handshake.capabilities)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(cursor) = replay_cursor {
+            ensure_commission_exists(&transaction, &cursor.commission_id)?;
+        }
+
+        let token_hash = attachment_token_hash(launch_token);
+        let token = transaction
+            .query_row(
+                "SELECT expected_harness, expected_adapter_identity, expected_adapter_version,
+                        expires_at, consumed_at
+                 FROM attachment_launch_tokens WHERE token_hash = ?1",
+                [&token_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::AttachmentRejected("launch token is invalid".into()))?;
+        if token.4.is_some() {
+            return Err(TyrionError::AttachmentRejected(
+                "launch token was already used".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        if now >= token.3 {
+            return Err(TyrionError::AttachmentRejected(
+                "launch token has expired".into(),
+            ));
+        }
+        if handshake.adapter.harness != token.0 {
+            return Err(TyrionError::AttachmentRejected(format!(
+                "harness identity mismatch: expected {}",
+                token.0
+            )));
+        }
+        if handshake.adapter.adapter_identity != token.1 {
+            return Err(TyrionError::AttachmentRejected(format!(
+                "adapter identity mismatch: expected {}",
+                token.1
+            )));
+        }
+        if handshake.adapter.adapter_version != token.2 {
+            return Err(TyrionError::AttachmentRejected(format!(
+                "adapter version mismatch: expected {}",
+                token.2
+            )));
+        }
+        if prior_result(&transaction, idempotency_key, &request_hash)?.is_some() {
+            return Err(TyrionError::AttachmentRejected(
+                "launch token was already used".into(),
+            ));
+        }
+
+        let attachment_id = Uuid::new_v4().to_string();
+        let attachment_session_token = format!("tat_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+        let session_token_hash = attachment_token_hash(&attachment_session_token);
+        transaction.execute(
+            "INSERT INTO attachments (
+                id, session_token_hash, harness, adapter_identity, adapter_version,
+                protocol_version, native_session_id, mode, capabilities_json,
+                missing_capabilities_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                attachment_id,
+                session_token_hash,
+                handshake.adapter.harness,
+                handshake.adapter.adapter_identity,
+                handshake.adapter.adapter_version,
+                handshake.adapter_protocol_version,
+                handshake.native_session_id,
+                negotiated.mode.as_str(),
+                serde_json::to_string(&negotiated.effective)?,
+                serde_json::to_string(&negotiated.missing)?,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE attachment_launch_tokens SET consumed_at = ?2 WHERE token_hash = ?1",
+            params![token_hash, now],
+        )?;
+        if let Some(cursor) = replay_cursor {
+            let commission_id = &cursor.commission_id;
+            transaction.execute(
+                "INSERT INTO commission_attachments (commission_id, attachment_id, role, joined_at)
+                 VALUES (?1, ?2, 'observer', ?3)",
+                params![commission_id, attachment_id, now],
+            )?;
+            let commission_revision = transaction.query_row(
+                "SELECT revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::AttachmentJoined,
+                commission_revision,
+                &serde_json::json!({
+                    "attachment_id": attachment_id,
+                    "role": "observer",
+                }),
+            )?;
+        }
+        let replay = if negotiated.effective.contains(&attachment::EVENT_REPLAY) {
+            replay_cursor
+                .map(|cursor| {
+                    replay_events(
+                        &transaction,
+                        &attachment_id,
+                        &cursor.commission_id,
+                        cursor.last_event_sequence,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let result = serde_json::json!({
+            "attachment": {
+                "id": attachment_id,
+                "harness": handshake.adapter.harness,
+                "adapter_identity": handshake.adapter.adapter_identity,
+                "adapter_version": handshake.adapter.adapter_version,
+                "protocol_version": handshake.adapter_protocol_version,
+                "native_session_id": handshake.native_session_id,
+                "mode": negotiated.mode.as_str(),
+                "mode_tag": negotiated.mode.tag(),
+                "capabilities": negotiated.effective,
+                "missing_capabilities": negotiated.missing,
+            },
+            "commission_id": replay_cursor.map(|cursor| &cursor.commission_id),
+            "commission_role": replay_cursor.map(|_| "observer"),
+            "replay": replay,
+            "attachment_session_token": attachment_session_token,
+        });
+        let persisted_result = serde_json::json!({
+            "attachment_id": attachment_id,
+            "attachment_handshake": "consumed",
+        });
+        save_idempotent_result(
+            &transaction,
+            idempotency_key,
+            &request_hash,
+            &persisted_result,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn resume_attachment(
+        &self,
+        request: &Request,
+        handshake: &AttachmentHandshake,
+        replay_cursor: &CommissionReplayCursor,
+    ) -> Result<Value, TyrionError> {
+        validate_attachment_identity(&handshake.adapter)?;
+        if handshake.native_session_id.trim().is_empty() {
+            return Err(TyrionError::AttachmentRejected(
+                "native session identity must not be empty".into(),
+            ));
+        }
+        if replay_cursor.last_event_sequence < 0 {
+            return Err(TyrionError::AttachmentRejected(
+                "last durable event cursor must not be negative".into(),
+            ));
+        }
+        if handshake.adapter_protocol_version != PROTOCOL_VERSION {
+            return Err(TyrionError::AttachmentRejected(format!(
+                "adapter protocol version {} is incompatible with {PROTOCOL_VERSION}",
+                handshake.adapter_protocol_version
+            )));
+        }
+        let negotiated = attachment::negotiate(&handshake.capabilities)?;
+        let attachment_id = authenticated_attachment_id(&self.connection, request)?;
+        let stored = self.connection.query_row(
+            "SELECT harness, adapter_identity, adapter_version, protocol_version,
+                    native_session_id, mode, capabilities_json
+             FROM attachments WHERE id = ?1",
+            [&attachment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u16>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        let stored_capabilities = serde_json::from_str::<Vec<String>>(&stored.6)?;
+        let negotiated_capabilities = negotiated
+            .effective
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect::<Vec<_>>();
+        if stored.0 != handshake.adapter.harness
+            || stored.1 != handshake.adapter.adapter_identity
+            || stored.2 != handshake.adapter.adapter_version
+            || stored.3 != handshake.adapter_protocol_version
+            || stored.4 != handshake.native_session_id
+            || stored.5 != negotiated.mode.as_str()
+            || stored_capabilities != negotiated_capabilities
+        {
+            return Err(TyrionError::AttachmentRejected(
+                "resume handshake does not match the authenticated Attachment".into(),
+            ));
+        }
+        ensure_commission_attachment(
+            &self.connection,
+            &attachment_id,
+            &replay_cursor.commission_id,
+            attachment::EVENT_REPLAY,
+        )?;
+        let replay = replay_events(
+            &self.connection,
+            &attachment_id,
+            &replay_cursor.commission_id,
+            replay_cursor.last_event_sequence,
+        )?;
+        Ok(serde_json::json!({
+            "attachment_id": attachment_id,
+            "resumed": true,
+            "replay": replay,
+        }))
+    }
+
+    pub fn inspect_commission(
+        &self,
+        request: &Request,
+        commission_id: &str,
+    ) -> Result<Value, TyrionError> {
+        let attachment_id = authenticated_attachment_id(&self.connection, request)?;
+        ensure_commission_attachment(
+            &self.connection,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        project_commission(&self.connection, commission_id)
+    }
+
+    pub fn replay_events(
+        &self,
+        request: &Request,
+        commission_id: &str,
+        after_sequence: i64,
+    ) -> Result<Value, TyrionError> {
+        if after_sequence < 0 {
+            return Err(TyrionError::InvalidRequest(
+                "event replay cursor must not be negative".into(),
+            ));
+        }
+        let attachment_id = authenticated_attachment_id(&self.connection, request)?;
+        ensure_commission_attachment(
+            &self.connection,
+            &attachment_id,
+            commission_id,
+            attachment::EVENT_REPLAY,
+        )?;
+        replay_events(
+            &self.connection,
+            &attachment_id,
+            commission_id,
+            after_sequence,
+        )
     }
 
     pub fn ready_commission_ids(&self) -> Result<Vec<String>, TyrionError> {
@@ -140,6 +626,13 @@ impl Store {
         if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
             return Ok(prior);
         }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
 
         let (status, current_revision) = transaction
             .query_row(
@@ -216,7 +709,7 @@ impl Store {
             mandate_revision,
         )?;
 
-        let result = inspect_commission(&transaction, commission_id)?;
+        let result = project_commission(&transaction, commission_id)?;
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
         transaction.commit()?;
         Ok(result)
@@ -537,6 +1030,192 @@ fn block_ready_assignment(
     Ok(())
 }
 
+fn authenticated_attachment_id(
+    connection: &Connection,
+    request: &Request,
+) -> Result<String, TyrionError> {
+    let attachment_token = request
+        .attachment_token
+        .as_deref()
+        .filter(|attachment_token| !attachment_token.trim().is_empty())
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(
+                "an authenticated Attachment is required for this Commission operation".into(),
+            )
+        })?;
+    let token_hash = attachment_token_hash(attachment_token);
+    connection
+        .query_row(
+            "SELECT id FROM attachments WHERE session_token_hash = ?1",
+            [token_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| TyrionError::ControlDenied("Attachment credential is invalid".into()))
+}
+
+fn ensure_commission_exists(
+    connection: &Connection,
+    commission_id: &str,
+) -> Result<(), TyrionError> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commissions WHERE id = ?1)",
+        [commission_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(TyrionError::NotFound(commission_id.to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_attachment_capability(
+    connection: &Connection,
+    attachment_id: &str,
+    required_capability: &str,
+) -> Result<(), TyrionError> {
+    let capabilities_json = connection
+        .query_row(
+            "SELECT capabilities_json FROM attachments WHERE id = ?1",
+            [attachment_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(format!("Attachment {attachment_id} was not found"))
+        })?;
+    let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json)?;
+    if !capabilities
+        .iter()
+        .any(|capability| capability == required_capability)
+    {
+        return Err(TyrionError::ControlDenied(format!(
+            "Attachment {attachment_id} lacks the {required_capability} capability"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_commission_attachment(
+    connection: &Connection,
+    attachment_id: &str,
+    commission_id: &str,
+    required_capability: &str,
+) -> Result<(), TyrionError> {
+    ensure_commission_exists(connection, commission_id)?;
+    ensure_attachment_capability(connection, attachment_id, required_capability)?;
+    let observes = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM commission_attachments
+            WHERE commission_id = ?1 AND attachment_id = ?2
+         )",
+        params![commission_id, attachment_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !observes {
+        return Err(TyrionError::ControlDenied(format!(
+            "Attachment {attachment_id} does not observe Commission {commission_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_active_attachment(
+    connection: &Connection,
+    attachment_id: &str,
+    commission_id: &str,
+    required_capability: &str,
+) -> Result<(), TyrionError> {
+    ensure_commission_attachment(
+        connection,
+        attachment_id,
+        commission_id,
+        required_capability,
+    )?;
+    let is_active = connection.query_row(
+        "SELECT role = 'active' FROM commission_attachments
+         WHERE commission_id = ?1 AND attachment_id = ?2",
+        params![commission_id, attachment_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !is_active {
+        return Err(TyrionError::ControlDenied(format!(
+            "Attachment {attachment_id} is not the Active Attachment for Commission {commission_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn replay_events(
+    connection: &Connection,
+    attachment_id: &str,
+    commission_id: &str,
+    after_sequence: i64,
+) -> Result<Value, TyrionError> {
+    let (role, mode, capabilities_json, missing_capabilities_json) = connection.query_row(
+        "SELECT commission_attachments.role, attachments.mode,
+                attachments.capabilities_json, attachments.missing_capabilities_json
+         FROM commission_attachments
+         JOIN attachments ON attachments.id = commission_attachments.attachment_id
+         WHERE commission_attachments.commission_id = ?1
+           AND commission_attachments.attachment_id = ?2",
+        params![commission_id, attachment_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+    let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json)?;
+    let missing_capabilities = serde_json::from_str::<Vec<Value>>(&missing_capabilities_json)?;
+    let mut statement = connection.prepare(
+        "SELECT sequence, event_type, commission_revision, payload_json, created_at
+         FROM events
+         WHERE commission_id = ?1 AND sequence > ?2
+         ORDER BY sequence",
+    )?;
+    let rows = statement.query_map(params![commission_id, after_sequence], event_value)?;
+    let events = rows.collect::<Result<Vec<_>, _>>()?;
+    let next_event_sequence = events
+        .last()
+        .and_then(|event| event["sequence"].as_i64())
+        .unwrap_or(after_sequence);
+    let may_receive_material_notifications = role == "active"
+        && capabilities
+            .iter()
+            .any(|capability| capability == attachment::MATERIAL_NOTIFICATIONS);
+    let material_notifications = if may_receive_material_notifications {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("commission_verified_complete" | "assignment_blocked")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mode = attachment::AttachmentMode::parse(&mode)?;
+
+    Ok(serde_json::json!({
+        "attachment_id": attachment_id,
+        "attachment_mode": mode.as_str(),
+        "mode_tag": mode.tag(),
+        "commission_id": commission_id,
+        "commission_role": role,
+        "missing_capabilities": missing_capabilities,
+        "events": events,
+        "next_event_sequence": next_event_sequence,
+        "material_notifications": material_notifications,
+    }))
+}
+
 fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     if proposal.goal.trim().is_empty() {
         return Err(TyrionError::InvalidRequest("goal must not be empty".into()));
@@ -584,6 +1263,22 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
         ));
     }
     Ok(())
+}
+
+fn validate_attachment_identity(identity: &AdapterIdentity) -> Result<(), TyrionError> {
+    if identity.harness.trim().is_empty()
+        || identity.adapter_identity.trim().is_empty()
+        || identity.adapter_version.trim().is_empty()
+    {
+        return Err(TyrionError::InvalidRequest(
+            "harness, adapter identity, and adapter version must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn attachment_token_hash(launch_token: &str) -> String {
+    format!("{:x}", Sha256::digest(launch_token.as_bytes()))
 }
 
 fn ensure_result_fits_storage_ceiling(
@@ -706,9 +1401,33 @@ fn record_event(
     event_kind: EventKind,
     revision: i64,
 ) -> Result<(), TyrionError> {
+    record_event_with_payload(
+        transaction,
+        commission_id,
+        event_kind,
+        revision,
+        &serde_json::json!({}),
+    )
+}
+
+fn record_event_with_payload(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    event_kind: EventKind,
+    revision: i64,
+    payload: &Value,
+) -> Result<(), TyrionError> {
     transaction.execute(
-        "INSERT INTO events (commission_id, event_type, commission_revision, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![commission_id, event_kind.as_str(), revision, unix_timestamp()?],
+        "INSERT INTO events (
+            commission_id, event_type, commission_revision, payload_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            commission_id,
+            event_kind.as_str(),
+            revision,
+            serde_json::to_string(payload)?,
+            unix_timestamp()?
+        ],
     )?;
     Ok(())
 }

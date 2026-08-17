@@ -115,6 +115,8 @@ pub(crate) enum EventKind {
     EvidenceRecorded,
     CommissionVerifiedComplete,
     AssignmentBlocked,
+    AttachmentJoined,
+    ActiveAttachmentChanged,
 }
 
 impl EventKind {
@@ -128,6 +130,8 @@ impl EventKind {
             Self::EvidenceRecorded => "evidence_recorded",
             Self::CommissionVerifiedComplete => "commission_verified_complete",
             Self::AssignmentBlocked => "assignment_blocked",
+            Self::AttachmentJoined => "attachment_joined",
+            Self::ActiveAttachmentChanged => "active_attachment_changed",
         }
     }
 }

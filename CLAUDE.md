@@ -11,9 +11,16 @@
 - Evidence is immutable and bound to criterion, accepted mandate revision, candidate Result, verifier, and artifact revision. Failed Evidence leaves a candidate Result unaccepted.
 - Evidence uses the Assignment's persisted mandate revision, and the Control Plane independently recomputes deterministic Result artifact hashes before accepting them.
 - Verified Completion, accepted Result status, passed criteria, completion briefing, and the terminal event are committed in one SQLite transaction.
-- Mutating protocol requests require idempotency keys. Identical replay returns the stored response; key reuse with a different request is rejected.
+- Mutating protocol requests require idempotency keys. Identical replay returns the stored response; key reuse with a different request is rejected. A consumed attachment handshake is the credential-bearing exception: replay fails and its one-time session credential is never cached.
 - Run `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` before committing.
 - A stale socket remains after forced test shutdown. Startup may replace a socket file only after acquiring data-directory ownership and must refuse to replace any non-socket path.
 - Daemon startup resumes durable ready Assignments. Recovery of Attempts that were already running when the process stopped belongs to the later failure-recovery slice.
 - Keep lifecycle transactions in `store.rs`, read projections in `store/projection.rs`, and schema invariants in `store/schema.rs`.
 - After completing each tracker ticket, commit and push the current branch to `origin` before handoff.
+- Commission inspection and mutation require an opaque Attachment session credential. Public Attachment IDs identify projections but grant no authority. Proposal creation makes its capable creator active; later Attachments join as observers until an explicit revision-checked takeover.
+- Launch tokens expire within 300 seconds, are single-use, and bind the expected harness, adapter identity, and adapter version. The handshake also requires an exact protocol version and native session identity.
+- Entry capability negotiation currently covers proposal creation, acceptance, inspection, event replay, takeover, material notifications, and persistent mode display. Every missing capability returns its practical effect and derives Full, Limited, or Observer mode.
+- Attachment joins and control transfers are durable ordered events with structured payloads. Cursor replay returns only later events; observers receive the event ledger but never material notifications.
+- Resume reauthenticates the durable Attachment credential against the exact adapter, protocol, native session, and negotiated capabilities before replaying unseen events.
+- Control takeover advances a separate control revision without changing the Commission mandate revision or Authority Envelope.
+- Schema changes create one temporary SQLite backup before migration, verify database integrity and required schema afterward, then delete the backup.

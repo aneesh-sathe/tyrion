@@ -10,7 +10,7 @@ pub(super) fn inspect_commission(
 ) -> Result<Value, TyrionError> {
     let commission = connection
         .query_row(
-            "SELECT id, goal, status, revision, accepted_at, completed_at, artifact_revision
+            "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at, artifact_revision
              FROM commissions WHERE id = ?1",
             [commission_id],
             |row| {
@@ -19,9 +19,10 @@ pub(super) fn inspect_commission(
                     "goal": row.get::<_, String>(1)?,
                     "status": row.get::<_, String>(2)?,
                     "revision": row.get::<_, i64>(3)?,
-                    "accepted_at": row.get::<_, Option<i64>>(4)?,
-                    "completed_at": row.get::<_, Option<i64>>(5)?,
-                    "artifact_revision": row.get::<_, Option<String>>(6)?,
+                    "control_revision": row.get::<_, i64>(4)?,
+                    "accepted_at": row.get::<_, Option<i64>>(5)?,
+                    "completed_at": row.get::<_, Option<i64>>(6)?,
+                    "artifact_revision": row.get::<_, Option<String>>(7)?,
                 }))
             },
         )
@@ -144,17 +145,10 @@ pub(super) fn inspect_commission(
     let briefing = completion_briefing(connection, commission_id)?;
     let events = query_values(
         connection,
-        "SELECT sequence, event_type, commission_revision, created_at
+        "SELECT sequence, event_type, commission_revision, payload_json, created_at
          FROM events WHERE commission_id = ?1 ORDER BY sequence",
         commission_id,
-        |row| {
-            Ok(json!({
-                "sequence": row.get::<_, i64>(0)?,
-                "type": row.get::<_, String>(1)?,
-                "commission_revision": row.get::<_, i64>(2)?,
-                "created_at": row.get::<_, i64>(3)?,
-            }))
-        },
+        event_value,
     )?;
     let blockers = query_values(
         connection,
@@ -171,6 +165,29 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let attachments = query_values(
+        connection,
+        "SELECT attachments.id, attachments.harness, attachments.adapter_identity,
+                attachments.adapter_version, attachments.native_session_id, attachments.mode,
+                commission_attachments.role, commission_attachments.joined_at
+         FROM commission_attachments
+         JOIN attachments ON attachments.id = commission_attachments.attachment_id
+         WHERE commission_attachments.commission_id = ?1
+         ORDER BY commission_attachments.joined_at, attachments.id",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "harness": row.get::<_, String>(1)?,
+                "adapter_identity": row.get::<_, String>(2)?,
+                "adapter_version": row.get::<_, String>(3)?,
+                "native_session_id": row.get::<_, String>(4)?,
+                "mode": row.get::<_, String>(5)?,
+                "role": row.get::<_, String>(6)?,
+                "joined_at": row.get::<_, i64>(7)?,
+            }))
+        },
+    )?;
 
     Ok(json!({
         "commission": commission,
@@ -182,6 +199,21 @@ pub(super) fn inspect_commission(
         "briefing": briefing,
         "events": events,
         "blockers": blockers,
+        "attachments": attachments,
+    }))
+}
+
+pub(super) fn event_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let payload_json = row.get::<_, String>(3)?;
+    let payload = serde_json::from_str::<Value>(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(json!({
+        "sequence": row.get::<_, i64>(0)?,
+        "type": row.get::<_, String>(1)?,
+        "commission_revision": row.get::<_, i64>(2)?,
+        "payload": payload,
+        "created_at": row.get::<_, i64>(4)?,
     }))
 }
 

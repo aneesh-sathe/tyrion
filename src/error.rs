@@ -11,6 +11,9 @@ pub enum ErrorCode {
     NotFound,
     IdempotencyConflict,
     StaleRevision,
+    StaleControlRevision,
+    AttachmentRejected,
+    ControlDenied,
 }
 
 #[derive(Debug, Error)]
@@ -25,6 +28,14 @@ pub enum TyrionError {
     IdempotencyConflict,
     #[error("stale commission revision: expected {expected}, current revision is {actual}")]
     StaleRevision { expected: i64, actual: i64 },
+    #[error(
+        "stale attachment control revision: expected {expected}, current revision is {actual}"
+    )]
+    StaleControlRevision { expected: i64, actual: i64 },
+    #[error("attachment rejected: {0}")]
+    AttachmentRejected(String),
+    #[error("control denied: {0}")]
+    ControlDenied(String),
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("database failure: {0}")]
@@ -41,6 +52,9 @@ impl TyrionError {
             Self::NotFound(_) => ErrorCode::NotFound,
             Self::IdempotencyConflict => ErrorCode::IdempotencyConflict,
             Self::StaleRevision { .. } => ErrorCode::StaleRevision,
+            Self::StaleControlRevision { .. } => ErrorCode::StaleControlRevision,
+            Self::AttachmentRejected(_) => ErrorCode::AttachmentRejected,
+            Self::ControlDenied(_) => ErrorCode::ControlDenied,
             Self::Io(_) | Self::Database(_) | Self::Serialization(_) => ErrorCode::Internal,
         }
     }
@@ -50,6 +64,10 @@ impl TyrionError {
             Self::StaleRevision { expected, actual } => Some(serde_json::json!({
                 "expected_revision": expected,
                 "current_revision": actual,
+            })),
+            Self::StaleControlRevision { expected, actual } => Some(serde_json::json!({
+                "expected_control_revision": expected,
+                "current_control_revision": actual,
             })),
             _ => None,
         }

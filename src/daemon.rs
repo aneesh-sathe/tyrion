@@ -184,12 +184,39 @@ fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, Tyr
             store.create_proposal(request, proposal)?,
         )),
         Command::InspectCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
-            store.inspect_commission(commission_id)?,
+            store.inspect_commission(request, commission_id)?,
         )),
         Command::AcceptCommission { commission_id } => Ok(DispatchOutcome {
             data: store.accept_commission(request, commission_id)?,
             follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
         }),
+        Command::IssueAttachmentToken {
+            expected_adapter,
+            ttl_seconds,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.issue_attachment_token(request, expected_adapter, *ttl_seconds)?,
+        )),
+        Command::ConnectAttachment {
+            launch_token,
+            handshake,
+            replay,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.connect_attachment(request, launch_token, handshake, replay.as_ref())?,
+        )),
+        Command::ResumeAttachment { handshake, replay } => Ok(DispatchOutcome::without_follow_up(
+            store.resume_attachment(request, handshake, replay)?,
+        )),
+        Command::TakeControl { commission_id } => Ok(DispatchOutcome::without_follow_up(
+            store.take_control(request, commission_id)?,
+        )),
+        Command::ReplayEvents {
+            commission_id,
+            after_sequence,
+        } => Ok(DispatchOutcome::without_follow_up(store.replay_events(
+            request,
+            commission_id,
+            *after_sequence,
+        )?)),
     }
 }
 
