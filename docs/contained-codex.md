@@ -1,6 +1,6 @@
 # Contained Codex Git assignments
 
-Tyrion supports one production Git assignment profile: Codex CLI `0.147.0` inside the repaired OpenShell `0.0.104` MicroVM boundary. The profile pins OpenShell source revision `dd2b4e3bc0688bdd59f90030f7c1d52511d6e354`, the base image digest, the hard Landlock policy, the repaired kernel configuration, every runtime artifact, and the Linux Codex binary. Startup rejects a missing or mismatched artifact.
+Tyrion supports one production Git assignment profile: Codex CLI `0.147.0` inside the repaired OpenShell `0.0.104` MicroVM boundary. The profile pins OpenShell source revision `dd2b4e3bc0688bdd59f90030f7c1d52511d6e354`, the base image digest, the hard Landlock policy, the repaired kernel configuration, every runtime artifact, and the Linux Codex binary. Startup rejects missing or hash-mismatched artifacts. After transfer, the MicroVM itself verifies the guest-only Codex binary version before executing it.
 
 The gateway must use the VM driver with mTLS, 2 vCPUs, 2 GiB memory, a 4 GiB overlay, and the repaired guest's 256-process child cgroup. The checked policy at [`runtime/openshell/hard-landlock-policy.yaml`](../runtime/openshell/hard-landlock-policy.yaml) denies network access unless an explicitly selected OpenShell provider adds a named endpoint policy.
 

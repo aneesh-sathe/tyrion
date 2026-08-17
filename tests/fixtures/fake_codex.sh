@@ -2,6 +2,15 @@
 set -eu
 
 if [ "${1:-}" = "--version" ]; then
+    if [ -z "${TYRION_WORKSPACE_ROOT:-}" ]; then
+        printf '%s\n' 'guest Codex was executed outside the sandbox' >&2
+        exit 86
+    fi
+    fake_state=$(dirname "$(dirname "$TYRION_WORKSPACE_ROOT")")
+    if [ -e "$fake_state/wrong-codex-version" ]; then
+        printf '%s\n' 'codex-cli 0.146.0'
+        exit 0
+    fi
     printf '%s\n' 'codex-cli 0.147.0'
     exit 0
 fi

@@ -33,3 +33,4 @@
 - Classify Worker-time storage breaches as `max_storage_bytes` resource Blockers with the exact required minimum; use typed Worker Lease expiry errors for durable lease status.
 - Run `cargo test --test git_commission` for contained Git lifecycle, lease expiry, boundary failure, unauthorized-path, descendant-cleanup, and malformed-transfer coverage.
 - Run the ignored `real_openshell_microvm_completes_the_contained_git_assignment` test with `TYRION_REAL_CODEX_WORKER_CONFIG` to attest the repaired MicroVM boundary; the default suite uses deterministic protocol fakes.
+- Treat the pinned Codex artifact as a guest-only Linux binary: hash it on the host, but probe its version only after upload inside the MicroVM.

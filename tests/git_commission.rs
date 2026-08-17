@@ -200,6 +200,7 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert!(log.contains("ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:"));
     assert!(log.contains("tyrion-containment-probe"));
     assert!(log.contains("descendant-terminated"));
+    assert!(log.contains("/sandbox/codex --version"));
     assert!(!log.lines().any(|line| {
         line.contains("sandbox upload") && line.contains(path_text(&principal_checkout))
     }));
@@ -246,6 +247,28 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap();
     assert_eq!(log.matches("sandbox create").count(), 1);
     assert_eq!(log.matches("sandbox delete").count(), 1);
+    assert!(!log.contains("run-attempt.sh"));
+}
+
+#[test]
+fn guest_codex_version_mismatch_is_rejected_before_execution() {
+    let fixture = FailedFixture::new("wrong-codex-version");
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &fixture.proposal_path);
+
+    let failed = wait_for_failed_attempt(&daemon, &attachment_token, &commission_id);
+    assert_eq!(failed["assignments"][0]["status"], "verification_failed");
+    assert_eq!(failed["attempts"][0]["status"], "failed");
+    assert_eq!(failed["attempts"][0]["lease"]["status"], "revoked");
+    assert_eq!(failed["results"], json!([]));
+    assert!(failed["blockers"][0]["requirement"]
+        .as_str()
+        .unwrap()
+        .contains("Codex binary version does not match its pin"));
+
+    let log = fs::read_to_string(fixture.fake_state.join("commands.log")).unwrap();
+    assert!(log.contains("/sandbox/codex --version"));
     assert!(!log.contains("run-attempt.sh"));
 }
 

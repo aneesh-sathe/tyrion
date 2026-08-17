@@ -151,6 +151,21 @@ impl ContainedCodexRuntime {
             "/sandbox/codex",
             assignment.lease_expires_at,
         )?;
+        sandbox.exec_checked(
+            &["chmod", "700", "/sandbox/codex"],
+            None,
+            assignment.lease_expires_at,
+        )?;
+        let codex = sandbox.exec_checked(
+            &["/sandbox/codex", "--version"],
+            None,
+            assignment.lease_expires_at,
+        )?;
+        if String::from_utf8_lossy(&codex.stdout).trim() != self.config.codex_version {
+            return Err(TyrionError::InvalidRequest(
+                "Codex binary version does not match its pin".into(),
+            ));
+        }
         let prompt_path = artifact_dir.join("prompt.txt");
         fs::write(&prompt_path, worker_prompt(assignment, base_revision))?;
         sandbox.upload(
@@ -715,16 +730,6 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
     if String::from_utf8_lossy(&openshell.stdout).trim() != config.openshell_version {
         return Err(TyrionError::InvalidRequest(
             "OpenShell binary version does not match its pin".into(),
-        ));
-    }
-    let codex = Command::new(&config.codex_binary)
-        .arg("--version")
-        .env_clear()
-        .output()?;
-    let codex = require_success("Codex version probe", codex)?;
-    if String::from_utf8_lossy(&codex.stdout).trim() != config.codex_version {
-        return Err(TyrionError::InvalidRequest(
-            "Codex binary version does not match its pin".into(),
         ));
     }
     Ok(())
