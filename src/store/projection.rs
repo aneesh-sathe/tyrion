@@ -10,10 +10,12 @@ pub(super) fn inspect_commission(
 ) -> Result<Value, TyrionError> {
     let commission = connection
         .query_row(
-            "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at, artifact_revision
+            "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at,
+                    artifact_revision, execution_json
              FROM commissions WHERE id = ?1",
             [commission_id],
             |row| {
+                let execution = json_column(row, 8)?;
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
                     "goal": row.get::<_, String>(1)?,
@@ -23,6 +25,7 @@ pub(super) fn inspect_commission(
                     "accepted_at": row.get::<_, Option<i64>>(5)?,
                     "completed_at": row.get::<_, Option<i64>>(6)?,
                     "artifact_revision": row.get::<_, Option<String>>(7)?,
+                    "execution": execution,
                 }))
             },
         )
@@ -58,13 +61,23 @@ pub(super) fn inspect_commission(
          FROM criteria WHERE commission_id = ?1 ORDER BY position",
         commission_id,
         |row| {
+            let verifier_kind = row.get::<_, String>(2)?;
+            let expected = row.get::<_, String>(3)?;
+            let verifier = if verifier_kind == "command" {
+                json!({"kind": "command", "argv": serde_json::from_str::<Value>(&expected).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?})
+            } else {
+                json!({"kind": verifier_kind, "expected": expected})
+            };
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "description": row.get::<_, String>(1)?,
-                "verifier": {
-                    "kind": row.get::<_, String>(2)?,
-                    "expected": row.get::<_, String>(3)?,
-                },
+                "verifier": verifier,
                 "status": row.get::<_, String>(4)?,
             }))
         },
@@ -98,12 +111,26 @@ pub(super) fn inspect_commission(
     let attempts = query_values(
         connection,
         "SELECT attempts.id, attempts.assignment_id, attempts.worker_configuration,
-                attempts.status, attempts.started_at, attempts.completed_at
+                attempts.status, attempts.started_at, attempts.completed_at,
+                worker_leases.id, worker_leases.issued_at, worker_leases.expires_at,
+                worker_leases.released_at, worker_leases.status
          FROM attempts
          JOIN assignments ON assignments.id = attempts.assignment_id
+         LEFT JOIN worker_leases ON worker_leases.attempt_id = attempts.id
          WHERE assignments.commission_id = ?1 ORDER BY attempts.started_at, attempts.id",
         commission_id,
         |row| {
+            let lease_id = row.get::<_, Option<String>>(6)?;
+            let lease = match lease_id {
+                Some(id) => Some(json!({
+                    "id": id,
+                    "issued_at": row.get::<_, i64>(7)?,
+                    "expires_at": row.get::<_, i64>(8)?,
+                    "released_at": row.get::<_, Option<i64>>(9)?,
+                    "status": row.get::<_, String>(10)?,
+                })),
+                None => None,
+            };
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "assignment_id": row.get::<_, String>(1)?,
@@ -111,13 +138,18 @@ pub(super) fn inspect_commission(
                 "status": row.get::<_, String>(3)?,
                 "started_at": row.get::<_, i64>(4)?,
                 "completed_at": row.get::<_, Option<i64>>(5)?,
+                "lease": lease,
             }))
         },
     )?;
     let results = query_values(
         connection,
         "SELECT results.id, results.attempt_id, results.output, results.artifact_revision,
-                results.status, results.created_at
+                results.status, results.created_at, results.mandate_revision,
+                results.base_revision, results.candidate_commits_json,
+                results.changed_paths_json, results.artifacts_json,
+                results.verification_outcomes_json, results.known_effects_json,
+                results.integrated_artifact_revision
          FROM results
          JOIN attempts ON attempts.id = results.attempt_id
          JOIN assignments ON assignments.id = attempts.assignment_id
@@ -131,6 +163,14 @@ pub(super) fn inspect_commission(
                 "artifact_revision": row.get::<_, String>(3)?,
                 "status": row.get::<_, String>(4)?,
                 "created_at": row.get::<_, i64>(5)?,
+                "mandate_revision": row.get::<_, Option<i64>>(6)?,
+                "base_revision": row.get::<_, Option<String>>(7)?,
+                "candidate_commits": json_column(row, 8)?,
+                "changed_paths": json_column(row, 9)?,
+                "artifacts": json_column(row, 10)?,
+                "verification_outcomes": json_column(row, 11)?,
+                "known_effects": json_column(row, 12)?,
+                "integrated_artifact_revision": row.get::<_, Option<String>>(13)?,
             }))
         },
     )?;
@@ -203,6 +243,17 @@ pub(super) fn inspect_commission(
     }))
 }
 
+fn json_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value> {
+    let encoded = row.get::<_, String>(index)?;
+    serde_json::from_str(&encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 pub(super) fn event_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let payload_json = row.get::<_, String>(3)?;
     let payload = serde_json::from_str::<Value>(&payload_json).map_err(|error| {
@@ -259,6 +310,13 @@ fn completion_briefing(
          FROM criteria
          JOIN evidence ON evidence.commission_id = criteria.commission_id
                       AND evidence.criterion_id = criteria.criterion_id
+                      AND evidence.rowid = (
+                          SELECT latest.rowid FROM evidence AS latest
+                          WHERE latest.commission_id = criteria.commission_id
+                            AND latest.criterion_id = criteria.criterion_id
+                          ORDER BY latest.created_at DESC, latest.rowid DESC
+                          LIMIT 1
+                      )
          WHERE criteria.commission_id = ?1 ORDER BY criteria.position",
         commission_id,
         |row| {

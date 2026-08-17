@@ -24,3 +24,12 @@
 - Resume reauthenticates the durable Attachment credential against the exact adapter, protocol, native session, and negotiated capabilities before replaying unseen events.
 - Control takeover advances a separate control revision without changing the Commission mandate revision or Authority Envelope.
 - Schema changes create one temporary SQLite backup before migration, verify database integrity and required schema afterward, then delete the backup.
+- `codex_git` proposals require a full immutable base object ID, an exact repository authority entry, normalized authorized changed paths, `codex.git_change`, command verifiers, and no destinations or effects.
+- Start the contained Worker path with `tyriond --codex-worker-config <json>`; the configuration pins Codex CLI 0.147.0, OpenShell 0.0.104, the repaired source and runtime artifacts, the hard policy, the base image, and the fixed 2-vCPU, 2-GiB, 4-GiB, 256-process boundary.
+- OpenShell Codex authentication reaches the Attempt only as `openshell:resolve:env:*` placeholders from the named provider. Tyrion rejects raw values, creates a disposable Codex home, and clears the Worker environment.
+- Git Commissions transfer verified bundles only, require a linear chain from the immutable base, authorize the union of paths touched across every candidate commit, verify the candidate in a fresh MicroVM, integrate into daemon-owned state, and verify the integrated bundle in another fresh MicroVM.
+- Passing candidate and integrated checks each create immutable Evidence. A Result remains candidate until fresh integrated verification passes and acceptance is committed with Verified Completion.
+- Dispatch each ready Assignment on its own SQLite connection and background thread so a long Worker cannot block the Control Plane listener.
+- Classify Worker-time storage breaches as `max_storage_bytes` resource Blockers with the exact required minimum; use typed Worker Lease expiry errors for durable lease status.
+- Run `cargo test --test git_commission` for contained Git lifecycle, lease expiry, boundary failure, unauthorized-path, descendant-cleanup, and malformed-transfer coverage.
+- Run the ignored `real_openshell_microvm_completes_the_contained_git_assignment` test with `TYRION_REAL_CODEX_WORKER_CONFIG` to attest the repaired MicroVM boundary; the default suite uses deterministic protocol fakes.

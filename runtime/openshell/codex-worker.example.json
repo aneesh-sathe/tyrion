@@ -1,0 +1,34 @@
+{
+  "openshell_binary": "/absolute/path/to/openshell-0.0.104",
+  "openshell_sha256": "cafb95f472a39ec755e67dcd04ef30010c69c4e7024d922c27b630bbd3716e91",
+  "openshell_version": "openshell 0.0.104",
+  "openshell_config_home": "/absolute/path/to/openshell-client-config",
+  "policy_path": "/absolute/path/to/tyrion/runtime/openshell/hard-landlock-policy.yaml",
+  "policy_sha256": "a245a499c89f4edf39203935d83ae5fd8e3209e121da78a2eaaa0ff82512a469",
+  "gateway_config_path": "/absolute/path/to/repaired-v0.0.104/gateway.toml",
+  "gateway_config_sha256": "758cd933b78c1d74b8a67a6494e5834de52abb28a822a6218e6139751fe12a7a",
+  "kernel_config_path": "/absolute/path/to/repaired-v0.0.104/kernel.config",
+  "kernel_config_sha256": "f04e4835de5b9c5b52aa13ab49af43d3f4eea8aca5104102ebe764f8354ac823",
+  "runtime_artifacts": [
+    {
+      "path": "/absolute/path/to/repaired-v0.0.104/runtime/libkrunfw.5.dylib",
+      "sha256": "aff8e0804ff5b6925b61db451f6320d2bc75b4f569216789703c2935b94faf27"
+    },
+    {
+      "path": "/absolute/path/to/openshell-driver-vm-0.0.104",
+      "sha256": "e2053fc9847362372f713482fb72641f82958280764ce78ca731e5ff61f7c641"
+    }
+  ],
+  "source_revision": "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354",
+  "base_image": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
+  "codex_binary": "/absolute/path/to/linux-aarch64/codex-0.147.0",
+  "codex_version": "codex-cli 0.147.0",
+  "codex_sha256": "replace-with-the-linux-codex-binary-sha256",
+  "model": "gpt-5.5",
+  "openshell_provider": "tyrion-codex",
+  "lease_ttl_seconds": 900,
+  "vcpus": 2,
+  "memory_mib": 2048,
+  "overlay_disk_mib": 4096,
+  "max_processes": 256
+}

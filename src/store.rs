@@ -10,14 +10,14 @@ use uuid::Uuid;
 
 use crate::domain::{
     AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus, CriterionStatus,
-    EventKind, EvidenceOutcome, ResultStatus,
+    EventKind, EvidenceOutcome, ResultStatus, WorkerLeaseStatus,
 };
 use crate::protocol::{
-    AdapterIdentity, AttachmentHandshake, CommissionProposal, CommissionReplayCursor, Request,
-    ResourceCeilings, Verifier, PROTOCOL_VERSION,
+    AdapterIdentity, AttachmentHandshake, CommissionProposal, CommissionReplayCursor,
+    ExecutionSpec, Request, ResourceCeilings, Verifier, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
-use crate::{attachment, verification, worker};
+use crate::{attachment, worker};
 
 mod projection;
 mod schema;
@@ -31,6 +31,7 @@ pub struct Store {
 struct ReadyAssignmentDispatch {
     assignment_id: String,
     goal: String,
+    execution_json: String,
     mandate_revision: i64,
     commission_revision: i64,
     accepted_at: i64,
@@ -83,18 +84,21 @@ impl Store {
 
         let commission_id = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO commissions (id, goal, status, revision, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
+            "INSERT INTO commissions (id, goal, status, revision, created_at, execution_json)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
             params![
                 commission_id,
                 proposal.goal,
                 CommissionStatus::Proposed.as_str(),
-                unix_timestamp()?
+                unix_timestamp()?,
+                serde_json::to_string(&proposal.execution)?,
             ],
         )?;
 
         for (position, criterion) in proposal.criteria.iter().enumerate() {
             let (verifier_kind, expected) = match &criterion.verifier {
-                Verifier::ExactMatch { expected } => ("exact_match", expected),
+                Verifier::ExactMatch { expected } => ("exact_match", expected.clone()),
+                Verifier::Command { argv } => ("command", serde_json::to_string(argv)?),
             };
             transaction.execute(
                 "INSERT INTO criteria (commission_id, criterion_id, position, description, verifier_kind, expected, status)
@@ -634,11 +638,17 @@ impl Store {
             attachment::COMMISSION_ACCEPTANCE,
         )?;
 
-        let (status, current_revision) = transaction
+        let (status, current_revision, execution_json) = transaction
             .query_row(
-                "SELECT status, revision FROM commissions WHERE id = ?1",
+                "SELECT status, revision, execution_json FROM commissions WHERE id = ?1",
                 [commission_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
@@ -654,6 +664,11 @@ impl Store {
                 status
             )));
         }
+        let execution: ExecutionSpec = serde_json::from_str(&execution_json)?;
+        let required_action = match execution {
+            ExecutionSpec::Deterministic => worker::DETERMINISTIC_ACTION,
+            ExecutionSpec::CodexGit { .. } => worker::CODEX_GIT_ACTION,
+        };
         let may_execute = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM authority_scopes
@@ -662,14 +677,14 @@ impl Store {
             params![
                 commission_id,
                 AuthorityScopeType::Action.as_str(),
-                worker::ACTION
+                required_action
             ],
             |row| row.get::<_, bool>(0),
         )?;
         if !may_execute {
-            return Err(TyrionError::InvalidRequest(
-                "the Authority Envelope does not permit deterministic.echo".into(),
-            ));
+            return Err(TyrionError::InvalidRequest(format!(
+                "the Authority Envelope does not permit {required_action}"
+            )));
         }
 
         let accepted_at = unix_timestamp()?;
@@ -718,7 +733,7 @@ impl Store {
     pub fn run_ready_assignment(
         &mut self,
         commission_id: &str,
-        worker: &dyn worker::Worker,
+        worker: &worker::WorkerRuntime,
     ) -> Result<(), TyrionError> {
         let transaction = self.connection.transaction()?;
         let ready = transaction
@@ -728,7 +743,7 @@ impl Store {
                         commissions.accepted_at, resource_ceilings.max_attempts,
                         resource_ceilings.max_elapsed_seconds,
                         resource_ceilings.max_worker_concurrency,
-                        resource_ceilings.max_storage_bytes
+                        resource_ceilings.max_storage_bytes, commissions.execution_json
                  FROM assignments
                  JOIN commissions ON commissions.id = assignments.commission_id
                  JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
@@ -753,6 +768,7 @@ impl Store {
                         max_elapsed_seconds: row.get(6)?,
                         max_worker_concurrency: row.get(7)?,
                         max_storage_bytes: row.get(8)?,
+                        execution_json: row.get(9)?,
                     })
                 },
             )
@@ -760,6 +776,7 @@ impl Store {
         let Some(ready) = ready else {
             return Ok(());
         };
+        let execution: ExecutionSpec = serde_json::from_str(&ready.execution_json)?;
         if ready.mandate_revision != ready.commission_revision {
             return Err(TyrionError::InvalidRequest(format!(
                 "ready Assignment {} is bound to mandate revision {}, but Commission {} is at revision {}",
@@ -808,7 +825,9 @@ impl Store {
                 "Start a new Commission with a higher max_elapsed_seconds ceiling.",
             );
         }
-        if ready.goal.len() as u64 > ready.max_storage_bytes {
+        if matches!(execution, ExecutionSpec::Deterministic)
+            && ready.goal.len() as u64 > ready.max_storage_bytes
+        {
             return block_ready_assignment(
                 transaction,
                 commission_id,
@@ -819,16 +838,48 @@ impl Store {
             );
         }
 
+        let criteria = load_criteria(&transaction, commission_id)?;
+        let authorized_paths = load_authorized_paths(&transaction, commission_id)?;
+        let configuration = worker.configuration(&execution)?;
+        let lease_ttl_seconds = worker.lease_ttl_seconds(&execution)?;
+        let commission_deadline = ready
+            .accepted_at
+            .saturating_add(ready.max_elapsed_seconds as i64);
+        let lease_expires_at = now
+            .saturating_add(lease_ttl_seconds as i64)
+            .min(commission_deadline);
+        if lease_expires_at <= now {
+            return block_ready_assignment(
+                transaction,
+                commission_id,
+                &ready.assignment_id,
+                ready.mandate_revision,
+                "worker_lease",
+                "Start a new Commission with enough elapsed time for an expiring Worker Lease.",
+            );
+        }
         let attempt_id = Uuid::new_v4().to_string();
+        let lease_id = Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO attempts (id, assignment_id, worker_configuration, status, started_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 attempt_id,
                 ready.assignment_id,
-                worker.configuration(),
+                configuration,
                 AttemptStatus::Running.as_str(),
                 now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO worker_leases (id, attempt_id, issued_at, expires_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                lease_id,
+                attempt_id,
+                now,
+                lease_expires_at,
+                WorkerLeaseStatus::Active.as_str(),
             ],
         )?;
         transaction.execute(
@@ -843,7 +894,32 @@ impl Store {
         )?;
         transaction.commit()?;
 
-        let candidate = worker.execute(&ready.goal);
+        let assignment = worker::AssignmentContext {
+            commission_id: commission_id.to_owned(),
+            assignment_id: ready.assignment_id.clone(),
+            attempt_id: attempt_id.clone(),
+            mandate_revision: ready.mandate_revision,
+            goal: ready.goal.clone(),
+            execution,
+            criteria,
+            authorized_paths,
+            max_storage_bytes: ready.max_storage_bytes,
+            lease_expires_at,
+        };
+        let candidate = match worker.execute(&assignment) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.fail_attempt(
+                    commission_id,
+                    &assignment.assignment_id,
+                    &attempt_id,
+                    &lease_id,
+                    ready.mandate_revision,
+                    &error,
+                )?;
+                return Ok(());
+            }
+        };
         let transaction = self.connection.transaction()?;
         let current_revision = transaction.query_row(
             "SELECT revision FROM commissions WHERE id = ?1 AND status = ?2",
@@ -858,9 +934,16 @@ impl Store {
         }
         let result_id = Uuid::new_v4().to_string();
         let result_created_at = unix_timestamp()?;
+        let candidate_commits_json = serde_json::to_string(&candidate.candidate_commits)?;
+        let changed_paths_json = serde_json::to_string(&candidate.changed_paths)?;
+        let artifacts_json = serde_json::to_string(&candidate.artifacts)?;
+        let known_effects_json = serde_json::to_string(&candidate.known_effects)?;
         transaction.execute(
-            "INSERT INTO results (id, attempt_id, output, artifact_revision, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO results (
+                id, attempt_id, output, artifact_revision, status, created_at,
+                mandate_revision, base_revision, candidate_commits_json,
+                changed_paths_json, artifacts_json, known_effects_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 result_id,
                 attempt_id,
@@ -868,6 +951,12 @@ impl Store {
                 candidate.artifact_revision.as_str(),
                 ResultStatus::Candidate.as_str(),
                 result_created_at,
+                ready.mandate_revision,
+                candidate.base_revision,
+                candidate_commits_json,
+                changed_paths_json,
+                artifacts_json,
+                known_effects_json,
             ],
         )?;
         record_event(
@@ -876,124 +965,382 @@ impl Store {
             EventKind::ResultSubmitted,
             ready.mandate_revision,
         )?;
+        transaction.commit()?;
 
-        let criteria = {
-            let mut statement = transaction.prepare(
-                "SELECT criterion_id, expected FROM criteria
-                 WHERE commission_id = ?1 ORDER BY position",
-            )?;
-            let rows = statement.query_map([commission_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let artifact_revision_is_current = candidate
-            .artifact_revision
-            .matches_content(&candidate.output);
-        let mut every_criterion_passed = true;
-        for (criterion_id, expected) in criteria {
-            let verification = verification::exact_match(&expected, &candidate.output);
-            let evidence_outcome = if artifact_revision_is_current {
-                verification.outcome
-            } else {
-                EvidenceOutcome::Failed
-            };
-            every_criterion_passed &= evidence_outcome == EvidenceOutcome::Passed;
-            let evidence_id = Uuid::new_v4().to_string();
-            transaction.execute(
-                "INSERT INTO evidence (
-                    id, commission_id, criterion_id, result_id, mandate_revision,
-                    artifact_revision, verifier_kind, outcome, observed, expected, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'exact_match', ?7, ?8, ?9, ?10)",
-                params![
-                    evidence_id,
+        let candidate_verification = match worker.verify_candidate(&assignment, &candidate) {
+            Ok(verification) => verification,
+            Err(error) => {
+                self.fail_attempt(
                     commission_id,
-                    criterion_id,
-                    result_id,
+                    &assignment.assignment_id,
+                    &attempt_id,
+                    &lease_id,
                     ready.mandate_revision,
-                    candidate.artifact_revision.as_str(),
-                    evidence_outcome.as_str(),
-                    verification.observed,
-                    expected,
-                    unix_timestamp()?,
-                ],
-            )?;
-            transaction.execute(
-                "UPDATE criteria SET status = ?3 WHERE commission_id = ?1 AND criterion_id = ?2",
-                params![
-                    commission_id,
-                    criterion_id,
-                    evidence_outcome.criterion_status().as_str()
-                ],
-            )?;
-            record_event(
-                &transaction,
-                commission_id,
-                EventKind::EvidenceRecorded,
-                ready.mandate_revision,
-            )?;
-        }
-
+                    &error,
+                )?;
+                return Ok(());
+            }
+        };
+        let candidate_passed = candidate_verification
+            .iter()
+            .all(worker::VerificationRecord::passed);
+        let transaction = self.connection.transaction()?;
         transaction.execute(
-            "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+            "UPDATE results SET verification_outcomes_json = ?2 WHERE id = ?1",
+            params![result_id, serde_json::to_string(&candidate_verification)?],
+        )?;
+        record_evidence(
+            &transaction,
+            commission_id,
+            &result_id,
+            ready.mandate_revision,
+            candidate.artifact_revision.as_str(),
+            &candidate_verification,
+        )?;
+        if !candidate_passed {
+            finish_failed_verification(
+                &transaction,
+                &assignment.assignment_id,
+                &attempt_id,
+                &lease_id,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        transaction.commit()?;
+
+        let integrated = match worker.integrate(&assignment, &candidate) {
+            Ok(integrated) => integrated,
+            Err(error) => {
+                self.fail_attempt(
+                    commission_id,
+                    &assignment.assignment_id,
+                    &attempt_id,
+                    &lease_id,
+                    ready.mandate_revision,
+                    &error,
+                )?;
+                return Ok(());
+            }
+        };
+        let mut artifacts = candidate.artifacts.clone();
+        artifacts.extend(integrated.artifacts.clone());
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE results
+             SET artifacts_json = ?2, integrated_artifact_revision = ?3
+             WHERE id = ?1",
             params![
-                attempt_id,
-                AttemptStatus::Succeeded.as_str(),
-                unix_timestamp()?
+                result_id,
+                serde_json::to_string(&artifacts)?,
+                integrated.artifact_revision.as_str(),
             ],
         )?;
-        if every_criterion_passed {
-            transaction.execute(
-                "UPDATE assignments SET status = ?2 WHERE id = ?1",
-                params![ready.assignment_id, AssignmentStatus::Accepted.as_str()],
-            )?;
-            transaction.execute(
-                "UPDATE results SET status = ?2 WHERE id = ?1",
-                params![result_id, ResultStatus::Accepted.as_str()],
-            )?;
-            let completion_revision = ready.mandate_revision + 1;
-            let completed_at = unix_timestamp()?;
-            transaction.execute(
-                "UPDATE commissions
-                 SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
-                 WHERE id = ?1",
-                params![
+        transaction.execute(
+            "UPDATE commissions SET artifact_revision = ?2 WHERE id = ?1",
+            params![commission_id, integrated.artifact_revision.as_str()],
+        )?;
+        record_event(
+            &transaction,
+            commission_id,
+            EventKind::ResultIntegrated,
+            ready.mandate_revision,
+        )?;
+        transaction.commit()?;
+
+        let integrated_verification = match worker.verify_integrated(&assignment, &integrated) {
+            Ok(verification) => verification,
+            Err(error) => {
+                self.fail_attempt(
                     commission_id,
-                    CommissionStatus::VerifiedComplete.as_str(),
-                    completion_revision,
-                    completed_at,
-                    candidate.artifact_revision.as_str(),
-                ],
-            )?;
-            transaction.execute(
-                "INSERT INTO completion_briefings (commission_id, summary, artifact_revision, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    commission_id,
-                    format!("Verified Complete: {}", ready.goal),
-                    candidate.artifact_revision.as_str(),
-                    completed_at,
-                ],
-            )?;
-            record_event(
+                    &assignment.assignment_id,
+                    &attempt_id,
+                    &lease_id,
+                    ready.mandate_revision,
+                    &error,
+                )?;
+                return Ok(());
+            }
+        };
+        let integrated_passed = integrated_verification
+            .iter()
+            .all(worker::VerificationRecord::passed);
+        let mut all_verification = candidate_verification;
+        all_verification.extend(integrated_verification.clone());
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE results SET verification_outcomes_json = ?2 WHERE id = ?1",
+            params![result_id, serde_json::to_string(&all_verification)?],
+        )?;
+        record_evidence(
+            &transaction,
+            commission_id,
+            &result_id,
+            ready.mandate_revision,
+            integrated.artifact_revision.as_str(),
+            &integrated_verification,
+        )?;
+        if !integrated_passed {
+            finish_failed_verification(
                 &transaction,
-                commission_id,
-                EventKind::CommissionVerifiedComplete,
-                completion_revision,
+                &assignment.assignment_id,
+                &attempt_id,
+                &lease_id,
             )?;
-        } else {
-            transaction.execute(
-                "UPDATE assignments SET status = ?2 WHERE id = ?1",
-                params![
-                    ready.assignment_id,
-                    AssignmentStatus::VerificationFailed.as_str()
-                ],
-            )?;
+            transaction.commit()?;
+            return Ok(());
         }
+
+        let completed_at = unix_timestamp()?;
+        transaction.execute(
+            "UPDATE results SET status = ?2 WHERE id = ?1",
+            params![result_id, ResultStatus::Accepted.as_str()],
+        )?;
+        record_event(
+            &transaction,
+            commission_id,
+            EventKind::ResultAccepted,
+            ready.mandate_revision,
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+            params![attempt_id, AttemptStatus::Succeeded.as_str(), completed_at],
+        )?;
+        transaction.execute(
+            "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
+            params![lease_id, WorkerLeaseStatus::Released.as_str(), completed_at],
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![
+                assignment.assignment_id,
+                AssignmentStatus::Accepted.as_str()
+            ],
+        )?;
+        let completion_revision = ready.mandate_revision + 1;
+        transaction.execute(
+            "UPDATE commissions
+             SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
+             WHERE id = ?1",
+            params![
+                commission_id,
+                CommissionStatus::VerifiedComplete.as_str(),
+                completion_revision,
+                completed_at,
+                integrated.artifact_revision.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO completion_briefings (commission_id, summary, artifact_revision, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                commission_id,
+                format!("Verified Complete: {}", ready.goal),
+                integrated.artifact_revision.as_str(),
+                completed_at,
+            ],
+        )?;
+        record_event(
+            &transaction,
+            commission_id,
+            EventKind::CommissionVerifiedComplete,
+            completion_revision,
+        )?;
 
         transaction.commit()?;
         Ok(())
     }
+
+    fn fail_attempt(
+        &mut self,
+        commission_id: &str,
+        assignment_id: &str,
+        attempt_id: &str,
+        lease_id: &str,
+        mandate_revision: i64,
+        error: &TyrionError,
+    ) -> Result<(), TyrionError> {
+        let transaction = self.connection.transaction()?;
+        let now = unix_timestamp()?;
+        transaction.execute(
+            "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+            params![attempt_id, AttemptStatus::Failed.as_str(), now],
+        )?;
+        let (lease_status, assignment_status, blocker_code, requirement) = match error {
+            TyrionError::WorkerLeaseExpired { .. } => (
+                WorkerLeaseStatus::Expired,
+                AssignmentStatus::VerificationFailed,
+                "worker_execution_failed".to_owned(),
+                error.to_string(),
+            ),
+            TyrionError::StorageCeilingExceeded {
+                required_bytes,
+                ceiling_bytes,
+            } => (
+                WorkerLeaseStatus::Revoked,
+                AssignmentStatus::ResourceBlocked,
+                "max_storage_bytes".to_owned(),
+                format!(
+                    "Git artifacts require at least {required_bytes} bytes; start a new Commission with max_storage_bytes of {required_bytes} or more (current ceiling: {ceiling_bytes})."
+                ),
+            ),
+            _ => (
+                WorkerLeaseStatus::Revoked,
+                AssignmentStatus::VerificationFailed,
+                "worker_execution_failed".to_owned(),
+                error.to_string(),
+            ),
+        };
+        transaction.execute(
+            "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
+            params![lease_id, lease_status.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![assignment_id, assignment_status.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                commission_id,
+                assignment_id,
+                blocker_code,
+                requirement,
+                now,
+            ],
+        )?;
+        record_event(
+            &transaction,
+            commission_id,
+            EventKind::AssignmentBlocked,
+            mandate_revision,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn load_criteria(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<Vec<worker::CriterionDefinition>, TyrionError> {
+    let mut statement = transaction.prepare(
+        "SELECT criterion_id, verifier_kind, expected
+         FROM criteria WHERE commission_id = ?1 ORDER BY position",
+    )?;
+    let rows = statement.query_map([commission_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, kind, expected) = row?;
+        let verifier = match kind.as_str() {
+            "exact_match" => Verifier::ExactMatch { expected },
+            "command" => Verifier::Command {
+                argv: serde_json::from_str(&expected)?,
+            },
+            _ => {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "unsupported persisted verifier {kind}"
+                )))
+            }
+        };
+        Ok(worker::CriterionDefinition { id, verifier })
+    })
+    .collect()
+}
+
+fn load_authorized_paths(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<Vec<String>, TyrionError> {
+    let mut statement = transaction.prepare(
+        "SELECT value FROM authority_scopes
+         WHERE commission_id = ?1 AND scope_type = ?2 ORDER BY position",
+    )?;
+    let rows = statement.query_map(
+        params![commission_id, AuthorityScopeType::Path.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn record_evidence(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    result_id: &str,
+    mandate_revision: i64,
+    artifact_revision: &str,
+    verification: &[worker::VerificationRecord],
+) -> Result<(), TyrionError> {
+    for record in verification {
+        let outcome = if record.passed() {
+            EvidenceOutcome::Passed
+        } else {
+            EvidenceOutcome::Failed
+        };
+        transaction.execute(
+            "INSERT INTO evidence (
+                id, commission_id, criterion_id, result_id, mandate_revision,
+                artifact_revision, verifier_kind, outcome, observed, expected, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                Uuid::new_v4().to_string(),
+                commission_id,
+                record.criterion_id,
+                result_id,
+                mandate_revision,
+                artifact_revision,
+                record.verifier_kind.as_str(),
+                record.outcome.as_str(),
+                record.observed,
+                record.expected,
+                unix_timestamp()?,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE criteria SET status = ?3 WHERE commission_id = ?1 AND criterion_id = ?2",
+            params![
+                commission_id,
+                record.criterion_id,
+                outcome.criterion_status().as_str(),
+            ],
+        )?;
+        record_event(
+            transaction,
+            commission_id,
+            EventKind::EvidenceRecorded,
+            mandate_revision,
+        )?;
+    }
+    Ok(())
+}
+
+fn finish_failed_verification(
+    transaction: &Transaction<'_>,
+    assignment_id: &str,
+    attempt_id: &str,
+    lease_id: &str,
+) -> Result<(), TyrionError> {
+    let now = unix_timestamp()?;
+    transaction.execute(
+        "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+        params![attempt_id, AttemptStatus::Succeeded.as_str(), now],
+    )?;
+    transaction.execute(
+        "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
+        params![lease_id, WorkerLeaseStatus::Released.as_str(), now],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![assignment_id, AssignmentStatus::VerificationFailed.as_str()],
+    )?;
+    Ok(())
 }
 
 fn block_ready_assignment(
@@ -1238,6 +1585,31 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
                 criterion.id
             )));
         }
+        match (&proposal.execution, &criterion.verifier) {
+            (ExecutionSpec::Deterministic, Verifier::ExactMatch { .. })
+            | (ExecutionSpec::CodexGit { .. }, Verifier::Command { .. }) => {}
+            (ExecutionSpec::Deterministic, Verifier::Command { .. }) => {
+                return Err(TyrionError::InvalidRequest(
+                    "deterministic execution requires exact_match verifiers".into(),
+                ));
+            }
+            (ExecutionSpec::CodexGit { .. }, Verifier::ExactMatch { .. }) => {
+                return Err(TyrionError::InvalidRequest(
+                    "codex_git execution requires command verifiers".into(),
+                ));
+            }
+        }
+        if let Verifier::Command { argv } = &criterion.verifier {
+            if argv.is_empty()
+                || argv
+                    .iter()
+                    .any(|argument| argument.is_empty() || argument.contains('\0'))
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "command verifier argv must contain only non-empty arguments".into(),
+                ));
+            }
+        }
     }
     if proposal.resource_ceilings.max_attempts == 0
         || proposal.resource_ceilings.max_elapsed_seconds == 0
@@ -1248,10 +1620,77 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
             "attempt, elapsed-time, concurrency, and storage ceilings must be positive".into(),
         ));
     }
-    ensure_result_fits_storage_ceiling(
-        &proposal.goal,
-        proposal.resource_ceilings.max_storage_bytes,
-    )?;
+    match &proposal.execution {
+        ExecutionSpec::Deterministic => ensure_result_fits_storage_ceiling(
+            &proposal.goal,
+            proposal.resource_ceilings.max_storage_bytes,
+        )?,
+        ExecutionSpec::CodexGit {
+            repository,
+            base_revision,
+        } => {
+            if !Path::new(repository).is_absolute() {
+                return Err(TyrionError::InvalidRequest(
+                    "codex_git repository must be an absolute path".into(),
+                ));
+            }
+            Path::new(repository).canonicalize().map_err(|error| {
+                TyrionError::InvalidRequest(format!(
+                    "codex_git repository cannot be resolved: {error}"
+                ))
+            })?;
+            if !proposal
+                .authority
+                .repositories
+                .iter()
+                .any(|value| value == repository)
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "codex_git repository must be named in the Authority Envelope".into(),
+                ));
+            }
+            if !proposal
+                .authority
+                .actions
+                .iter()
+                .any(|action| action == worker::CODEX_GIT_ACTION)
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "the Authority Envelope does not permit codex.git_change".into(),
+                ));
+            }
+            if proposal.authority.paths.is_empty() {
+                return Err(TyrionError::InvalidRequest(
+                    "codex_git execution requires at least one authorized changed path".into(),
+                ));
+            }
+            for path in &proposal.authority.paths {
+                let path = Path::new(path);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(TyrionError::InvalidRequest(
+                        "authorized changed paths must be normalized relative paths".into(),
+                    ));
+                }
+            }
+            if !(40..=64).contains(&base_revision.len())
+                || !base_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "codex_git base_revision must be a full hexadecimal Git object id".into(),
+                ));
+            }
+            if !proposal.authority.destinations.is_empty() || !proposal.authority.effects.is_empty()
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "the contained codex_git slice does not permit external effects".into(),
+                ));
+            }
+        }
+    }
     let sqlite_integer_max = i64::MAX as u64;
     if proposal.resource_ceilings.max_elapsed_seconds > sqlite_integer_max
         || proposal.resource_ceilings.max_storage_bytes > sqlite_integer_max

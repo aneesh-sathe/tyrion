@@ -8,6 +8,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CommissionProposal {
     pub goal: String,
+    #[serde(default)]
+    pub execution: ExecutionSpec,
     pub criteria: Vec<AcceptanceCriterion>,
     pub authority: AuthorityEnvelope,
     pub resource_ceilings: ResourceCeilings,
@@ -26,6 +28,18 @@ pub struct AcceptanceCriterion {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Verifier {
     ExactMatch { expected: String },
+    Command { argv: Vec<String> },
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionSpec {
+    #[default]
+    Deterministic,
+    CodexGit {
+        repository: String,
+        base_revision: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

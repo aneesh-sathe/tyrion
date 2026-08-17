@@ -36,6 +36,15 @@ pub enum TyrionError {
     AttachmentRejected(String),
     #[error("control denied: {0}")]
     ControlDenied(String),
+    #[error("Worker Lease expired {operation}")]
+    WorkerLeaseExpired { operation: &'static str },
+    #[error(
+        "max_storage_bytes exceeded: Git artifacts require at least {required_bytes} bytes; start a new Commission with max_storage_bytes of {required_bytes} or more (current ceiling: {ceiling_bytes})."
+    )]
+    StorageCeilingExceeded {
+        required_bytes: u64,
+        ceiling_bytes: u64,
+    },
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("database failure: {0}")]
@@ -55,6 +64,9 @@ impl TyrionError {
             Self::StaleControlRevision { .. } => ErrorCode::StaleControlRevision,
             Self::AttachmentRejected(_) => ErrorCode::AttachmentRejected,
             Self::ControlDenied(_) => ErrorCode::ControlDenied,
+            Self::WorkerLeaseExpired { .. } | Self::StorageCeilingExceeded { .. } => {
+                ErrorCode::InvalidRequest
+            }
             Self::Io(_) | Self::Database(_) | Self::Serialization(_) => ErrorCode::Internal,
         }
     }

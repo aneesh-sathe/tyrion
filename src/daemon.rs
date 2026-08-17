@@ -3,14 +3,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 
 use fs2::FileExt;
 use serde_json::Value;
 
 use crate::protocol::{Command, Request, Response, PROTOCOL_VERSION};
 use crate::store::Store;
-use crate::worker::{CorruptArtifactRevisionWorker, DeterministicLocalWorker, Worker};
+use crate::worker::WorkerRuntime;
 use crate::TyrionError;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -19,10 +21,11 @@ pub fn run_daemon(data_dir: &Path, socket_path: &Path) -> Result<(), TyrionError
     run_daemon_with_options(data_dir, socket_path, DaemonOptions::default())
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DaemonOptions {
     pub defer_ready_dispatch: bool,
     pub corrupt_worker_artifact_revision: bool,
+    pub codex_worker_config: Option<PathBuf>,
 }
 
 pub fn run_daemon_with_options(
@@ -36,37 +39,52 @@ pub fn run_daemon_with_options(
     prepare_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
-    let mut store = Store::open(&data_dir.join("state.sqlite3"))?;
-    let worker: Box<dyn Worker> = if options.corrupt_worker_artifact_revision {
-        Box::new(CorruptArtifactRevisionWorker)
-    } else {
-        Box::new(DeterministicLocalWorker)
-    };
+    let database_path = data_dir.join("state.sqlite3");
+    let mut store = Store::open(&database_path)?;
+    let worker = Arc::new(WorkerRuntime::load(
+        data_dir,
+        options.codex_worker_config.as_deref(),
+        options.corrupt_worker_artifact_revision,
+    )?);
     if !options.defer_ready_dispatch {
-        resume_ready_assignments(&mut store, worker.as_ref())?;
+        resume_ready_assignments(&mut store, &database_path, &worker)?;
     }
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => serve_connection(stream, &mut store, options, worker.as_ref()),
+            Ok(stream) => serve_connection(stream, &mut store, &options, &database_path, &worker),
             Err(error) => eprintln!("failed to accept local connection: {error}"),
         }
     }
     Ok(())
 }
 
-fn resume_ready_assignments(store: &mut Store, worker: &dyn Worker) -> Result<(), TyrionError> {
+fn resume_ready_assignments(
+    store: &mut Store,
+    database_path: &Path,
+    worker: &Arc<WorkerRuntime>,
+) -> Result<(), TyrionError> {
     for commission_id in store.ready_commission_ids()? {
-        match store.run_ready_assignment(&commission_id, worker) {
-            Ok(()) => {}
-            Err(TyrionError::InvalidRequest(message)) => {
-                eprintln!(
-                    "could not resume ready Assignment for Commission {commission_id}: {message}"
-                );
-            }
-            Err(error) => return Err(error),
-        }
+        spawn_ready_assignment(database_path.to_owned(), Arc::clone(worker), commission_id)?;
     }
+    Ok(())
+}
+
+fn spawn_ready_assignment(
+    database_path: PathBuf,
+    worker: Arc<WorkerRuntime>,
+    commission_id: String,
+) -> Result<(), TyrionError> {
+    let thread_label = commission_id.chars().take(12).collect::<String>();
+    thread::Builder::new()
+        .name(format!("assignment-{thread_label}"))
+        .spawn(move || {
+            let outcome = Store::open(&database_path)
+                .and_then(|mut store| store.run_ready_assignment(&commission_id, &worker));
+            if let Err(error) = outcome {
+                eprintln!("failed to run ready Assignment for Commission {commission_id}: {error}");
+            }
+        })?;
     Ok(())
 }
 
@@ -114,8 +132,9 @@ fn prepare_socket(socket_path: &Path) -> Result<(), TyrionError> {
 fn serve_connection(
     mut stream: UnixStream,
     store: &mut Store,
-    options: DaemonOptions,
-    worker: &dyn Worker,
+    options: &DaemonOptions,
+    database_path: &Path,
+    worker: &Arc<WorkerRuntime>,
 ) {
     let outcome = read_request(&stream).and_then(|request| dispatch(store, &request));
     let (response, follow_up) = match outcome {
@@ -138,8 +157,10 @@ fn serve_connection(
         let Some(FollowUp::RunReadyAssignment(commission_id)) = follow_up else {
             return;
         };
-        if let Err(error) = store.run_ready_assignment(&commission_id, worker) {
-            eprintln!("failed to run ready Assignment for Commission {commission_id}: {error}");
+        if let Err(error) =
+            spawn_ready_assignment(database_path.to_owned(), Arc::clone(worker), commission_id)
+        {
+            eprintln!("failed to schedule ready Assignment: {error}");
         }
     }
 }

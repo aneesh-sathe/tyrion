@@ -501,6 +501,12 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
     assert_eq!(accepted["evidence"], json!([]));
     assert_eq!(accepted["briefing"], Value::Null);
 
+    wait_for_event(
+        &daemon,
+        &attachment_id,
+        &commission_id,
+        "commission_verified_complete",
+    );
     let completed = run_cli(
         &daemon.socket_path,
         &[
@@ -519,7 +525,7 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
     assert_eq!(completed["attempts"][0]["status"], "succeeded");
     assert_eq!(completed["results"].as_array().unwrap().len(), 1);
     assert_eq!(completed["results"][0]["status"], "accepted");
-    assert_eq!(completed["evidence"].as_array().unwrap().len(), 2);
+    assert_eq!(completed["evidence"].as_array().unwrap().len(), 4);
     assert!(completed["evidence"]
         .as_array()
         .unwrap()
@@ -568,6 +574,10 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
             "result_submitted",
             "evidence_recorded",
             "evidence_recorded",
+            "result_integrated",
+            "evidence_recorded",
+            "evidence_recorded",
+            "result_accepted",
             "commission_verified_complete",
         ]
     );
@@ -605,6 +615,7 @@ fn failed_evidence_cannot_establish_completion() {
     );
 
     assert_eq!(accepted["assignments"][0]["status"], "ready");
+    wait_for_event(&daemon, &attachment_id, &commission_id, "evidence_recorded");
     let inspected = run_cli(
         &daemon.socket_path,
         &[
@@ -656,6 +667,7 @@ fn forged_worker_artifact_revision_cannot_establish_completion() {
     );
 
     assert_eq!(accepted["assignments"][0]["status"], "ready");
+    wait_for_event(&daemon, &attachment_id, &commission_id, "evidence_recorded");
     let inspected = run_cli(
         &daemon.socket_path,
         &[
@@ -700,6 +712,12 @@ fn mutation_replay_is_durable_and_stale_revision_is_rejected() {
             "--idempotency-key",
             "commission-accept-replay",
         ],
+    );
+    wait_for_event(
+        &daemon,
+        &attachment_id,
+        &commission_id,
+        "commission_verified_complete",
     );
     let completed_before_restart = run_cli(
         &daemon.socket_path,

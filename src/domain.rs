@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommissionStatus {
     Proposed,
@@ -57,6 +59,7 @@ impl AssignmentStatus {
 pub(crate) enum AttemptStatus {
     Running,
     Succeeded,
+    Failed,
 }
 
 impl AttemptStatus {
@@ -64,6 +67,7 @@ impl AttemptStatus {
         match self {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
         }
     }
 }
@@ -83,7 +87,8 @@ impl ResultStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum EvidenceOutcome {
     Passed,
     Failed,
@@ -112,6 +117,8 @@ pub(crate) enum EventKind {
     AssignmentReady,
     AttemptStarted,
     ResultSubmitted,
+    ResultAccepted,
+    ResultIntegrated,
     EvidenceRecorded,
     CommissionVerifiedComplete,
     AssignmentBlocked,
@@ -127,11 +134,32 @@ impl EventKind {
             Self::AssignmentReady => "assignment_ready",
             Self::AttemptStarted => "attempt_started",
             Self::ResultSubmitted => "result_submitted",
+            Self::ResultAccepted => "result_accepted",
+            Self::ResultIntegrated => "result_integrated",
             Self::EvidenceRecorded => "evidence_recorded",
             Self::CommissionVerifiedComplete => "commission_verified_complete",
             Self::AssignmentBlocked => "assignment_blocked",
             Self::AttachmentJoined => "attachment_joined",
             Self::ActiveAttachmentChanged => "active_attachment_changed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerLeaseStatus {
+    Active,
+    Released,
+    Revoked,
+    Expired,
+}
+
+impl WorkerLeaseStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Released => "released",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
         }
     }
 }

@@ -6,7 +6,6 @@ mod domain;
 mod error;
 pub mod protocol;
 mod store;
-mod verification;
 mod worker;
 
 pub use client::send_request;

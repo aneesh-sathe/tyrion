@@ -1,6 +1,6 @@
 # Tyrion
 
-Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2) and the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current deterministic Evidence passes.
+Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), and the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
 
 ## What exists
 
@@ -14,6 +14,10 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Durable acceptance before Worker dispatch, with the ready Assignment returned to the Principal
 - Durable idempotency keys for mutating requests
 - One replaceable deterministic local Worker configuration
+- One precisely pinned Codex Git Worker configuration inside a repaired OpenShell MicroVM
+- Expiring Worker Leases with fail-closed sandbox deletion
+- Verified Git-bundle transfer without mounting the Principal checkout
+- Candidate verification, daemon-owned Integration, and fresh integrated verification
 - Criterion-linked deterministic Evidence with independently validated artifact revisions
 - A criterion-linked Verified Completion briefing
 - Assignment-scoped resource Blockers that preserve Control Plane availability
@@ -21,6 +25,8 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Black-box end-to-end coverage through the CLI, protocol, daemon, and real restarts
 
 The deterministic Worker echoes the accepted Goal. Each `exact_match` criterion compares its expected value with that candidate Result. It is a test configuration, not a production Agent Harness adapter. Tyrion rejects a proposal whose deterministic Result cannot fit its storage ceiling and rechecks attempt, elapsed-time, concurrency, and storage ceilings immediately before dispatch.
+
+The Codex Git path accepts an explicit full base revision, authorized changed paths, and argv-based command verifiers. It records governing revisions, commits, paths, bundle artifacts, candidate and integrated verification outcomes, known effects, and the integrated artifact revision. See [Contained Codex Git assignments](docs/contained-codex.md) for its exact runtime contract and configuration.
 
 ## Run locally
 
