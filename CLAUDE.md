@@ -7,6 +7,7 @@
 - Acceptance and Assignment readiness commit before the Worker dispatches. The acceptance response exposes that ready state; the daemon closes the response path before attempting dispatch, and a disconnected Entry Session does not revoke accepted work.
 - `deterministic-local-v1` echoes the accepted Goal. It is a replaceable test Worker configuration, not a production harness adapter.
 - Validate the deterministic Result against its storage ceiling at proposal time, then recheck attempt, elapsed-time, concurrency, and storage ceilings immediately before dispatch.
+- A hard resource-ceiling failure blocks only its Assignment, records the exact next requirement, and must not prevent the daemon from serving other Commissions.
 - Evidence is immutable and bound to criterion, accepted mandate revision, candidate Result, verifier, and artifact revision. Failed Evidence leaves a candidate Result unaccepted.
 - Verified Completion, accepted Result status, passed criteria, completion briefing, and the terminal event are committed in one SQLite transaction.
 - Mutating protocol requests require idempotency keys. Identical replay returns the stored response; key reuse with a different request is rejected.

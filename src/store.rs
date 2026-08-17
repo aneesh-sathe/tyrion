@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::{
-    AssignmentStatus, AttemptStatus, CommissionStatus, CriterionStatus, EventKind, EvidenceOutcome,
-    ResultStatus,
+    AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus, CriterionStatus,
+    EventKind, EvidenceOutcome, ResultStatus,
 };
 use crate::protocol::{CommissionProposal, Request, ResourceCeilings, Verifier};
 use crate::TyrionError;
@@ -152,9 +152,13 @@ impl Store {
         let may_execute = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM authority_scopes
-                WHERE commission_id = ?1 AND scope_type = 'action' AND value = 'deterministic.echo'
+                WHERE commission_id = ?1 AND scope_type = ?2 AND value = ?3
              )",
-            [commission_id],
+            params![
+                commission_id,
+                AuthorityScopeType::Action.as_str(),
+                worker::ACTION
+            ],
             |row| row.get::<_, bool>(0),
         )?;
         if !may_execute {
@@ -264,9 +268,14 @@ impl Store {
             |row| row.get::<_, u32>(0),
         )?;
         if attempt_count >= max_attempts {
-            return Err(TyrionError::InvalidRequest(
-                "the max_attempts resource ceiling is exhausted".into(),
-            ));
+            return block_ready_assignment(
+                transaction,
+                commission_id,
+                &assignment_id,
+                mandate_revision,
+                "max_attempts",
+                "Start a new Commission with a higher max_attempts ceiling.",
+            );
         }
         let running_count = transaction.query_row(
             "SELECT COUNT(*) FROM attempts
@@ -276,17 +285,29 @@ impl Store {
             |row| row.get::<_, u32>(0),
         )?;
         if running_count >= max_worker_concurrency {
-            return Err(TyrionError::InvalidRequest(
-                "the max_worker_concurrency resource ceiling is exhausted".into(),
-            ));
+            return Ok(());
         }
         let now = unix_timestamp()?;
         if now.saturating_sub(accepted_at) as u64 >= max_elapsed_seconds {
-            return Err(TyrionError::InvalidRequest(
-                "the max_elapsed_seconds resource ceiling is exhausted".into(),
-            ));
+            return block_ready_assignment(
+                transaction,
+                commission_id,
+                &assignment_id,
+                mandate_revision,
+                "max_elapsed_seconds",
+                "Start a new Commission with a higher max_elapsed_seconds ceiling.",
+            );
         }
-        ensure_result_fits_storage_ceiling(&goal, max_storage_bytes)?;
+        if goal.len() as u64 > max_storage_bytes {
+            return block_ready_assignment(
+                transaction,
+                commission_id,
+                &assignment_id,
+                mandate_revision,
+                "max_storage_bytes",
+                "Start a new Commission with a max_storage_bytes ceiling large enough for the Result.",
+            );
+        }
 
         let attempt_id = Uuid::new_v4().to_string();
         transaction.execute(
@@ -443,6 +464,40 @@ impl Store {
     }
 }
 
+fn block_ready_assignment(
+    transaction: Transaction<'_>,
+    commission_id: &str,
+    assignment_id: &str,
+    mandate_revision: i64,
+    code: &str,
+    requirement: &str,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![assignment_id, AssignmentStatus::ResourceBlocked.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            Uuid::new_v4().to_string(),
+            commission_id,
+            assignment_id,
+            code,
+            requirement,
+            unix_timestamp()?
+        ],
+    )?;
+    record_event(
+        &transaction,
+        commission_id,
+        EventKind::AssignmentBlocked,
+        mandate_revision,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     if proposal.goal.trim().is_empty() {
         return Err(TyrionError::InvalidRequest("goal must not be empty".into()));
@@ -560,17 +615,23 @@ fn insert_authority(
     proposal: &CommissionProposal,
 ) -> Result<(), TyrionError> {
     let scopes = [
-        ("repository", &proposal.authority.repositories),
-        ("path", &proposal.authority.paths),
-        ("action", &proposal.authority.actions),
-        ("destination", &proposal.authority.destinations),
-        ("effect", &proposal.authority.effects),
+        (
+            AuthorityScopeType::Repository,
+            &proposal.authority.repositories,
+        ),
+        (AuthorityScopeType::Path, &proposal.authority.paths),
+        (AuthorityScopeType::Action, &proposal.authority.actions),
+        (
+            AuthorityScopeType::Destination,
+            &proposal.authority.destinations,
+        ),
+        (AuthorityScopeType::Effect, &proposal.authority.effects),
     ];
     for (scope_type, values) in scopes {
         for (position, value) in values.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO authority_scopes (commission_id, scope_type, position, value) VALUES (?1, ?2, ?3, ?4)",
-                params![commission_id, scope_type, position as i64, value],
+                params![commission_id, scope_type.as_str(), position as i64, value],
             )?;
         }
     }

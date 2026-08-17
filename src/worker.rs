@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 
 pub const CONFIGURATION: &str = "deterministic-local-v1";
+pub const ACTION: &str = "deterministic.echo";
 
 pub struct CandidateResult {
     pub output: String,

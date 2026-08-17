@@ -546,6 +546,83 @@ fn restart_resumes_a_durably_ready_assignment() {
 }
 
 #[test]
+fn expired_ceiling_blocks_only_its_assignment_after_restart() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let proposal_path = temp.path().join("expiring-proposal.json");
+    let mut expiring = proposal();
+    expiring["resource_ceilings"]["max_elapsed_seconds"] = json!(1);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&expiring).expect("proposal should serialize"),
+    )
+    .expect("proposal fixture should be written");
+
+    let daemon = RunningDaemon::start_with_deferred_dispatch(temp.path());
+    let created = run_cli(
+        &daemon.socket_path,
+        &[
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "proposal-create-expiring",
+        ],
+    );
+    let commission_id = created["commission"]["id"]
+        .as_str()
+        .expect("proposal should have an id")
+        .to_owned();
+    run_cli(
+        &daemon.socket_path,
+        &[
+            "commission",
+            "accept",
+            &commission_id,
+            "--expected-revision",
+            "0",
+            "--idempotency-key",
+            "commission-accept-expiring",
+        ],
+    );
+    daemon.stop();
+    thread::sleep(Duration::from_millis(1_100));
+
+    let restarted = RunningDaemon::start(temp.path());
+    let blocked = run_cli(
+        &restarted.socket_path,
+        &["commission", "inspect", &commission_id],
+    );
+    assert_eq!(blocked["commission"]["status"], "active");
+    assert_eq!(blocked["assignments"][0]["status"], "resource_blocked");
+    assert_eq!(blocked["attempts"], json!([]));
+    assert_eq!(blocked["blockers"][0]["code"], "max_elapsed_seconds");
+    assert!(blocked["blockers"][0]["requirement"]
+        .as_str()
+        .unwrap()
+        .contains("new Commission"));
+
+    let healthy_path = temp.path().join("healthy-proposal.json");
+    fs::write(
+        &healthy_path,
+        serde_json::to_vec_pretty(&proposal()).expect("proposal should serialize"),
+    )
+    .expect("proposal fixture should be written");
+    let healthy = run_cli(
+        &restarted.socket_path,
+        &[
+            "proposal",
+            "create",
+            "--file",
+            path_text(&healthy_path),
+            "--idempotency-key",
+            "proposal-create-after-blocker",
+        ],
+    );
+    assert_eq!(healthy["commission"]["status"], "proposed");
+}
+
+#[test]
 fn one_control_plane_owns_a_data_directory() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let _first = RunningDaemon::start(temp.path());

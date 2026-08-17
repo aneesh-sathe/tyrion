@@ -50,7 +50,15 @@ pub fn run_daemon_with_options(
 
 fn resume_ready_assignments(store: &mut Store) -> Result<(), TyrionError> {
     for commission_id in store.ready_commission_ids()? {
-        store.run_ready_assignment(&commission_id)?;
+        match store.run_ready_assignment(&commission_id) {
+            Ok(()) => {}
+            Err(TyrionError::InvalidRequest(message)) => {
+                eprintln!(
+                    "could not resume ready Assignment for Commission {commission_id}: {message}"
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
+use crate::domain::AuthorityScopeType;
 use crate::TyrionError;
 
 pub(super) fn inspect_commission(
@@ -28,11 +29,11 @@ pub(super) fn inspect_commission(
         .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
 
     let authority = json!({
-        "repositories": scope_values(connection, commission_id, "repository")?,
-        "paths": scope_values(connection, commission_id, "path")?,
-        "actions": scope_values(connection, commission_id, "action")?,
-        "destinations": scope_values(connection, commission_id, "destination")?,
-        "effects": scope_values(connection, commission_id, "effect")?,
+        "repositories": scope_values(connection, commission_id, AuthorityScopeType::Repository)?,
+        "paths": scope_values(connection, commission_id, AuthorityScopeType::Path)?,
+        "actions": scope_values(connection, commission_id, AuthorityScopeType::Action)?,
+        "destinations": scope_values(connection, commission_id, AuthorityScopeType::Destination)?,
+        "effects": scope_values(connection, commission_id, AuthorityScopeType::Effect)?,
     });
     let resource_ceilings = connection.query_row(
         "SELECT max_attempts, max_elapsed_seconds, max_worker_concurrency, max_storage_bytes,
@@ -155,6 +156,21 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let blockers = query_values(
+        connection,
+        "SELECT id, assignment_id, code, requirement, created_at
+         FROM blockers WHERE commission_id = ?1 ORDER BY created_at, id",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "assignment_id": row.get::<_, String>(1)?,
+                "code": row.get::<_, String>(2)?,
+                "requirement": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, i64>(4)?,
+            }))
+        },
+    )?;
 
     Ok(json!({
         "commission": commission,
@@ -165,6 +181,7 @@ pub(super) fn inspect_commission(
         "evidence": evidence,
         "briefing": briefing,
         "events": events,
+        "blockers": blockers,
     }))
 }
 
@@ -239,13 +256,15 @@ fn completion_briefing(
 fn scope_values(
     connection: &Connection,
     commission_id: &str,
-    scope_type: &str,
+    scope_type: AuthorityScopeType,
 ) -> Result<Vec<String>, TyrionError> {
     let mut statement = connection.prepare(
         "SELECT value FROM authority_scopes
          WHERE commission_id = ?1 AND scope_type = ?2 ORDER BY position",
     )?;
-    let rows = statement.query_map(params![commission_id, scope_type], |row| row.get(0))?;
+    let rows = statement.query_map(params![commission_id, scope_type.as_str()], |row| {
+        row.get(0)
+    })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 

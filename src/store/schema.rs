@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS criteria (
 
 CREATE TABLE IF NOT EXISTS authority_scopes (
     commission_id TEXT NOT NULL REFERENCES commissions(id),
-    scope_type TEXT NOT NULL,
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('repository', 'path', 'action', 'destination', 'effect')),
     position INTEGER NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (commission_id, scope_type, position)
@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS assignments (
     id TEXT PRIMARY KEY,
     commission_id TEXT NOT NULL REFERENCES commissions(id),
     plan_revision INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('ready', 'running', 'accepted', 'verification_failed')),
+    status TEXT NOT NULL CHECK (status IN (
+        'ready', 'running', 'accepted', 'verification_failed', 'resource_blocked'
+    )),
     created_at INTEGER NOT NULL
 );
 
@@ -94,13 +96,22 @@ CREATE TABLE IF NOT EXISTS completion_briefings (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS blockers (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL UNIQUE REFERENCES assignments(id),
+    code TEXT NOT NULL,
+    requirement TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     commission_id TEXT NOT NULL REFERENCES commissions(id),
     event_type TEXT NOT NULL CHECK (event_type IN (
         'commission_proposed', 'commission_accepted', 'assignment_ready',
         'attempt_started', 'result_submitted', 'evidence_recorded',
-        'commission_verified_complete'
+        'commission_verified_complete', 'assignment_blocked'
     )),
     commission_revision INTEGER NOT NULL,
     created_at INTEGER NOT NULL

@@ -38,6 +38,7 @@ pub(crate) enum AssignmentStatus {
     Running,
     Accepted,
     VerificationFailed,
+    ResourceBlocked,
 }
 
 impl AssignmentStatus {
@@ -47,6 +48,7 @@ impl AssignmentStatus {
             Self::Running => "running",
             Self::Accepted => "accepted",
             Self::VerificationFailed => "verification_failed",
+            Self::ResourceBlocked => "resource_blocked",
         }
     }
 }
@@ -112,6 +114,7 @@ pub(crate) enum EventKind {
     ResultSubmitted,
     EvidenceRecorded,
     CommissionVerifiedComplete,
+    AssignmentBlocked,
 }
 
 impl EventKind {
@@ -124,6 +127,28 @@ impl EventKind {
             Self::ResultSubmitted => "result_submitted",
             Self::EvidenceRecorded => "evidence_recorded",
             Self::CommissionVerifiedComplete => "commission_verified_complete",
+            Self::AssignmentBlocked => "assignment_blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthorityScopeType {
+    Repository,
+    Path,
+    Action,
+    Destination,
+    Effect,
+}
+
+impl AuthorityScopeType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Path => "path",
+            Self::Action => "action",
+            Self::Destination => "destination",
+            Self::Effect => "effect",
         }
     }
 }
