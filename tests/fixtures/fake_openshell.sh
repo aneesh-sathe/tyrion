@@ -32,6 +32,10 @@ case "$operation" in
             fi
         done
         [[ -n $name ]]
+        if ((${#name} > 19)); then
+            printf 'sandbox name exceeds maximum length: %s > 19\n' "${#name}" >&2
+            exit 64
+        fi
         mkdir -p "$state/sandboxes/$name"
         ;;
     upload)
@@ -127,7 +131,7 @@ case "$operation" in
             workdir=${workdir//\/sandbox/$root}
             cd "$workdir"
         fi
-        if [[ -e $state/fail-integrated-verification && $name == tyrion-integrated-* && -n $workdir ]]; then
+        if [[ -e $state/fail-integrated-verification && $name == tyrion-i-* && -n $workdir ]]; then
             printf '%s\n' 'simulated integrated verification failure' >&2
             exit 7
         fi

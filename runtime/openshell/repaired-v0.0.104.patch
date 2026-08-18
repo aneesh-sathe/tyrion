@@ -1,0 +1,75 @@
+diff --git a/crates/openshell-driver-vm/runtime/kernel/openshell.kconfig b/crates/openshell-driver-vm/runtime/kernel/openshell.kconfig
+index e8d826c5..e7666dfa 100644
+--- a/crates/openshell-driver-vm/runtime/kernel/openshell.kconfig
++++ b/crates/openshell-driver-vm/runtime/kernel/openshell.kconfig
+@@ -135,2 +135,4 @@
++CONFIG_SECURITY=y
+ CONFIG_SECURITY_LANDLOCK=y
++CONFIG_LSM="landlock,lockdown,yama,integrity"
+ CONFIG_SECCOMP_FILTER=y
+diff --git a/crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh b/crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh
+index 14dbc046..bb25828e 100644
+--- a/crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh
++++ b/crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh
+@@ -677,6 +677,32 @@ run_post_overlay_setup() {
+     mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
+     wait
+ 
++    # Every sandbox VM is a single security boundary. Put PID 1 and all of
++    # its descendants in a dedicated cgroup, then expose that cgroup as the
++    # guest root so the supervisor and workloads observe the enforced limit.
++    # Fail closed because a missing process ceiling violates the boundary.
++    local cgroup_root sandbox_cgroup
++    cgroup_root="$(root_path /sys/fs/cgroup)"
++    sandbox_cgroup="${cgroup_root}/openshell-sandbox"
++    if ! grep -qw pids "${cgroup_root}/cgroup.controllers"; then
++        ts "FATAL: cgroup v2 pids controller unavailable"
++        exit 1
++    fi
++    mkdir "$sandbox_cgroup"
++    echo "$$" > "${sandbox_cgroup}/cgroup.procs"
++    echo +pids > "${cgroup_root}/cgroup.subtree_control"
++    if [ ! -f "${sandbox_cgroup}/pids.max" ]; then
++        ts "FATAL: cgroup v2 pids.max unavailable"
++        exit 1
++    fi
++    echo 256 > "${sandbox_cgroup}/pids.max"
++    mount --bind "$sandbox_cgroup" "$cgroup_root"
++    if [ "$(cat "${cgroup_root}/pids.max")" != 256 ]; then
++        ts "FATAL: failed to enforce the 256-process ceiling"
++        exit 1
++    fi
++    ts "enforced 256-process cgroup ceiling"
++
+     # Allow nftables LOG rules to work in non-init network namespaces.
+     # Without this, the kernel's nf_log_syslog silently suppresses output
+     # from the sandbox's network namespace.
+diff --git a/tasks/scripts/vm/build-libkrun.sh b/tasks/scripts/vm/build-libkrun.sh
+index 580f6bf4..48a1bc95 100755
+--- a/tasks/scripts/vm/build-libkrun.sh
++++ b/tasks/scripts/vm/build-libkrun.sh
+@@ -212,7 +212,14 @@ if [ -f openshell.kconfig ]; then
+ 
+   # Verify that the key options were actually applied.
+   all_ok=true
+-  for opt in CONFIG_BRIDGE CONFIG_NETFILTER CONFIG_NF_NAT; do
++  for opt in \
++    CONFIG_BRIDGE \
++    CONFIG_NETFILTER \
++    CONFIG_NF_NAT \
++    CONFIG_SECURITY \
++    CONFIG_SECURITY_LANDLOCK \
++    CONFIG_CGROUP_PIDS \
++    CONFIG_SECCOMP_FILTER; do
+     val="$(grep "^${opt}=" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
+     if [ -n "$val" ]; then
+       echo "    ${opt}: ${val#*=}"
+@@ -221,4 +228,8 @@ if [ -f openshell.kconfig ]; then
+       all_ok=false
+     fi
+   done
++  if ! grep -qx 'CONFIG_LSM="landlock,lockdown,yama,integrity"' "${KERNEL_SOURCES}/.config"; then
++    echo "    WARNING: CONFIG_LSM does not activate the pinned Landlock stack" >&2
++    all_ok=false
++  fi
+   if [ "$all_ok" = false ]; then

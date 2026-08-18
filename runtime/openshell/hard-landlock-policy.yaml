@@ -18,4 +18,29 @@ landlock:
 process:
   run_as_user: sandbox
   run_as_group: sandbox
-network_policies: {}
+network_policies:
+  codex:
+    name: codex
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        access: full
+        enforcement: enforce
+      - host: auth.openai.com
+        port: 443
+        protocol: rest
+        access: full
+        enforcement: enforce
+      - host: chatgpt.com
+        port: 443
+        protocol: rest
+        access: full
+        enforcement: enforce
+      - host: ab.chatgpt.com
+        port: 443
+        protocol: rest
+        access: full
+        enforcement: enforce
+    binaries:
+      - path: /sandbox/codex

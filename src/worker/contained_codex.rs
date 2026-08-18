@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use super::{
     ArtifactRecord, AssignmentContext, CriterionDefinition, VerificationKind, VerificationRecord,
@@ -21,8 +20,10 @@ use crate::protocol::Verifier;
 use crate::TyrionError;
 
 const SOURCE_REVISION: &str = "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354";
+const SOURCE_PATCH_SHA256: &str =
+    "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402";
 const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e";
-const POLICY_SHA256: &str = "a245a499c89f4edf39203935d83ae5fd8e3209e121da78a2eaaa0ff82512a469";
+const POLICY_SHA256: &str = "76715da36c5e5f8603cd4732690707bca8b7f11ee153ae36521028db75bc4453";
 const CODEX_VERSION: &str = "codex-cli 0.147.0";
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +40,8 @@ struct RuntimeConfig {
     kernel_config_sha256: String,
     runtime_artifacts: Vec<PinnedArtifact>,
     source_revision: String,
+    source_patch_path: PathBuf,
+    source_patch_sha256: String,
     base_image: String,
     codex_binary: PathBuf,
     codex_version: String,
@@ -654,6 +657,7 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
     if config.openshell_version != "openshell 0.0.104"
         || config.codex_version != CODEX_VERSION
         || config.source_revision != SOURCE_REVISION
+        || config.source_patch_sha256 != SOURCE_PATCH_SHA256
         || config.base_image != BASE_IMAGE
         || config.policy_sha256 != POLICY_SHA256
     {
@@ -690,6 +694,7 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
     verify_hash(&config.policy_path, &config.policy_sha256)?;
     verify_hash(&config.gateway_config_path, &config.gateway_config_sha256)?;
     verify_hash(&config.kernel_config_path, &config.kernel_config_sha256)?;
+    verify_hash(&config.source_patch_path, &config.source_patch_sha256)?;
     verify_hash(&config.codex_binary, &config.codex_sha256)?;
     for artifact in &config.runtime_artifacts {
         verify_hash(&artifact.path, &artifact.sha256)?;
@@ -709,18 +714,7 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
         }
     }
     let kernel = fs::read_to_string(&config.kernel_config_path)?;
-    for required in [
-        "CONFIG_SECURITY=y",
-        "CONFIG_SECURITY_LANDLOCK=y",
-        "CONFIG_CGROUP_PIDS=y",
-        "CONFIG_SECCOMP_FILTER=y",
-    ] {
-        if !kernel.lines().any(|line| line == required) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "kernel configuration is missing {required}"
-            )));
-        }
-    }
+    validate_kernel_config(&kernel)?;
     let openshell = Command::new(&config.openshell_binary)
         .arg("--version")
         .env_clear()
@@ -731,6 +725,23 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
         return Err(TyrionError::InvalidRequest(
             "OpenShell binary version does not match its pin".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_kernel_config(kernel: &str) -> Result<(), TyrionError> {
+    for required in [
+        "CONFIG_SECURITY=y",
+        "CONFIG_SECURITY_LANDLOCK=y",
+        "CONFIG_LSM=\"landlock,lockdown,yama,integrity\"",
+        "CONFIG_CGROUP_PIDS=y",
+        "CONFIG_SECCOMP_FILTER=y",
+    ] {
+        if !kernel.lines().any(|line| line == required) {
+            return Err(TyrionError::InvalidRequest(format!(
+                "kernel configuration is missing {required}"
+            )));
+        }
     }
     Ok(())
 }
@@ -929,16 +940,18 @@ for value in "$CODEX_AUTH_ACCESS_TOKEN" "$CODEX_AUTH_REFRESH_TOKEN" "$CODEX_AUTH
   esac
 done
 mkdir -p "$root/home/.codex"
-cat >"$root/home/.codex/auth.json" <<'AUTH'
+last_refresh=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+cat >"$root/home/.codex/auth.json" <<AUTH
 {
   "auth_mode": "chatgpt",
   "OPENAI_API_KEY": null,
   "tokens": {
-    "id_token": "openshell:resolve:env:CODEX_AUTH_ID_TOKEN",
-    "access_token": "openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN",
-    "refresh_token": "openshell:resolve:env:CODEX_AUTH_REFRESH_TOKEN",
-    "account_id": "openshell:resolve:env:CODEX_AUTH_ACCOUNT_ID"
-  }
+    "id_token": "e30.e30.placeholder",
+    "access_token": "$CODEX_AUTH_ACCESS_TOKEN",
+    "refresh_token": "$CODEX_AUTH_REFRESH_TOKEN",
+    "account_id": "$CODEX_AUTH_ACCOUNT_ID"
+  },
+  "last_refresh": "$last_refresh"
 }
 AUTH
 chmod 600 "$root/home/.codex/auth.json"
@@ -954,6 +967,11 @@ git clone -q "$root/base.bundle" "$root/repository"
 git -C "$root/repository" checkout -q --detach {base}
 {auth_setup}
 env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/home/.codex" $codex_auth_env \
+  ALL_PROXY="${{ALL_PROXY:-}}" HTTP_PROXY="${{HTTP_PROXY:-}}" HTTPS_PROXY="${{HTTPS_PROXY:-}}" NO_PROXY="${{NO_PROXY:-}}" \
+  http_proxy="${{http_proxy:-}}" https_proxy="${{https_proxy:-}}" no_proxy="${{no_proxy:-}}" grpc_proxy="${{grpc_proxy:-}}" \
+  SSL_CERT_FILE="${{SSL_CERT_FILE:-}}" CURL_CA_BUNDLE="${{CURL_CA_BUNDLE:-}}" GIT_SSL_CAINFO="${{GIT_SSL_CAINFO:-}}" \
+  REQUESTS_CA_BUNDLE="${{REQUESTS_CA_BUNDLE:-}}" NODE_EXTRA_CA_CERTS="${{NODE_EXTRA_CA_CERTS:-}}" \
+  NODE_USE_ENV_PROXY="${{NODE_USE_ENV_PROXY:-}}" DENO_CERT="${{DENO_CERT:-}}" \
   "$root/codex" exec --json --ephemeral --ignore-user-config \
   --dangerously-bypass-approvals-and-sandbox -C "$root/repository" \
   --model {model} --output-schema "$root/result-schema.json" \
@@ -981,7 +999,7 @@ sync
 
 fn worker_prompt(assignment: &AssignmentContext, base_revision: &str) -> String {
     format!(
-        "Implement this Assignment in the current Git repository.\n\nGoal: {}\n\nMandate revision: {}\nImmutable base: {}\nAllowed changed paths: {}\n\nDo not use credentials or perform external effects. Return only the required structured final response.",
+        "Implement this Assignment in the current Git repository.\n\nGoal: {}\n\nMandate revision: {}\nImmutable base: {}\nAllowed changed paths: {}\n\nDo not use credentials or perform external effects. The authorized repository edit is the Result artifact, not an external effect, so known_effects must be an empty array. Return only the required structured final response.",
         assignment.goal,
         assignment.mandate_revision,
         base_revision,
@@ -995,7 +1013,12 @@ fn result_schema() -> &'static [u8] {
   "additionalProperties": false,
   "properties": {
     "summary": {"type": "string"},
-    "known_effects": {"type": "array", "items": {"type": "string"}}
+    "known_effects": {
+      "type": "array",
+      "description": "External effects beyond the local Result artifact; this contained slice permits none.",
+      "items": {"type": "string"},
+      "maxItems": 0
+    }
   },
   "required": ["summary", "known_effects"]
 }
@@ -1187,11 +1210,14 @@ fn unix_timestamp() -> Result<i64, TyrionError> {
 }
 
 fn sandbox_name(scope: &str, attempt_id: &str) -> String {
-    let short = attempt_id.chars().take(12).collect::<String>();
-    format!(
-        "tyrion-{scope}-{short}-{}",
-        &Uuid::new_v4().simple().to_string()[..8]
-    )
+    let scope_code = match scope {
+        "attempt" => "a",
+        "candidate" => "c",
+        "integrated" => "i",
+        _ => "x",
+    };
+    let digest = format!("{:x}", Sha256::digest(format!("{scope}:{attempt_id}")));
+    format!("tyrion-{scope_code}-{}", &digest[..10])
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1210,4 +1236,59 @@ fn os(value: &str) -> OsString {
 
 fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attempt_script, result_schema, validate_kernel_config};
+
+    #[test]
+    fn repaired_kernel_activates_landlock_as_an_lsm() {
+        let inactive = "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n";
+        assert!(validate_kernel_config(inactive).is_err());
+
+        let active = "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n";
+        assert!(validate_kernel_config(active).is_ok());
+    }
+
+    #[test]
+    fn codex_receives_only_the_brokered_network_environment() {
+        let script = attempt_script("0123456789012345678901234567890123456789", "test-model");
+        for required in [
+            "HTTP_PROXY=\"${HTTP_PROXY:-}\"",
+            "HTTPS_PROXY=\"${HTTPS_PROXY:-}\"",
+            "SSL_CERT_FILE=\"${SSL_CERT_FILE:-}\"",
+            "CURL_CA_BUNDLE=\"${CURL_CA_BUNDLE:-}\"",
+            "CODEX_AUTH_ACCESS_TOKEN=$CODEX_AUTH_ACCESS_TOKEN",
+        ] {
+            assert!(script.contains(required), "missing {required}");
+        }
+        assert!(!script.contains("AWS_ACCESS_KEY_ID="));
+        assert!(!script.contains("GH_TOKEN="));
+        assert!(!script.contains("SSH_AUTH_SOCK="));
+    }
+
+    #[test]
+    fn codex_auth_file_is_locally_parseable_without_raw_credentials() {
+        let script = attempt_script("0123456789012345678901234567890123456789", "test-model");
+        let auth_file = script
+            .split("cat >\"$root/home/.codex/auth.json\" <<AUTH\n")
+            .nth(1)
+            .and_then(|tail| tail.split("\nAUTH\n").next())
+            .expect("attempt script contains the Codex auth file");
+
+        assert!(auth_file.contains("\"id_token\": \"e30.e30.placeholder\""));
+        assert!(auth_file.contains("\"last_refresh\": \"$last_refresh\""));
+        assert!(auth_file.contains("\"access_token\": \"$CODEX_AUTH_ACCESS_TOKEN\""));
+        assert!(auth_file.contains("\"account_id\": \"$CODEX_AUTH_ACCOUNT_ID\""));
+        assert!(!auth_file.contains("openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"));
+        assert!(!auth_file.contains("openshell:resolve:env:CODEX_AUTH_ID_TOKEN"));
+    }
+
+    #[test]
+    fn contained_codex_schema_forbids_external_effects() {
+        let schema: serde_json::Value =
+            serde_json::from_slice(result_schema()).expect("result schema is valid JSON");
+        assert_eq!(schema["properties"]["known_effects"]["maxItems"], 0);
+    }
 }

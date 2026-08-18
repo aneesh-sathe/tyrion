@@ -588,7 +588,7 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path) -> PathBuf
     let kernel = root.join("kernel.config");
     fs::write(
         &kernel,
-        "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n",
+        "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n",
     )
     .unwrap();
     let runtime_artifact = root.join("libkrunfw.5.dylib");
@@ -614,6 +614,8 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path) -> PathBuf
                 "sha256": sha256_file(&runtime_artifact)
             }],
             "source_revision": "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354",
+            "source_patch_path": concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/openshell/repaired-v0.0.104.patch"),
+            "source_patch_sha256": "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402",
             "base_image": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
             "codex_binary": codex,
             "codex_version": "codex-cli 0.147.0",
@@ -785,6 +787,14 @@ fn wait_for_completion_with_timeout(
         if inspected["commission"]["status"] == "verified_complete" {
             return inspected;
         }
+        assert!(
+            !inspected["attempts"].as_array().is_some_and(|attempts| {
+                attempts
+                    .first()
+                    .is_some_and(|attempt| attempt["status"] == "failed")
+            }),
+            "Attempt failed before Commission completion: {inspected}"
+        );
         assert!(
             Instant::now() < deadline,
             "Commission did not complete: {inspected}"

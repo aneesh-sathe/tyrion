@@ -34,3 +34,7 @@
 - Run `cargo test --test git_commission` for contained Git lifecycle, lease expiry, boundary failure, unauthorized-path, descendant-cleanup, and malformed-transfer coverage.
 - Run the ignored `real_openshell_microvm_completes_the_contained_git_assignment` test with `TYRION_REAL_CODEX_WORKER_CONFIG` to attest the repaired MicroVM boundary; the default suite uses deterministic protocol fakes.
 - Treat the pinned Codex artifact as a guest-only Linux binary: hash it on the host, but probe its version only after upload inside the MicroVM.
+- Stock OpenShell 0.0.104 is not the contained Worker runtime. Apply `runtime/openshell/repaired-v0.0.104.patch` to the pinned source so Landlock is active in `CONFIG_LSM` and guest PID 1 enters a fail-closed 256-process cgroup.
+- Rebuild or invalidate OpenShell's bootstrap rootfs cache after changing guest init. Its v0.0.104 cache identity does not include the init-script contents and can silently retain the stock boundary.
+- A cleared Codex environment must retain only OpenShell proxy and CA variables. Materialize a parseable synthetic ID token plus `last_refresh`, and preserve the injected revision-scoped access, refresh, and account placeholders; v0.0.104 does not resolve their documented canonical aliases in this path.
+- The uploaded `/sandbox/codex` binary needs its own narrow OpenAI endpoint policy because the built-in Codex provider policy matches only installed `/usr` paths. The attached provider still supplies endpoint-bound credential resolution.
