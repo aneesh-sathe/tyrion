@@ -19,7 +19,7 @@ impl CommissionStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CriterionStatus {
-    Pending,
+    Uncertain,
     Passed,
     Failed,
 }
@@ -27,7 +27,7 @@ pub(crate) enum CriterionStatus {
 impl CriterionStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Pending => "pending",
+            Self::Uncertain => "uncertain",
             Self::Passed => "passed",
             Self::Failed => "failed",
         }
@@ -39,6 +39,7 @@ pub(crate) enum AssignmentStatus {
     Ready,
     Running,
     Accepted,
+    VerificationPending,
     VerificationFailed,
     ResourceBlocked,
 }
@@ -49,6 +50,7 @@ impl AssignmentStatus {
             Self::Ready => "ready",
             Self::Running => "running",
             Self::Accepted => "accepted",
+            Self::VerificationPending => "verification_pending",
             Self::VerificationFailed => "verification_failed",
             Self::ResourceBlocked => "resource_blocked",
         }
@@ -76,6 +78,7 @@ impl AttemptStatus {
 pub(crate) enum ResultStatus {
     Candidate,
     Accepted,
+    Superseded,
 }
 
 impl ResultStatus {
@@ -83,6 +86,7 @@ impl ResultStatus {
         match self {
             Self::Candidate => "candidate",
             Self::Accepted => "accepted",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -92,6 +96,7 @@ impl ResultStatus {
 pub(crate) enum EvidenceOutcome {
     Passed,
     Failed,
+    Uncertain,
 }
 
 impl EvidenceOutcome {
@@ -99,6 +104,7 @@ impl EvidenceOutcome {
         match self {
             Self::Passed => "passed",
             Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
         }
     }
 
@@ -106,6 +112,7 @@ impl EvidenceOutcome {
         match self {
             Self::Passed => CriterionStatus::Passed,
             Self::Failed => CriterionStatus::Failed,
+            Self::Uncertain => CriterionStatus::Uncertain,
         }
     }
 }
@@ -114,6 +121,7 @@ impl EvidenceOutcome {
 pub(crate) enum EventKind {
     CommissionProposed,
     CommissionAccepted,
+    CommissionAmended,
     AssignmentReady,
     AttemptStarted,
     ResultSubmitted,
@@ -131,6 +139,7 @@ impl EventKind {
         match self {
             Self::CommissionProposed => "commission_proposed",
             Self::CommissionAccepted => "commission_accepted",
+            Self::CommissionAmended => "commission_amended",
             Self::AssignmentReady => "assignment_ready",
             Self::AttemptStarted => "attempt_started",
             Self::ResultSubmitted => "result_submitted",

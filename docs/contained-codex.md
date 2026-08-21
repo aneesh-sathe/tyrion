@@ -91,6 +91,11 @@ The immutable base must be a full Git object ID. The repository path must appear
     {
       "id": "focused-test",
       "description": "The focused test passes in the integrated repository",
+      "required_evidence": "focused_test_output",
+      "verifier_type": "deterministic",
+      "verification_depth": "standard",
+      "verifier_configuration": "contained-command-v1",
+      "verification_environment": "openshell-repaired-v0.0.104",
       "verifier": {
         "kind": "command",
         "argv": ["cargo", "test", "--test", "focused_test"]

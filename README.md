@@ -1,6 +1,6 @@
 # Tyrion
 
-Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), and the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
+Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), and the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
 
 ## What exists
 
@@ -18,7 +18,14 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Expiring Worker Leases with fail-closed sandbox deletion
 - Verified Git-bundle transfer without mounting the Principal checkout
 - Candidate verification, daemon-owned Integration, and fresh integrated verification
-- Criterion-linked deterministic Evidence with independently validated artifact revisions
+- Deterministic, model, and Principal verifiers with standard or independent depth
+- Immutable Evidence bound to the mandate, artifact, verifier configuration, procedure, and environment
+- Daemon-issued verification Attempt identities bound to the authenticated Attachment
+- Durable Principal verification gates that must close before completion
+- Visible passed, failed, and uncertain verdicts with one derived recovery action
+- Durable verification recovery records with pending, scheduled, attention, blocked, and resolved states
+- Result rework that retains prior Attempts and marks superseded Evidence stale
+- Revision-checked verification amendments with retained criterion history
 - A criterion-linked Verified Completion briefing
 - Assignment-scoped resource Blockers that preserve Control Plane availability
 - Public ordered lifecycle events, including Assignment readiness before dispatch
@@ -53,6 +60,11 @@ Create `proposal.json`:
     {
       "id": "greeting",
       "description": "The Result contains the accepted greeting",
+      "required_evidence": "exact_output",
+      "verifier_type": "deterministic",
+      "verification_depth": "standard",
+      "verifier_configuration": "deterministic-exact-match-v1",
+      "verification_environment": "tyrion-controlled-v1",
       "verifier": {
         "kind": "exact_match",
         "expected": "return a deterministic greeting"
@@ -146,6 +158,30 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --capability persistent_mode_display \
   --last-event-sequence LAST_EVENT_SEQUENCE
 ```
+
+Model and Principal criteria remain visibly `uncertain` after Integration until the Active Attachment records matching structured Evidence. Each `evidence.json` record names its criterion, current Result, Evidence type, verdict, exact verifier configuration, procedure, environment, inspectable output, and any diagnosed defect. The daemon creates the Verification Attempt identity and binds the verifier identity to the authenticated Attachment, so caller-supplied identity claims are rejected. Failed or uncertain Evidence must classify the defect as `result`, `verifier`, `environment`, or `criterion`.
+
+```sh
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  commission record-evidence COMMISSION_ID \
+  --file evidence.json \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key record-review-1
+```
+
+A result defect routes rework while Attempts remain. Environment retry records a fresh daemon-issued Verification Attempt, verifier reroute can transfer control to another eligible Attachment, criterion escalation can enter the revision-checked amendment path, and exhausted attempt ceilings produce an actionable Blocker. Each diagnosis creates a durable `verification_recoveries` record whose state survives restart and resolves when the routed action starts or replacement Evidence arrives. Principal criteria also create durable verification gates that remain open until sufficient current Principal Evidence from distinct verifier Attachments passes. A verification-only mandate change uses an explicit amendment containing the complete current criterion set:
+
+```sh
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  commission amend-verification COMMISSION_ID \
+  --file amendment.json \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key amend-verification-1
+```
+
+The amendment cannot change the Goal, Authority Envelope, resource ceilings, or criterion identifiers. It retains prior criterion versions and Evidence, marks old Evidence stale, and routes a fresh Attempt under the new mandate revision.
 
 A second Attachment may join a Commission as an observer by passing `--commission-id` and `--last-event-sequence` to `attachment connect`. It becomes the controller only after an explicit takeover:
 

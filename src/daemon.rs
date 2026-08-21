@@ -25,6 +25,7 @@ pub fn run_daemon(data_dir: &Path, socket_path: &Path) -> Result<(), TyrionError
 pub struct DaemonOptions {
     pub defer_ready_dispatch: bool,
     pub corrupt_worker_artifact_revision: bool,
+    pub incorrect_first_worker_result: bool,
     pub codex_worker_config: Option<PathBuf>,
 }
 
@@ -45,6 +46,7 @@ pub fn run_daemon_with_options(
         data_dir,
         options.codex_worker_config.as_deref(),
         options.corrupt_worker_artifact_revision,
+        options.incorrect_first_worker_result,
     )?);
     if !options.defer_ready_dispatch {
         resume_ready_assignments(&mut store, &database_path, &worker)?;
@@ -79,8 +81,20 @@ fn spawn_ready_assignment(
     thread::Builder::new()
         .name(format!("assignment-{thread_label}"))
         .spawn(move || {
-            let outcome = Store::open(&database_path)
-                .and_then(|mut store| store.run_ready_assignment(&commission_id, &worker));
+            let outcome = (|| {
+                loop {
+                    let mut store = Store::open(&database_path)?;
+                    store.run_ready_assignment(&commission_id, &worker)?;
+                    if !store
+                        .ready_commission_ids()?
+                        .iter()
+                        .any(|ready_id| ready_id == &commission_id)
+                    {
+                        break;
+                    }
+                }
+                Ok::<(), TyrionError>(())
+            })();
             if let Err(error) = outcome {
                 eprintln!("failed to run ready Assignment for Commission {commission_id}: {error}");
             }
@@ -209,6 +223,20 @@ fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, Tyr
         )),
         Command::AcceptCommission { commission_id } => Ok(DispatchOutcome {
             data: store.accept_commission(request, commission_id)?,
+            follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
+        }),
+        Command::RecordVerificationEvidence {
+            commission_id,
+            evidence,
+        } => Ok(DispatchOutcome {
+            data: store.record_verification_evidence(request, commission_id, evidence)?,
+            follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
+        }),
+        Command::AmendVerification {
+            commission_id,
+            amendment,
+        } => Ok(DispatchOutcome {
+            data: store.amend_verification(request, commission_id, amendment)?,
             follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
         }),
         Command::IssueAttachmentToken {

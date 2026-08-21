@@ -15,6 +15,8 @@ struct Arguments {
     fault_defer_ready_dispatch: bool,
     #[arg(long, hide = true)]
     fault_corrupt_worker_artifact_revision: bool,
+    #[arg(long, hide = true)]
+    fault_incorrect_first_worker_result: bool,
 }
 
 fn main() {
@@ -22,6 +24,7 @@ fn main() {
     let options = tyrion::DaemonOptions {
         defer_ready_dispatch: arguments.fault_defer_ready_dispatch,
         corrupt_worker_artifact_revision: arguments.fault_corrupt_worker_artifact_revision,
+        incorrect_first_worker_result: arguments.fault_incorrect_first_worker_result,
         codex_worker_config: arguments.codex_worker_config,
     };
     if let Err(error) =

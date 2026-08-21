@@ -443,6 +443,32 @@ fn failed_fresh_integrated_verification_prevents_completion() {
     assert_eq!(failed["briefing"], Value::Null);
 }
 
+#[test]
+fn unavailable_verifier_remains_uncertain_and_recommends_retry() {
+    let fixture = FailedFixture::new("unused-marker");
+    set_proposal_verifier(
+        &fixture.proposal_path,
+        &["/definitely-unavailable-verifier"],
+    );
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &fixture.proposal_path);
+
+    let uncertain = wait_for_verification_failure(&daemon, &attachment_token, &commission_id);
+    assert_eq!(uncertain["commission"]["status"], "active");
+    assert_eq!(uncertain["assignments"][0]["status"], "verification_failed");
+    assert_eq!(uncertain["results"][0]["status"], "candidate");
+    assert_eq!(
+        uncertain["evidence"][0]["outcome"], "uncertain",
+        "{}",
+        uncertain["evidence"][0]
+    );
+    assert_eq!(uncertain["evidence"][0]["defect"], "environment");
+    assert_eq!(uncertain["verification"]["verdict"], "uncertain");
+    assert_eq!(uncertain["verification"]["next_action"], "retry");
+    assert_eq!(uncertain["briefing"], Value::Null);
+}
+
 struct FailedFixture {
     _temp: TempDir,
     principal_checkout: PathBuf,
@@ -496,6 +522,12 @@ fn set_proposal_ceiling(path: &Path, key: &str, value: u64) {
     fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
 }
 
+fn set_proposal_verifier(path: &Path, argv: &[&str]) {
+    let mut proposal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    proposal["criteria"][0]["verifier"]["argv"] = json!(argv);
+    fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+}
+
 fn write_git_proposal(path: &Path, principal_checkout: &Path, base_revision: &str) {
     fs::write(
         path,
@@ -509,6 +541,9 @@ fn write_git_proposal(path: &Path, principal_checkout: &Path, base_revision: &st
             "criteria": [{
                 "id": "issue-file",
                 "description": "The integrated repository contains the requested file",
+                "required_evidence": "command_output",
+                "verifier_type": "deterministic",
+                "verification_depth": "standard",
                 "verifier": {
                     "kind": "command",
                     "argv": ["sh", "-c", "test \"$(cat issue-4.txt)\" = 'contained codex result'"]

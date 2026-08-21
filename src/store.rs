@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,11 +10,13 @@ use uuid::Uuid;
 
 use crate::domain::{
     AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus, CriterionStatus,
-    EventKind, EvidenceOutcome, ResultStatus, WorkerLeaseStatus,
+    EventKind, ResultStatus, WorkerLeaseStatus,
 };
 use crate::protocol::{
-    AdapterIdentity, AttachmentHandshake, CommissionProposal, CommissionReplayCursor,
-    ExecutionSpec, Request, ResourceCeilings, Verifier, PROTOCOL_VERSION,
+    AcceptanceCriterion, AdapterIdentity, AttachmentHandshake, CommissionProposal,
+    CommissionReplayCursor, ExecutionSpec, Request, ResourceCeilings, VerificationAmendment,
+    VerificationDefect, VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict,
+    Verifier, VerifierType, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
@@ -39,6 +41,70 @@ struct ReadyAssignmentDispatch {
     max_elapsed_seconds: u64,
     max_worker_concurrency: u32,
     max_storage_bytes: u64,
+}
+
+struct StoredCriterion {
+    id: String,
+    required_evidence: String,
+    verifier_type: VerifierType,
+    verification_depth: VerificationDepth,
+    verifier_configuration: String,
+    verification_environment: String,
+    verifier_kind: String,
+    expected: String,
+}
+
+struct CompletionTransition<'a> {
+    commission_id: &'a str,
+    result_id: &'a str,
+    assignment_id: &'a str,
+    attempt_id: Option<&'a str>,
+    lease_id: Option<&'a str>,
+    mandate_revision: i64,
+    artifact_revision: &'a str,
+    goal: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum VerificationRecoveryAction {
+    Rework,
+    Retry,
+    Reroute,
+    Escalate,
+    Block,
+}
+
+impl VerificationRecoveryAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rework => "rework",
+            Self::Retry => "retry",
+            Self::Reroute => "reroute",
+            Self::Escalate => "escalate",
+            Self::Block => "block",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VerificationRecoveryStatus {
+    Pending,
+    Scheduled,
+    AttentionRequired,
+    Blocked,
+    Resolved,
+}
+
+impl VerificationRecoveryStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Scheduled => "scheduled",
+            Self::AttentionRequired => "attention_required",
+            Self::Blocked => "blocked",
+            Self::Resolved => "resolved",
+        }
+    }
 }
 
 impl Store {
@@ -99,20 +165,31 @@ impl Store {
             let (verifier_kind, expected) = match &criterion.verifier {
                 Verifier::ExactMatch { expected } => ("exact_match", expected.clone()),
                 Verifier::Command { argv } => ("command", serde_json::to_string(argv)?),
+                Verifier::Prompt { prompt } => ("prompt", prompt.clone()),
             };
+            let verifier_configuration = resolved_verifier_configuration(criterion);
             transaction.execute(
-                "INSERT INTO criteria (commission_id, criterion_id, position, description, verifier_kind, expected, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO criteria (
+                    commission_id, criterion_id, position, description, required_evidence,
+                    verifier_type, verification_depth, verifier_configuration,
+                    verification_environment, verifier_kind, expected, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     commission_id,
                     criterion.id,
                     position as i64,
                     criterion.description,
+                    criterion.required_evidence,
+                    criterion.verifier_type.as_str(),
+                    criterion.verification_depth.as_str(),
+                    verifier_configuration,
+                    criterion.verification_environment,
                     verifier_kind,
                     expected,
-                    CriterionStatus::Pending.as_str(),
+                    CriterionStatus::Uncertain.as_str(),
                 ],
             )?;
+            insert_criterion_version(&transaction, &commission_id, 0, position, criterion)?;
         }
 
         insert_authority(&transaction, &commission_id, proposal)?;
@@ -698,6 +775,17 @@ impl Store {
                 accepted_at
             ],
         )?;
+        transaction.execute(
+            "UPDATE criterion_versions SET mandate_revision = ?2
+             WHERE commission_id = ?1 AND mandate_revision = 0",
+            params![commission_id, mandate_revision],
+        )?;
+        open_principal_verification_gates(
+            &transaction,
+            commission_id,
+            mandate_revision,
+            accepted_at,
+        )?;
         record_event(
             &transaction,
             commission_id,
@@ -722,6 +810,383 @@ impl Store {
             commission_id,
             EventKind::AssignmentReady,
             mandate_revision,
+        )?;
+
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn amend_verification(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        amendment: &VerificationAmendment,
+    ) -> Result<Value, TyrionError> {
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "verification amendment requires an expected revision".into(),
+            )
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+        let (status, current_revision, execution_json) = transaction
+            .query_row(
+                "SELECT status, revision, execution_json FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if current_revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        if status != CommissionStatus::Active.as_str() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Commission {commission_id} is {status}; only an active mandate can be amended"
+            )));
+        }
+        let execution: ExecutionSpec = serde_json::from_str(&execution_json)?;
+        validate_acceptance_criteria(&execution, &amendment.criteria)?;
+
+        let current_criterion_ids = {
+            let mut statement = transaction
+                .prepare("SELECT criterion_id FROM criteria WHERE commission_id = ?1")?;
+            let rows = statement.query_map([commission_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<HashSet<_>, _>>()?
+        };
+        let amended_criterion_ids = amendment
+            .criteria
+            .iter()
+            .map(|criterion| criterion.id.clone())
+            .collect::<HashSet<_>>();
+        if amended_criterion_ids != current_criterion_ids {
+            return Err(TyrionError::InvalidRequest(
+                "this verification amendment must preserve the current criterion identifiers"
+                    .into(),
+            ));
+        }
+
+        let (assignment_id, assignment_status) = transaction.query_row(
+            "SELECT id, status FROM assignments
+             WHERE commission_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            [commission_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        if assignment_status != AssignmentStatus::VerificationPending.as_str()
+            && assignment_status != AssignmentStatus::VerificationFailed.as_str()
+        {
+            return Err(TyrionError::InvalidRequest(
+                "verification can be amended only after the current Attempt reaches a verification outcome"
+                    .into(),
+            ));
+        }
+
+        let next_revision = current_revision + 1;
+        transaction.execute(
+            "UPDATE commissions SET revision = ?2 WHERE id = ?1",
+            params![commission_id, next_revision],
+        )?;
+        resolve_all_verification_recoveries(&transaction, commission_id)?;
+        for (position, criterion) in amendment.criteria.iter().enumerate() {
+            let (verifier_kind, expected) = verifier_storage(&criterion.verifier)?;
+            transaction.execute(
+                "UPDATE criteria SET
+                    position = ?3, description = ?4, required_evidence = ?5,
+                    verifier_type = ?6, verification_depth = ?7,
+                    verifier_configuration = ?8, verification_environment = ?9,
+                    verifier_kind = ?10, expected = ?11, status = ?12
+                 WHERE commission_id = ?1 AND criterion_id = ?2",
+                params![
+                    commission_id,
+                    criterion.id,
+                    position as i64,
+                    criterion.description,
+                    criterion.required_evidence,
+                    criterion.verifier_type.as_str(),
+                    criterion.verification_depth.as_str(),
+                    resolved_verifier_configuration(criterion),
+                    criterion.verification_environment,
+                    verifier_kind,
+                    expected,
+                    CriterionStatus::Uncertain.as_str(),
+                ],
+            )?;
+            insert_criterion_version(
+                &transaction,
+                commission_id,
+                next_revision,
+                position,
+                criterion,
+            )?;
+        }
+        open_principal_verification_gates(
+            &transaction,
+            commission_id,
+            next_revision,
+            unix_timestamp()?,
+        )?;
+        transaction.execute(
+            "UPDATE results SET status = ?2
+             WHERE status = ?3 AND attempt_id IN (
+                 SELECT id FROM attempts WHERE assignment_id = ?1
+             )",
+            params![
+                assignment_id,
+                ResultStatus::Superseded.as_str(),
+                ResultStatus::Candidate.as_str()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET plan_revision = ?2, status = ?3 WHERE id = ?1",
+            params![
+                assignment_id,
+                next_revision,
+                AssignmentStatus::Ready.as_str()
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::CommissionAmended,
+            next_revision,
+            &serde_json::json!({
+                "previous_mandate_revision": current_revision,
+                "mandate_revision": next_revision,
+                "changed_section": "verification",
+            }),
+        )?;
+        record_event(
+            &transaction,
+            commission_id,
+            EventKind::AssignmentReady,
+            next_revision,
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn record_verification_evidence(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        evidence: &VerificationEvidenceSubmission,
+    ) -> Result<Value, TyrionError> {
+        validate_evidence_submission(evidence)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "recording verification Evidence requires an expected revision".into(),
+            )
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+
+        let (status, current_revision, artifact_revision) = transaction
+            .query_row(
+                "SELECT status, revision, artifact_revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if current_revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        if status != CommissionStatus::Active.as_str() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Commission {commission_id} is {status}; Evidence can be recorded only while active"
+            )));
+        }
+        let criterion = transaction
+            .query_row(
+                "SELECT criterion_id, required_evidence, verifier_type, verification_depth,
+                        verifier_configuration, verification_environment,
+                        verifier_kind, expected
+                 FROM criteria WHERE commission_id = ?1 AND criterion_id = ?2",
+                params![commission_id, evidence.criterion_id],
+                stored_criterion,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(format!(
+                    "Acceptance Criterion {} was not found",
+                    evidence.criterion_id
+                ))
+            })?;
+        if criterion.verifier_type == VerifierType::Deterministic {
+            return Err(TyrionError::InvalidRequest(
+                "deterministic Evidence is recorded only by the Control Plane and cannot be overridden through an Entry Session".into(),
+            ));
+        }
+        let artifact_revision = artifact_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "verification Evidence requires a current integrated artifact".into(),
+            )
+        })?;
+        let (submitted_kind, submitted_expected) = verifier_storage(&evidence.procedure)?;
+        if evidence.evidence_type != criterion.required_evidence
+            || evidence.verifier_configuration != criterion.verifier_configuration
+            || evidence.environment != criterion.verification_environment
+            || submitted_kind != criterion.verifier_kind
+            || submitted_expected != criterion.expected
+        {
+            return Err(TyrionError::InvalidRequest(
+                "Evidence does not match the current criterion, verifier configuration, procedure, or environment".into(),
+            ));
+        }
+
+        let (producer_attempt_id, integrated_artifact_revision, result_status) = transaction
+            .query_row(
+                "SELECT attempts.id, results.integrated_artifact_revision, results.status
+                     FROM results
+                     JOIN attempts ON attempts.id = results.attempt_id
+                     JOIN assignments ON assignments.id = attempts.assignment_id
+                     WHERE results.id = ?1 AND assignments.commission_id = ?2",
+                params![evidence.result_id, commission_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "Evidence Result does not belong to this Commission".into(),
+                )
+            })?;
+        if integrated_artifact_revision.as_deref() != Some(artifact_revision.as_str()) {
+            return Err(TyrionError::InvalidRequest(
+                "Evidence Result is not the current integrated artifact".into(),
+            ));
+        }
+        if result_status != ResultStatus::Candidate.as_str() {
+            return Err(TyrionError::InvalidRequest(
+                "Evidence Result is no longer the current candidate".into(),
+            ));
+        }
+        let verification_attempt_id = Uuid::new_v4().to_string();
+        let verifier_identity = format!("attachment:{attachment_id}");
+
+        let evidence_id = Uuid::new_v4().to_string();
+        resolve_verification_recoveries(&transaction, commission_id, &evidence.criterion_id)?;
+        transaction.execute(
+            "INSERT INTO evidence (
+                id, commission_id, criterion_id, result_id, mandate_revision,
+                artifact_revision, evidence_type, verifier_type, scope,
+                verification_attempt_id, verifier_identity, verifier_configuration,
+                verifier_kind, procedure_json, environment, outcome, observed, expected,
+                material_contradiction, defect, producer_attempt_id, created_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'external', ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+             )",
+            params![
+                evidence_id,
+                commission_id,
+                evidence.criterion_id,
+                evidence.result_id,
+                current_revision,
+                artifact_revision,
+                evidence.evidence_type,
+                criterion.verifier_type.as_str(),
+                verification_attempt_id,
+                verifier_identity,
+                evidence.verifier_configuration,
+                submitted_kind,
+                serde_json::to_string(&evidence.procedure)?,
+                evidence.environment,
+                evidence.verdict.as_str(),
+                evidence.inspectable_output,
+                submitted_expected,
+                evidence.material_contradiction,
+                evidence.defect.map(|defect| defect.as_str()),
+                producer_attempt_id,
+                unix_timestamp()?,
+            ],
+        )?;
+        record_event(
+            &transaction,
+            commission_id,
+            EventKind::EvidenceRecorded,
+            current_revision,
+        )?;
+        refresh_criterion_statuses(
+            &transaction,
+            commission_id,
+            current_revision,
+            &artifact_revision,
+        )?;
+        refresh_principal_verification_gate(
+            &transaction,
+            commission_id,
+            &criterion,
+            current_revision,
+        )?;
+        let recovery_id = plan_verification_recovery(
+            &transaction,
+            commission_id,
+            current_revision,
+            &evidence_id,
+            evidence,
+        )?;
+        route_result_rework(
+            &transaction,
+            commission_id,
+            current_revision,
+            evidence,
+            recovery_id.as_deref(),
+        )?;
+        complete_after_external_verification(
+            &transaction,
+            commission_id,
+            current_revision,
+            &artifact_revision,
         )?;
 
         let result = project_commission(&transaction, commission_id)?;
@@ -885,6 +1350,18 @@ impl Store {
         transaction.execute(
             "UPDATE assignments SET status = ?2 WHERE id = ?1",
             params![ready.assignment_id, AssignmentStatus::Running.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE verification_recoveries
+             SET status = ?2, resolved_at = ?3
+             WHERE commission_id = ?1 AND action = ?4 AND status = ?5",
+            params![
+                commission_id,
+                VerificationRecoveryStatus::Resolved.as_str(),
+                now,
+                VerificationRecoveryAction::Rework.as_str(),
+                VerificationRecoveryStatus::Scheduled.as_str(),
+            ],
         )?;
         record_event(
             &transaction,
@@ -1080,6 +1557,12 @@ impl Store {
             integrated.artifact_revision.as_str(),
             &integrated_verification,
         )?;
+        refresh_criterion_statuses(
+            &transaction,
+            commission_id,
+            ready.mandate_revision,
+            integrated.artifact_revision.as_str(),
+        )?;
         if !integrated_passed {
             finish_failed_verification(
                 &transaction,
@@ -1091,60 +1574,36 @@ impl Store {
             return Ok(());
         }
 
-        let completed_at = unix_timestamp()?;
-        transaction.execute(
-            "UPDATE results SET status = ?2 WHERE id = ?1",
-            params![result_id, ResultStatus::Accepted.as_str()],
+        let every_criterion_passed = transaction.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM criteria WHERE commission_id = ?1 AND status != ?2
+             )",
+            params![commission_id, CriterionStatus::Passed.as_str()],
+            |row| row.get::<_, bool>(0),
         )?;
-        record_event(
+        if !every_criterion_passed {
+            finish_pending_verification(
+                &transaction,
+                &assignment.assignment_id,
+                &attempt_id,
+                &lease_id,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        complete_commission(
             &transaction,
-            commission_id,
-            EventKind::ResultAccepted,
-            ready.mandate_revision,
-        )?;
-        transaction.execute(
-            "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
-            params![attempt_id, AttemptStatus::Succeeded.as_str(), completed_at],
-        )?;
-        transaction.execute(
-            "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
-            params![lease_id, WorkerLeaseStatus::Released.as_str(), completed_at],
-        )?;
-        transaction.execute(
-            "UPDATE assignments SET status = ?2 WHERE id = ?1",
-            params![
-                assignment.assignment_id,
-                AssignmentStatus::Accepted.as_str()
-            ],
-        )?;
-        let completion_revision = ready.mandate_revision + 1;
-        transaction.execute(
-            "UPDATE commissions
-             SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
-             WHERE id = ?1",
-            params![
+            CompletionTransition {
                 commission_id,
-                CommissionStatus::VerifiedComplete.as_str(),
-                completion_revision,
-                completed_at,
-                integrated.artifact_revision.as_str(),
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO completion_briefings (commission_id, summary, artifact_revision, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                commission_id,
-                format!("Verified Complete: {}", ready.goal),
-                integrated.artifact_revision.as_str(),
-                completed_at,
-            ],
-        )?;
-        record_event(
-            &transaction,
-            commission_id,
-            EventKind::CommissionVerifiedComplete,
-            completion_revision,
+                result_id: &result_id,
+                assignment_id: &assignment.assignment_id,
+                attempt_id: Some(&attempt_id),
+                lease_id: Some(&lease_id),
+                mandate_revision: ready.mandate_revision,
+                artifact_revision: integrated.artifact_revision.as_str(),
+                goal: &ready.goal,
+            },
         )?;
 
         transaction.commit()?;
@@ -1227,30 +1686,43 @@ fn load_criteria(
     commission_id: &str,
 ) -> Result<Vec<worker::CriterionDefinition>, TyrionError> {
     let mut statement = transaction.prepare(
-        "SELECT criterion_id, verifier_kind, expected
+        "SELECT criterion_id, required_evidence, verifier_type, verification_depth,
+                verifier_configuration, verification_environment, verifier_kind, expected
          FROM criteria WHERE commission_id = ?1 ORDER BY position",
     )?;
-    let rows = statement.query_map([commission_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
+    let rows = statement.query_map([commission_id], stored_criterion)?;
     rows.map(|row| {
-        let (id, kind, expected) = row?;
-        let verifier = match kind.as_str() {
+        let StoredCriterion {
+            id,
+            required_evidence,
+            verifier_type,
+            verification_depth,
+            verifier_configuration,
+            verification_environment,
+            verifier_kind,
+            expected,
+        } = row?;
+        let verifier = match verifier_kind.as_str() {
             "exact_match" => Verifier::ExactMatch { expected },
             "command" => Verifier::Command {
                 argv: serde_json::from_str(&expected)?,
             },
+            "prompt" => Verifier::Prompt { prompt: expected },
             _ => {
                 return Err(TyrionError::InvalidRequest(format!(
-                    "unsupported persisted verifier {kind}"
+                    "unsupported persisted verifier {verifier_kind}"
                 )))
             }
         };
-        Ok(worker::CriterionDefinition { id, verifier })
+        Ok(worker::CriterionDefinition {
+            id,
+            required_evidence,
+            verifier_type,
+            verification_depth,
+            verifier_configuration,
+            verification_environment,
+            verifier,
+        })
     })
     .collect()
 }
@@ -1279,16 +1751,18 @@ fn record_evidence(
     verification: &[worker::VerificationRecord],
 ) -> Result<(), TyrionError> {
     for record in verification {
-        let outcome = if record.passed() {
-            EvidenceOutcome::Passed
-        } else {
-            EvidenceOutcome::Failed
-        };
+        let outcome = record.outcome;
         transaction.execute(
             "INSERT INTO evidence (
                 id, commission_id, criterion_id, result_id, mandate_revision,
-                artifact_revision, verifier_kind, outcome, observed, expected, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                artifact_revision, evidence_type, verifier_type, scope,
+                verification_attempt_id, verifier_identity, verifier_configuration,
+                verifier_kind, procedure_json, environment, outcome, observed, expected,
+                material_contradiction, defect, producer_attempt_id, created_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+             )",
             params![
                 Uuid::new_v4().to_string(),
                 commission_id,
@@ -1296,10 +1770,21 @@ fn record_evidence(
                 result_id,
                 mandate_revision,
                 artifact_revision,
+                record.evidence_type,
+                record.verifier_type.as_str(),
+                record.scope.as_str(),
+                record.verification_attempt_id,
+                record.verifier_identity,
+                record.verifier_configuration,
                 record.verifier_kind.as_str(),
+                serde_json::to_string(&record.procedure)?,
+                record.environment,
                 record.outcome.as_str(),
                 record.observed,
                 record.expected,
+                record.material_contradiction,
+                record.defect.map(|defect| defect.as_str()),
+                record.producer_attempt_id,
                 unix_timestamp()?,
             ],
         )?;
@@ -1321,6 +1806,651 @@ fn record_evidence(
     Ok(())
 }
 
+fn open_principal_verification_gates(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    opened_at: i64,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "INSERT INTO verification_gates (
+            commission_id, criterion_id, mandate_revision, status, opened_at
+         )
+         SELECT commission_id, criterion_id, ?2, 'open', ?3
+         FROM criteria
+         WHERE commission_id = ?1 AND verifier_type = ?4",
+        params![
+            commission_id,
+            mandate_revision,
+            opened_at,
+            VerifierType::Principal.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
+fn refresh_principal_verification_gate(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    criterion: &StoredCriterion,
+    mandate_revision: i64,
+) -> Result<(), TyrionError> {
+    if criterion.verifier_type != VerifierType::Principal {
+        return Ok(());
+    }
+    let criterion_passed = transaction.query_row(
+        "SELECT status = ?3 FROM criteria WHERE commission_id = ?1 AND criterion_id = ?2",
+        params![
+            commission_id,
+            criterion.id,
+            CriterionStatus::Passed.as_str()
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    transaction.execute(
+        "UPDATE verification_gates
+         SET status = ?4, closed_at = ?5
+         WHERE commission_id = ?1 AND criterion_id = ?2 AND mandate_revision = ?3",
+        params![
+            commission_id,
+            criterion.id,
+            mandate_revision,
+            if criterion_passed { "closed" } else { "open" },
+            criterion_passed.then(unix_timestamp).transpose()?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn resolve_verification_recoveries(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    criterion_id: &str,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "UPDATE verification_recoveries
+         SET status = ?3, resolved_at = ?4
+         WHERE commission_id = ?1 AND criterion_id = ?2
+           AND status IN (?5, ?6, ?7)",
+        params![
+            commission_id,
+            criterion_id,
+            VerificationRecoveryStatus::Resolved.as_str(),
+            unix_timestamp()?,
+            VerificationRecoveryStatus::Pending.as_str(),
+            VerificationRecoveryStatus::Scheduled.as_str(),
+            VerificationRecoveryStatus::AttentionRequired.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn resolve_all_verification_recoveries(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "UPDATE verification_recoveries
+         SET status = ?2, resolved_at = ?3
+         WHERE commission_id = ?1 AND status IN (?4, ?5, ?6)",
+        params![
+            commission_id,
+            VerificationRecoveryStatus::Resolved.as_str(),
+            unix_timestamp()?,
+            VerificationRecoveryStatus::Pending.as_str(),
+            VerificationRecoveryStatus::Scheduled.as_str(),
+            VerificationRecoveryStatus::AttentionRequired.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn plan_verification_recovery(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    evidence_id: &str,
+    evidence: &VerificationEvidenceSubmission,
+) -> Result<Option<String>, TyrionError> {
+    let recovery = if evidence.material_contradiction {
+        Some((
+            VerificationRecoveryAction::Escalate,
+            VerificationRecoveryStatus::AttentionRequired,
+            "Resolve the material contradiction through Principal review or a verification amendment.",
+        ))
+    } else {
+        match evidence.defect {
+            Some(VerificationDefect::Result) => Some((
+                VerificationRecoveryAction::Rework,
+                VerificationRecoveryStatus::Pending,
+                "Rework the current Result under the accepted mandate.",
+            )),
+            Some(VerificationDefect::Environment) => Some((
+                VerificationRecoveryAction::Retry,
+                VerificationRecoveryStatus::Pending,
+                "Retry verification in the required current environment with a fresh Verification Attempt.",
+            )),
+            Some(VerificationDefect::Verifier) => Some((
+                VerificationRecoveryAction::Reroute,
+                VerificationRecoveryStatus::Pending,
+                "Reroute verification to a distinct eligible verifier Attachment or configuration.",
+            )),
+            Some(VerificationDefect::Criterion) => Some((
+                VerificationRecoveryAction::Escalate,
+                VerificationRecoveryStatus::AttentionRequired,
+                "Escalate for Principal clarification and a revision-checked verification amendment.",
+            )),
+            None => None,
+        }
+    };
+    let Some((action, status, requirement)) = recovery else {
+        return Ok(None);
+    };
+    let recovery_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO verification_recoveries (
+            id, commission_id, criterion_id, result_id, source_evidence_id,
+            mandate_revision, action, status, requirement, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            recovery_id,
+            commission_id,
+            evidence.criterion_id,
+            evidence.result_id,
+            evidence_id,
+            mandate_revision,
+            action.as_str(),
+            status.as_str(),
+            requirement,
+            unix_timestamp()?,
+        ],
+    )?;
+    Ok(Some(recovery_id))
+}
+
+fn refresh_criterion_statuses(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    artifact_revision: &str,
+) -> Result<(), TyrionError> {
+    let mut criteria_statement = transaction.prepare(
+        "SELECT criterion_id, required_evidence, verifier_type, verification_depth,
+                verifier_configuration, verification_environment, verifier_kind, expected
+         FROM criteria WHERE commission_id = ?1 ORDER BY position",
+    )?;
+    let criteria = criteria_statement
+        .query_map([commission_id], stored_criterion)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(criteria_statement);
+
+    for criterion in criteria {
+        let mut evidence_statement = transaction.prepare(
+            "SELECT outcome, verifier_identity, verification_attempt_id,
+                    material_contradiction
+             FROM evidence
+             WHERE commission_id = ?1 AND criterion_id = ?2
+               AND mandate_revision = ?3 AND artifact_revision = ?4
+               AND evidence_type = ?5 AND verifier_type = ?6
+               AND verifier_configuration = ?7 AND environment = ?8
+               AND verifier_kind = ?9 AND expected = ?10
+               AND scope IN ('integrated', 'external')
+             ORDER BY rowid",
+        )?;
+        let records = evidence_statement
+            .query_map(
+                params![
+                    commission_id,
+                    criterion.id,
+                    mandate_revision,
+                    artifact_revision,
+                    criterion.required_evidence,
+                    criterion.verifier_type.as_str(),
+                    criterion.verifier_configuration,
+                    criterion.verification_environment,
+                    criterion.verifier_kind,
+                    criterion.expected,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let has_material_contradiction = records.iter().any(|record| record.3);
+        let deterministic_failure = criterion.verifier_type == VerifierType::Deterministic
+            && records
+                .iter()
+                .any(|record| record.0 == VerificationVerdict::Failed.as_str());
+        let mut latest_by_identity = HashMap::new();
+        for record in &records {
+            latest_by_identity.insert(record.1.as_str(), record);
+        }
+        let current_records = latest_by_identity.values().copied().collect::<Vec<_>>();
+        let has_failure = deterministic_failure
+            || current_records
+                .iter()
+                .any(|record| record.0 == VerificationVerdict::Failed.as_str());
+        let passed_attempts = current_records
+            .iter()
+            .filter(|record| record.0 == VerificationVerdict::Passed.as_str())
+            .map(|record| record.2.as_str())
+            .collect::<HashSet<_>>();
+        let required_passes = criterion.verification_depth.required_passes();
+        let status = if has_material_contradiction {
+            CriterionStatus::Uncertain
+        } else if passed_attempts.len() >= required_passes {
+            CriterionStatus::Passed
+        } else if has_failure {
+            CriterionStatus::Failed
+        } else {
+            CriterionStatus::Uncertain
+        };
+        transaction.execute(
+            "UPDATE criteria SET status = ?3 WHERE commission_id = ?1 AND criterion_id = ?2",
+            params![commission_id, criterion.id, status.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn complete_after_external_verification(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    artifact_revision: &str,
+) -> Result<(), TyrionError> {
+    let unresolved = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM criteria WHERE commission_id = ?1 AND status != ?2
+         )",
+        params![commission_id, CriterionStatus::Passed.as_str()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let contradiction = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM evidence
+            WHERE commission_id = ?1 AND mandate_revision = ?2
+              AND artifact_revision = ?3 AND scope IN ('integrated', 'external')
+              AND material_contradiction = 1
+         )",
+        params![commission_id, mandate_revision, artifact_revision],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if unresolved || contradiction {
+        return Ok(());
+    }
+
+    let (result_id, assignment_id, goal) = transaction
+        .query_row(
+            "SELECT results.id, assignments.id, commissions.goal
+             FROM results
+             JOIN attempts ON attempts.id = results.attempt_id
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             JOIN commissions ON commissions.id = assignments.commission_id
+             WHERE assignments.commission_id = ?1
+               AND results.integrated_artifact_revision = ?2
+               AND results.mandate_revision = ?3
+               AND results.status = ?4
+             ORDER BY results.created_at DESC, results.id DESC
+             LIMIT 1",
+            params![
+                commission_id,
+                artifact_revision,
+                mandate_revision,
+                ResultStatus::Candidate.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "current Evidence does not identify one candidate integrated Result".into(),
+            )
+        })?;
+    complete_commission(
+        transaction,
+        CompletionTransition {
+            commission_id,
+            result_id: &result_id,
+            assignment_id: &assignment_id,
+            attempt_id: None,
+            lease_id: None,
+            mandate_revision,
+            artifact_revision,
+            goal: &goal,
+        },
+    )
+}
+
+fn complete_commission(
+    transaction: &Transaction<'_>,
+    completion: CompletionTransition<'_>,
+) -> Result<(), TyrionError> {
+    let CompletionTransition {
+        commission_id,
+        result_id,
+        assignment_id,
+        attempt_id,
+        lease_id,
+        mandate_revision,
+        artifact_revision,
+        goal,
+    } = completion;
+    let preconditions_hold = transaction.query_row(
+        "SELECT
+            NOT EXISTS(
+                SELECT 1 FROM criteria
+                WHERE commission_id = ?1 AND status != ?4
+            )
+            AND NOT EXISTS(
+                SELECT 1 FROM verification_gates
+                WHERE commission_id = ?1 AND mandate_revision = ?2 AND status = 'open'
+            )
+            AND NOT EXISTS(
+                SELECT 1 FROM evidence
+                JOIN results ON results.id = evidence.result_id
+                WHERE evidence.commission_id = ?1
+                  AND evidence.mandate_revision = ?2
+                  AND evidence.artifact_revision = ?3
+                  AND evidence.scope IN ('integrated', 'external')
+                  AND evidence.material_contradiction = 1
+                  AND results.status != ?5
+            )",
+        params![
+            commission_id,
+            mandate_revision,
+            artifact_revision,
+            CriterionStatus::Passed.as_str(),
+            ResultStatus::Superseded.as_str(),
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !preconditions_hold {
+        return Err(TyrionError::InvalidRequest(
+            "Verified Completion requires passed current criteria, closed gates, and no material contradiction"
+                .into(),
+        ));
+    }
+
+    let completed_at = unix_timestamp()?;
+    let accepted_results = transaction.execute(
+        "UPDATE results SET status = ?2 WHERE id = ?1 AND status = ?3",
+        params![
+            result_id,
+            ResultStatus::Accepted.as_str(),
+            ResultStatus::Candidate.as_str()
+        ],
+    )?;
+    if accepted_results != 1 {
+        return Err(TyrionError::InvalidRequest(
+            "Verified Completion requires exactly one current candidate Result".into(),
+        ));
+    }
+    record_event(
+        transaction,
+        commission_id,
+        EventKind::ResultAccepted,
+        mandate_revision,
+    )?;
+    match (attempt_id, lease_id) {
+        (Some(attempt_id), Some(lease_id)) => {
+            transaction.execute(
+                "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+                params![attempt_id, AttemptStatus::Succeeded.as_str(), completed_at],
+            )?;
+            transaction.execute(
+                "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
+                params![lease_id, WorkerLeaseStatus::Released.as_str(), completed_at],
+            )?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(TyrionError::InvalidRequest(
+                "completion Attempt and Worker Lease must be supplied together".into(),
+            ));
+        }
+    }
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![assignment_id, AssignmentStatus::Accepted.as_str()],
+    )?;
+    let completion_revision = mandate_revision + 1;
+    let completed_commissions = transaction.execute(
+        "UPDATE commissions
+         SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
+         WHERE id = ?1 AND status = ?6 AND revision = ?7",
+        params![
+            commission_id,
+            CommissionStatus::VerifiedComplete.as_str(),
+            completion_revision,
+            completed_at,
+            artifact_revision,
+            CommissionStatus::Active.as_str(),
+            mandate_revision,
+        ],
+    )?;
+    if completed_commissions != 1 {
+        return Err(TyrionError::StaleRevision {
+            expected: mandate_revision,
+            actual: transaction.query_row(
+                "SELECT revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| row.get(0),
+            )?,
+        });
+    }
+    transaction.execute(
+        "INSERT INTO completion_briefings (commission_id, summary, artifact_revision, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            commission_id,
+            format!("Verified Complete: {goal}"),
+            artifact_revision,
+            completed_at,
+        ],
+    )?;
+    record_event(
+        transaction,
+        commission_id,
+        EventKind::CommissionVerifiedComplete,
+        completion_revision,
+    )?;
+    Ok(())
+}
+
+fn route_result_rework(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    evidence: &VerificationEvidenceSubmission,
+    recovery_id: Option<&str>,
+) -> Result<(), TyrionError> {
+    if evidence.verdict != VerificationVerdict::Failed
+        || evidence.defect != Some(VerificationDefect::Result)
+        || evidence.material_contradiction
+    {
+        return Ok(());
+    }
+    let (assignment_id, assignment_status, attempt_count, max_attempts) = transaction.query_row(
+        "SELECT assignments.id, assignments.status,
+                (SELECT COUNT(*) FROM attempts AS counted
+                 WHERE counted.assignment_id = assignments.id),
+                resource_ceilings.max_attempts
+         FROM results
+         JOIN attempts ON attempts.id = results.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         JOIN resource_ceilings ON resource_ceilings.commission_id = assignments.commission_id
+         WHERE results.id = ?1 AND assignments.commission_id = ?2",
+        params![evidence.result_id, commission_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, u32>(3)?,
+            ))
+        },
+    )?;
+    if assignment_status != AssignmentStatus::VerificationPending.as_str() {
+        return Ok(());
+    }
+    if attempt_count < max_attempts {
+        transaction.execute(
+            "UPDATE results SET status = ?2 WHERE id = ?1",
+            params![evidence.result_id, ResultStatus::Superseded.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![assignment_id, AssignmentStatus::Ready.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE criteria SET status = ?2 WHERE commission_id = ?1",
+            params![commission_id, CriterionStatus::Uncertain.as_str()],
+        )?;
+        record_event(
+            transaction,
+            commission_id,
+            EventKind::AssignmentReady,
+            mandate_revision,
+        )?;
+        if let Some(recovery_id) = recovery_id {
+            transaction.execute(
+                "UPDATE verification_recoveries SET status = ?2 WHERE id = ?1",
+                params![recovery_id, VerificationRecoveryStatus::Scheduled.as_str()],
+            )?;
+        }
+    } else {
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![assignment_id, AssignmentStatus::ResourceBlocked.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO blockers (
+                id, commission_id, assignment_id, code, requirement, created_at
+             ) VALUES (?1, ?2, ?3, 'max_attempts', ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                commission_id,
+                assignment_id,
+                "Start a new Commission with a higher max_attempts ceiling to rework the failed Result.",
+                unix_timestamp()?,
+            ],
+        )?;
+        record_event(
+            transaction,
+            commission_id,
+            EventKind::AssignmentBlocked,
+            mandate_revision,
+        )?;
+        if let Some(recovery_id) = recovery_id {
+            transaction.execute(
+                "UPDATE verification_recoveries
+                 SET action = ?2, status = ?3, requirement = ?4
+                 WHERE id = ?1",
+                params![
+                    recovery_id,
+                    VerificationRecoveryAction::Block.as_str(),
+                    VerificationRecoveryStatus::Blocked.as_str(),
+                    "No authorized rework Attempt remains under max_attempts.",
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence_submission(
+    evidence: &VerificationEvidenceSubmission,
+) -> Result<(), TyrionError> {
+    if evidence.criterion_id.trim().is_empty()
+        || evidence.result_id.trim().is_empty()
+        || evidence.evidence_type.trim().is_empty()
+        || evidence.verifier_configuration.trim().is_empty()
+        || evidence.environment.trim().is_empty()
+        || evidence.inspectable_output.trim().is_empty()
+    {
+        return Err(TyrionError::InvalidRequest(
+            "verification Evidence identifiers, bindings, and inspectable output must not be empty"
+                .into(),
+        ));
+    }
+    match (evidence.verdict, evidence.defect) {
+        (VerificationVerdict::Passed, None)
+        | (VerificationVerdict::Failed | VerificationVerdict::Uncertain, Some(_)) => Ok(()),
+        (VerificationVerdict::Passed, Some(_)) => Err(TyrionError::InvalidRequest(
+            "passed Evidence must not diagnose a defect".into(),
+        )),
+        (VerificationVerdict::Failed | VerificationVerdict::Uncertain, None) => {
+            Err(TyrionError::InvalidRequest(
+                "failed or uncertain Evidence must diagnose a Result, verifier, environment, or criterion defect".into(),
+            ))
+        }
+    }
+}
+
+fn verifier_storage(verifier: &Verifier) -> Result<(&'static str, String), TyrionError> {
+    match verifier {
+        Verifier::ExactMatch { expected } => Ok(("exact_match", expected.clone())),
+        Verifier::Command { argv } => Ok(("command", serde_json::to_string(argv)?)),
+        Verifier::Prompt { prompt } => Ok(("prompt", prompt.clone())),
+    }
+}
+
+fn stored_criterion(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCriterion> {
+    let verifier_type = stored_verifier_type(row.get::<_, String>(2)?, 2)?;
+    let verification_depth = stored_verification_depth(row.get::<_, String>(3)?, 3)?;
+    Ok(StoredCriterion {
+        id: row.get(0)?,
+        required_evidence: row.get(1)?,
+        verifier_type,
+        verification_depth,
+        verifier_configuration: row.get(4)?,
+        verification_environment: row.get(5)?,
+        verifier_kind: row.get(6)?,
+        expected: row.get(7)?,
+    })
+}
+
+fn stored_verifier_type(value: String, index: usize) -> rusqlite::Result<VerifierType> {
+    match value.as_str() {
+        "deterministic" => Ok(VerifierType::Deterministic),
+        "model" => Ok(VerifierType::Model),
+        "principal" => Ok(VerifierType::Principal),
+        _ => Err(invalid_stored_enum(index, "verifier type", value)),
+    }
+}
+
+fn stored_verification_depth(value: String, index: usize) -> rusqlite::Result<VerificationDepth> {
+    match value.as_str() {
+        "standard" => Ok(VerificationDepth::Standard),
+        "independent" => Ok(VerificationDepth::Independent),
+        _ => Err(invalid_stored_enum(index, "verification depth", value)),
+    }
+}
+
+fn invalid_stored_enum(index: usize, field: &str, value: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid stored {field}: {value}"),
+        )),
+    )
+}
+
 fn finish_failed_verification(
     transaction: &Transaction<'_>,
     assignment_id: &str,
@@ -1339,6 +2469,31 @@ fn finish_failed_verification(
     transaction.execute(
         "UPDATE assignments SET status = ?2 WHERE id = ?1",
         params![assignment_id, AssignmentStatus::VerificationFailed.as_str()],
+    )?;
+    Ok(())
+}
+
+fn finish_pending_verification(
+    transaction: &Transaction<'_>,
+    assignment_id: &str,
+    attempt_id: &str,
+    lease_id: &str,
+) -> Result<(), TyrionError> {
+    let now = unix_timestamp()?;
+    transaction.execute(
+        "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
+        params![attempt_id, AttemptStatus::Succeeded.as_str(), now],
+    )?;
+    transaction.execute(
+        "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
+        params![lease_id, WorkerLeaseStatus::Released.as_str(), now],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![
+            assignment_id,
+            AssignmentStatus::VerificationPending.as_str()
+        ],
     )?;
     Ok(())
 }
@@ -1567,50 +2722,7 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     if proposal.goal.trim().is_empty() {
         return Err(TyrionError::InvalidRequest("goal must not be empty".into()));
     }
-    if proposal.criteria.is_empty() {
-        return Err(TyrionError::InvalidRequest(
-            "at least one acceptance criterion is required".into(),
-        ));
-    }
-    let mut criterion_ids = HashSet::new();
-    for criterion in &proposal.criteria {
-        if criterion.id.trim().is_empty() || criterion.description.trim().is_empty() {
-            return Err(TyrionError::InvalidRequest(
-                "criterion id and description must not be empty".into(),
-            ));
-        }
-        if !criterion_ids.insert(&criterion.id) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "criterion id {} is duplicated",
-                criterion.id
-            )));
-        }
-        match (&proposal.execution, &criterion.verifier) {
-            (ExecutionSpec::Deterministic, Verifier::ExactMatch { .. })
-            | (ExecutionSpec::CodexGit { .. }, Verifier::Command { .. }) => {}
-            (ExecutionSpec::Deterministic, Verifier::Command { .. }) => {
-                return Err(TyrionError::InvalidRequest(
-                    "deterministic execution requires exact_match verifiers".into(),
-                ));
-            }
-            (ExecutionSpec::CodexGit { .. }, Verifier::ExactMatch { .. }) => {
-                return Err(TyrionError::InvalidRequest(
-                    "codex_git execution requires command verifiers".into(),
-                ));
-            }
-        }
-        if let Verifier::Command { argv } = &criterion.verifier {
-            if argv.is_empty()
-                || argv
-                    .iter()
-                    .any(|argument| argument.is_empty() || argument.contains('\0'))
-            {
-                return Err(TyrionError::InvalidRequest(
-                    "command verifier argv must contain only non-empty arguments".into(),
-                ));
-            }
-        }
-    }
+    validate_acceptance_criteria(&proposal.execution, &proposal.criteria)?;
     if proposal.resource_ceilings.max_attempts == 0
         || proposal.resource_ceilings.max_elapsed_seconds == 0
         || proposal.resource_ceilings.max_worker_concurrency == 0
@@ -1701,6 +2813,150 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
             "resource ceilings must fit in a signed 64-bit integer".into(),
         ));
     }
+    Ok(())
+}
+
+fn validate_acceptance_criteria(
+    execution: &ExecutionSpec,
+    criteria: &[AcceptanceCriterion],
+) -> Result<(), TyrionError> {
+    if criteria.is_empty() {
+        return Err(TyrionError::InvalidRequest(
+            "at least one acceptance criterion is required".into(),
+        ));
+    }
+    let mut criterion_ids = HashSet::new();
+    for criterion in criteria {
+        if criterion.id.trim().is_empty()
+            || criterion.description.trim().is_empty()
+            || criterion.required_evidence.trim().is_empty()
+            || criterion.verification_environment.trim().is_empty()
+        {
+            return Err(TyrionError::InvalidRequest(
+                "criterion id, description, required Evidence, and verification environment must not be empty".into(),
+            ));
+        }
+        if !criterion_ids.insert(&criterion.id) {
+            return Err(TyrionError::InvalidRequest(format!(
+                "criterion id {} is duplicated",
+                criterion.id
+            )));
+        }
+        match (criterion.verifier_type, &criterion.verifier) {
+            (
+                VerifierType::Deterministic,
+                Verifier::ExactMatch { .. } | Verifier::Command { .. },
+            )
+            | (VerifierType::Model | VerifierType::Principal, Verifier::Prompt { .. }) => {}
+            (VerifierType::Deterministic, Verifier::Prompt { .. }) => {
+                return Err(TyrionError::InvalidRequest(
+                    "deterministic verifiers require an exact_match or command procedure".into(),
+                ));
+            }
+            (VerifierType::Model | VerifierType::Principal, _) => {
+                return Err(TyrionError::InvalidRequest(
+                    "model and Principal verifiers require a prompt procedure".into(),
+                ));
+            }
+        }
+        match (execution, criterion.verifier_type, &criterion.verifier) {
+            (
+                ExecutionSpec::Deterministic,
+                VerifierType::Deterministic,
+                Verifier::ExactMatch { .. },
+            )
+            | (
+                ExecutionSpec::CodexGit { .. },
+                VerifierType::Deterministic,
+                Verifier::Command { .. },
+            )
+            | (_, VerifierType::Model | VerifierType::Principal, Verifier::Prompt { .. }) => {}
+            (
+                ExecutionSpec::Deterministic,
+                VerifierType::Deterministic,
+                Verifier::Command { .. },
+            ) => {
+                return Err(TyrionError::InvalidRequest(
+                    "deterministic execution requires exact_match verifiers".into(),
+                ));
+            }
+            (
+                ExecutionSpec::CodexGit { .. },
+                VerifierType::Deterministic,
+                Verifier::ExactMatch { .. },
+            ) => {
+                return Err(TyrionError::InvalidRequest(
+                    "codex_git execution requires command verifiers".into(),
+                ));
+            }
+            _ => unreachable!("verifier type and procedure were validated"),
+        }
+        if let Verifier::Command { argv } = &criterion.verifier {
+            if argv.is_empty()
+                || argv
+                    .iter()
+                    .any(|argument| argument.is_empty() || argument.contains('\0'))
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "command verifier argv must contain only non-empty arguments".into(),
+                ));
+            }
+        }
+        if let Verifier::Prompt { prompt } = &criterion.verifier {
+            if prompt.trim().is_empty() {
+                return Err(TyrionError::InvalidRequest(
+                    "prompt verifier procedure must not be empty".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolved_verifier_configuration(criterion: &crate::protocol::AcceptanceCriterion) -> String {
+    if !criterion.verifier_configuration.trim().is_empty() {
+        return criterion.verifier_configuration.clone();
+    }
+    match criterion.verifier {
+        Verifier::ExactMatch { .. } => "deterministic-exact-match-v1".into(),
+        Verifier::Command { .. } => "contained-command-v1".into(),
+        Verifier::Prompt { .. } => match criterion.verifier_type {
+            VerifierType::Model => "model-verifier-v1".into(),
+            VerifierType::Principal => "principal-verifier-v1".into(),
+            VerifierType::Deterministic => unreachable!("validated verifier type"),
+        },
+    }
+}
+
+fn insert_criterion_version(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    position: usize,
+    criterion: &AcceptanceCriterion,
+) -> Result<(), TyrionError> {
+    let (verifier_kind, expected) = verifier_storage(&criterion.verifier)?;
+    transaction.execute(
+        "INSERT INTO criterion_versions (
+            commission_id, mandate_revision, criterion_id, position, description,
+            required_evidence, verifier_type, verification_depth,
+            verifier_configuration, verification_environment, verifier_kind, expected
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            commission_id,
+            mandate_revision,
+            criterion.id,
+            position as i64,
+            criterion.description,
+            criterion.required_evidence,
+            criterion.verifier_type.as_str(),
+            criterion.verification_depth.as_str(),
+            resolved_verifier_configuration(criterion),
+            criterion.verification_environment,
+            verifier_kind,
+            expected,
+        ],
+    )?;
     Ok(())
 }
 

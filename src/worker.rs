@@ -1,10 +1,13 @@
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::Serialize;
 
 use crate::artifact::ArtifactRevision;
 use crate::domain::EvidenceOutcome;
-use crate::protocol::{ExecutionSpec, Verifier};
+use crate::protocol::{
+    ExecutionSpec, VerificationDefect, VerificationDepth, Verifier, VerifierType,
+};
 use crate::TyrionError;
 
 mod contained_codex;
@@ -15,6 +18,8 @@ pub const CODEX_GIT_ACTION: &str = "codex.git_change";
 pub(crate) struct WorkerRuntime {
     contained_codex: Option<contained_codex::ContainedCodexRuntime>,
     corrupt_artifact_revision: bool,
+    incorrect_first_result: bool,
+    incorrect_result_commissions: Mutex<std::collections::HashSet<String>>,
 }
 
 pub(crate) struct AssignmentContext {
@@ -33,6 +38,11 @@ pub(crate) struct AssignmentContext {
 #[derive(Clone)]
 pub(crate) struct CriterionDefinition {
     pub id: String,
+    pub required_evidence: String,
+    pub verifier_type: VerifierType,
+    pub verification_depth: VerificationDepth,
+    pub verifier_configuration: String,
+    pub verification_environment: String,
     pub verifier: Verifier,
 }
 
@@ -74,11 +84,21 @@ pub(crate) struct ArtifactRecord {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct VerificationRecord {
     pub criterion_id: String,
+    pub evidence_type: String,
+    pub verifier_type: VerifierType,
+    pub verification_attempt_id: String,
+    pub verifier_identity: String,
+    pub verifier_configuration: String,
     pub verifier_kind: VerificationKind,
+    pub procedure: Verifier,
+    pub environment: String,
     pub scope: VerificationScope,
     pub outcome: EvidenceOutcome,
     pub observed: String,
     pub expected: String,
+    pub material_contradiction: bool,
+    pub defect: Option<VerificationDefect>,
+    pub producer_attempt_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -124,6 +144,7 @@ impl WorkerRuntime {
         data_dir: &Path,
         codex_worker_config: Option<&Path>,
         corrupt_artifact_revision: bool,
+        incorrect_first_result: bool,
     ) -> Result<Self, TyrionError> {
         let contained_codex = codex_worker_config
             .map(|path| contained_codex::ContainedCodexRuntime::load(path, data_dir))
@@ -131,6 +152,8 @@ impl WorkerRuntime {
         Ok(Self {
             contained_codex,
             corrupt_artifact_revision,
+            incorrect_first_result,
+            incorrect_result_commissions: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -173,7 +196,21 @@ impl WorkerRuntime {
     ) -> Result<CandidateResult, TyrionError> {
         match &assignment.execution {
             ExecutionSpec::Deterministic => {
-                let output = assignment.goal.clone();
+                let output = if self.incorrect_first_result {
+                    let mut commissions =
+                        self.incorrect_result_commissions.lock().map_err(|_| {
+                            TyrionError::InvalidRequest(
+                                "fault-injection Worker state is unavailable".into(),
+                            )
+                        })?;
+                    if commissions.insert(assignment.commission_id.clone()) {
+                        "insufficient worker result".into()
+                    } else {
+                        assignment.goal.clone()
+                    }
+                } else {
+                    assignment.goal.clone()
+                };
                 let artifact_revision = if self.corrupt_artifact_revision {
                     ArtifactRevision::from_claim("sha256:forged")
                 } else {
@@ -295,7 +332,8 @@ fn verify_deterministic(
     assignment
         .criteria
         .iter()
-        .map(|criterion| {
+        .filter(|criterion| criterion.verifier_type == VerifierType::Deterministic)
+        .flat_map(|criterion| {
             let Verifier::ExactMatch { expected } = &criterion.verifier else {
                 unreachable!("validated deterministic criterion uses exact_match")
             };
@@ -305,14 +343,27 @@ fn verify_deterministic(
             } else {
                 EvidenceOutcome::Failed
             };
-            VerificationRecord {
-                criterion_id: criterion.id.clone(),
-                verifier_kind: VerificationKind::ExactMatch,
-                scope,
-                outcome,
-                observed: output.to_owned(),
-                expected: expected.clone(),
-            }
+            (0..criterion.verification_depth.required_passes()).map(move |index| {
+                VerificationRecord {
+                    criterion_id: criterion.id.clone(),
+                    evidence_type: criterion.required_evidence.clone(),
+                    verifier_type: criterion.verifier_type,
+                    verification_attempt_id: uuid::Uuid::new_v4().to_string(),
+                    verifier_identity: format!("deterministic-exact-match-{}", index + 1),
+                    verifier_configuration: criterion.verifier_configuration.clone(),
+                    verifier_kind: VerificationKind::ExactMatch,
+                    procedure: criterion.verifier.clone(),
+                    environment: criterion.verification_environment.clone(),
+                    scope,
+                    outcome,
+                    observed: output.to_owned(),
+                    expected: expected.clone(),
+                    material_contradiction: false,
+                    defect: (outcome == EvidenceOutcome::Failed)
+                        .then_some(VerificationDefect::Result),
+                    producer_attempt_id: Some(assignment.attempt_id.clone()),
+                }
+            })
         })
         .collect()
 }

@@ -419,48 +419,67 @@ impl ContainedCodexRuntime {
         revision: &str,
     ) -> Result<Vec<VerificationRecord>, TyrionError> {
         ensure_lease_active(assignment.lease_expires_at)?;
-        let sandbox_name = sandbox_name(scope.as_str(), &assignment.attempt_id);
-        let sandbox = Sandbox::create(self, &sandbox_name, assignment.lease_expires_at)?;
         let crate::protocol::ExecutionSpec::CodexGit { repository, .. } = &assignment.execution
         else {
             unreachable!("Git verification has a codex_git execution spec")
         };
-        sandbox.preflight(
-            Path::new(repository),
-            &self.data_dir,
-            assignment.lease_expires_at,
-        )?;
-        if let Some((base_bundle, _)) = base {
-            sandbox.upload(
-                base_bundle,
-                "/sandbox/base.bundle",
+        let verification_runs = assignment
+            .criteria
+            .iter()
+            .filter(|criterion| {
+                criterion.verifier_type == crate::protocol::VerifierType::Deterministic
+            })
+            .map(|criterion| criterion.verification_depth.required_passes())
+            .max()
+            .unwrap_or(0);
+        let mut records = Vec::with_capacity(assignment.criteria.len() * verification_runs);
+        for run_index in 0..verification_runs {
+            let run_attempt_id =
+                format!("{}-verification-{}", assignment.attempt_id, run_index + 1);
+            let sandbox_name = sandbox_name(scope.as_str(), &run_attempt_id);
+            let sandbox = Sandbox::create(self, &sandbox_name, assignment.lease_expires_at)?;
+            sandbox.preflight(
+                Path::new(repository),
+                &self.data_dir,
                 assignment.lease_expires_at,
             )?;
-        }
-        sandbox.upload(
-            result_bundle,
-            "/sandbox/result.bundle",
-            assignment.lease_expires_at,
-        )?;
-        let setup = if let Some((_, base_revision)) = base {
-            format!(
-                "set -eu; root=${{TYRION_WORKSPACE_ROOT:-/sandbox}}; git clone -q \"$root/base.bundle\" \"$root/repository\"; git -C \"$root/repository\" fetch -q \"$root/result.bundle\" refs/heads/tyrion-result:refs/heads/tyrion-result; git -C \"$root/repository\" checkout -q --detach {}; git -C \"$root/repository\" checkout -q --detach {}; git -C \"$root/repository\" fsck --full",
-                shell_quote(base_revision),
-                shell_quote(revision)
-            )
-        } else {
-            format!(
-                "set -eu; root=${{TYRION_WORKSPACE_ROOT:-/sandbox}}; git clone -q \"$root/result.bundle\" \"$root/repository\"; git -C \"$root/repository\" checkout -q --detach {}; git -C \"$root/repository\" fsck --full",
-                shell_quote(revision)
-            )
-        };
-        sandbox.exec_checked(&["sh", "-c", &setup], None, assignment.lease_expires_at)?;
+            if let Some((base_bundle, _)) = base {
+                sandbox.upload(
+                    base_bundle,
+                    "/sandbox/base.bundle",
+                    assignment.lease_expires_at,
+                )?;
+            }
+            sandbox.upload(
+                result_bundle,
+                "/sandbox/result.bundle",
+                assignment.lease_expires_at,
+            )?;
+            let setup = if let Some((_, base_revision)) = base {
+                format!(
+                    "set -eu; root=${{TYRION_WORKSPACE_ROOT:-/sandbox}}; git clone -q \"$root/base.bundle\" \"$root/repository\"; git -C \"$root/repository\" fetch -q \"$root/result.bundle\" refs/heads/tyrion-result:refs/heads/tyrion-result; git -C \"$root/repository\" checkout -q --detach {}; git -C \"$root/repository\" checkout -q --detach {}; git -C \"$root/repository\" fsck --full",
+                    shell_quote(base_revision),
+                    shell_quote(revision)
+                )
+            } else {
+                format!(
+                    "set -eu; root=${{TYRION_WORKSPACE_ROOT:-/sandbox}}; git clone -q \"$root/result.bundle\" \"$root/repository\"; git -C \"$root/repository\" checkout -q --detach {}; git -C \"$root/repository\" fsck --full",
+                    shell_quote(revision)
+                )
+            };
+            sandbox.exec_checked(&["sh", "-c", &setup], None, assignment.lease_expires_at)?;
 
-        let mut records = Vec::with_capacity(assignment.criteria.len());
-        for criterion in &assignment.criteria {
-            records.push(sandbox.verify_command(criterion, scope, assignment.lease_expires_at)?);
+            for criterion in assignment.criteria.iter().filter(|criterion| {
+                criterion.verifier_type == crate::protocol::VerifierType::Deterministic
+                    && run_index < criterion.verification_depth.required_passes()
+            }) {
+                let mut record =
+                    sandbox.verify_command(criterion, scope, assignment.lease_expires_at)?;
+                record.verifier_identity = format!("contained-command-{}", run_index + 1);
+                records.push(record);
+            }
+            sandbox.delete()?;
         }
-        sandbox.delete()?;
         Ok(records)
     }
 }
@@ -590,6 +609,37 @@ impl<'a> Sandbox<'a> {
         let Verifier::Command { argv } = &criterion.verifier else {
             unreachable!("validated Git criterion uses a command verifier")
         };
+        let availability = self.exec(
+            &[
+                "sh",
+                "-c",
+                "command -v -- \"$1\" >/dev/null",
+                "tyrion-verifier-availability",
+                &argv[0],
+            ],
+            None,
+            deadline,
+        )?;
+        if !availability.status.success() {
+            return Ok(VerificationRecord {
+                criterion_id: criterion.id.clone(),
+                evidence_type: criterion.required_evidence.clone(),
+                verifier_type: criterion.verifier_type,
+                verification_attempt_id: uuid::Uuid::new_v4().to_string(),
+                verifier_identity: "contained-command".into(),
+                verifier_configuration: criterion.verifier_configuration.clone(),
+                verifier_kind: VerificationKind::Command,
+                procedure: criterion.verifier.clone(),
+                environment: criterion.verification_environment.clone(),
+                scope,
+                outcome: EvidenceOutcome::Uncertain,
+                observed: format!("verifier executable unavailable: {}", argv[0]),
+                expected: serde_json::to_string(argv)?,
+                material_contradiction: false,
+                defect: Some(crate::protocol::VerificationDefect::Environment),
+                producer_attempt_id: None,
+            });
+        }
         let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.exec(&borrowed, Some("/sandbox/repository"), deadline)?;
         let observed = format!(
@@ -600,7 +650,14 @@ impl<'a> Sandbox<'a> {
         );
         Ok(VerificationRecord {
             criterion_id: criterion.id.clone(),
+            evidence_type: criterion.required_evidence.clone(),
+            verifier_type: criterion.verifier_type,
+            verification_attempt_id: uuid::Uuid::new_v4().to_string(),
+            verifier_identity: "contained-command".into(),
+            verifier_configuration: criterion.verifier_configuration.clone(),
             verifier_kind: VerificationKind::Command,
+            procedure: criterion.verifier.clone(),
+            environment: criterion.verification_environment.clone(),
             scope,
             outcome: if output.status.success() {
                 EvidenceOutcome::Passed
@@ -609,6 +666,10 @@ impl<'a> Sandbox<'a> {
             },
             observed,
             expected: serde_json::to_string(argv)?,
+            material_contradiction: false,
+            defect: (!output.status.success())
+                .then_some(crate::protocol::VerificationDefect::Result),
+            producer_attempt_id: None,
         })
     }
 

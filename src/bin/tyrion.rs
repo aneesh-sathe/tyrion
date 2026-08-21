@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tyrion::protocol::{
     AdapterIdentity, AttachmentHandshake, Command, CommissionProposal, CommissionReplayCursor,
-    Request, PROTOCOL_VERSION,
+    Request, VerificationAmendment, VerificationEvidenceSubmission, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -111,6 +111,24 @@ enum CommissionCommand {
     },
     Accept {
         commission_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    RecordEvidence {
+        commission_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    AmendVerification {
+        commission_id: String,
+        #[arg(long)]
+        file: PathBuf,
         #[arg(long)]
         expected_revision: i64,
         #[arg(long)]
@@ -224,6 +242,47 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                 Some(*expected_revision),
                 None,
             ),
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::RecordEvidence {
+                        commission_id,
+                        file,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => {
+                let evidence: VerificationEvidenceSubmission =
+                    serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::RecordVerificationEvidence {
+                        commission_id: commission_id.clone(),
+                        evidence: Box::new(evidence),
+                    },
+                    Some(idempotency_key.clone()),
+                    Some(*expected_revision),
+                    None,
+                )
+            }
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::AmendVerification {
+                        commission_id,
+                        file,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => {
+                let amendment: VerificationAmendment = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::AmendVerification {
+                        commission_id: commission_id.clone(),
+                        amendment: Box::new(amendment),
+                    },
+                    Some(idempotency_key.clone()),
+                    Some(*expected_revision),
+                    None,
+                )
+            }
             TopLevelCommand::Commission {
                 command:
                     CommissionCommand::TakeControl {

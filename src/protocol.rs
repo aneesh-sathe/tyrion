@@ -21,7 +21,61 @@ pub struct CommissionProposal {
 pub struct AcceptanceCriterion {
     pub id: String,
     pub description: String,
+    pub required_evidence: String,
+    pub verifier_type: VerifierType,
+    pub verification_depth: VerificationDepth,
+    #[serde(default)]
+    pub verifier_configuration: String,
+    #[serde(default = "default_verification_environment")]
+    pub verification_environment: String,
     pub verifier: Verifier,
+}
+
+fn default_verification_environment() -> String {
+    "tyrion-controlled-v1".into()
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifierType {
+    #[default]
+    Deterministic,
+    Model,
+    Principal,
+}
+
+impl VerifierType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::Model => "model",
+            Self::Principal => "principal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationDepth {
+    #[default]
+    Standard,
+    Independent,
+}
+
+impl VerificationDepth {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Independent => "independent",
+        }
+    }
+
+    pub(crate) const fn required_passes(self) -> usize {
+        match self {
+            Self::Standard => 1,
+            Self::Independent => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -29,6 +83,67 @@ pub struct AcceptanceCriterion {
 pub enum Verifier {
     ExactMatch { expected: String },
     Command { argv: Vec<String> },
+    Prompt { prompt: String },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationVerdict {
+    Passed,
+    Failed,
+    Uncertain,
+}
+
+impl VerificationVerdict {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationDefect {
+    Result,
+    Verifier,
+    Environment,
+    Criterion,
+}
+
+impl VerificationDefect {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Result => "result",
+            Self::Verifier => "verifier",
+            Self::Environment => "environment",
+            Self::Criterion => "criterion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationEvidenceSubmission {
+    pub criterion_id: String,
+    pub result_id: String,
+    pub evidence_type: String,
+    pub verdict: VerificationVerdict,
+    pub verifier_configuration: String,
+    pub procedure: Verifier,
+    pub environment: String,
+    pub inspectable_output: String,
+    #[serde(default)]
+    pub material_contradiction: bool,
+    #[serde(default)]
+    pub defect: Option<VerificationDefect>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VerificationAmendment {
+    pub criteria: Vec<AcceptanceCriterion>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -112,6 +227,14 @@ pub enum Command {
     },
     AcceptCommission {
         commission_id: String,
+    },
+    RecordVerificationEvidence {
+        commission_id: String,
+        evidence: Box<VerificationEvidenceSubmission>,
+    },
+    AmendVerification {
+        commission_id: String,
+        amendment: Box<VerificationAmendment>,
     },
     IssueAttachmentToken {
         expected_adapter: AdapterIdentity,
