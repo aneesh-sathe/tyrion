@@ -1,6 +1,6 @@
 # Tyrion
 
-Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), and the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
+Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), and useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
 
 ## What exists
 
@@ -26,6 +26,14 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Durable verification recovery records with pending, scheduled, attention, blocked, and resolved states
 - Result rework that retains prior Attempts and marks superseded Evidence stale
 - Revision-checked verification amendments with retained criterion history
+- Incremental versioned Commission Plans with dependency-derived Execution Frontiers
+- Explicit critical-path, uncertainty-reduction, and independent-verification dispatch purposes
+- Transactional concurrency, storage, model-spend, and paid-service reservations per Attempt
+- Concurrent read and disjoint-write execution with declared overlap serialization
+- Explicit competing work with a retained uncertainty and comparison rule
+- Serialized dependency-aware Git Integration from immutable current artifact revisions
+- Explicit reconciliation for unexpected scope, conflict, stale base, and assembled regressions
+- Activity Journal timing Evidence for verified useful concurrency
 - A criterion-linked Verified Completion briefing
 - Assignment-scoped resource Blockers that preserve Control Plane availability
 - Public ordered lifecycle events, including Assignment readiness before dispatch
@@ -34,6 +42,49 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 The deterministic Worker echoes the accepted Goal. Each `exact_match` criterion compares its expected value with that candidate Result. It is a test configuration, not a production Agent Harness adapter. Tyrion rejects a proposal whose deterministic Result cannot fit its storage ceiling and rechecks attempt, elapsed-time, concurrency, and storage ceilings immediately before dispatch.
 
 The Codex Git path accepts an explicit full base revision, authorized changed paths, and argv-based command verifiers. It records governing revisions, commits, paths, bundle artifacts, candidate and integrated verification outcomes, known effects, and the integrated artifact revision. See [Contained Codex Git assignments](docs/contained-codex.md) for its exact runtime contract and configuration.
+
+An optional `plan` on a `codex_git` proposal enables multiple Assignments. Every planned Assignment declares dependencies, owned Acceptance Criteria, one useful dispatch purpose, read and write scopes, and its complete resource reservation. Read-only Assignments can verify without changing the authoritative artifact. Overlapping writes remain held unless both entries share the same non-empty `competition` group, uncertainty, and comparison rule. Plans currently require deterministic command Evidence so Tyrion can independently verify each candidate and the assembled repository.
+
+```json
+{
+  "plan": {
+    "assignments": [
+      {
+        "id": "backend",
+        "goal": "Implement the backend change",
+        "dependencies": [],
+        "criterion_ids": ["backend-check"],
+        "purpose": "critical_path",
+        "read_scopes": ["contracts"],
+        "write_scopes": ["src/backend"],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_storage_bytes": 5242880,
+          "max_model_spend_cents": 0,
+          "max_paid_service_spend_cents": 0
+        }
+      },
+      {
+        "id": "frontend",
+        "goal": "Implement the frontend change",
+        "dependencies": [],
+        "criterion_ids": ["frontend-check"],
+        "purpose": "critical_path",
+        "read_scopes": ["contracts"],
+        "write_scopes": ["web/frontend"],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_storage_bytes": 5242880,
+          "max_model_spend_cents": 0,
+          "max_paid_service_spend_cents": 0
+        }
+      }
+    ]
+  }
+}
+```
+
+The Control Plane validates the whole dependency graph, criterion ownership, cumulative spend, and any comparison-attempt allowance before proposal creation. Competition members must share one dependency frontier and cannot depend on each other, and their worst-case comparison working set must fit the storage ceiling. Acceptance records the entry-model plan, exposes only a safe and fully reservable frontier, and commits every dispatch reservation atomically with its Attempt. Current Evidence and comparison or rework Assignments create later plan revisions through the same safe-frontier selector. Accepted Results integrate one at a time. Competing candidates remain unintegrated until a comparison Assignment receives every contender bundle and its Evidence, applies the declared rule, and produces a fresh verified Result. Generic reconciliation reserves the Commission storage ceiling plus the source Assignment's compute and spend budgets before inspecting its candidate. A failed assembled-state check retains its Evidence, rolls the integration worktree back, and records dispatchable rework. Verified Completion requires every ordinary planned Assignment to be accepted or explicitly superseded by reconciliation and every criterion to pass on the final artifact revision. The Activity Journal uses the union of accepted and explicitly planned contender execution intervals to retain serial execution time, the parallel execution window, measured reduction, and final end-to-end elapsed time.
 
 ## Run locally
 

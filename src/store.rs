@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -13,17 +13,20 @@ use crate::domain::{
     EventKind, ResultStatus, WorkerLeaseStatus,
 };
 use crate::protocol::{
-    AcceptanceCriterion, AdapterIdentity, AttachmentHandshake, CommissionProposal,
-    CommissionReplayCursor, ExecutionSpec, Request, ResourceCeilings, VerificationAmendment,
-    VerificationDefect, VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict,
-    Verifier, VerifierType, PROTOCOL_VERSION,
+    AcceptanceCriterion, AdapterIdentity, AssignmentPurpose, AssignmentResources,
+    AttachmentHandshake, CommissionPlan, CommissionProposal, CommissionReplayCursor, ExecutionSpec,
+    PlannedAssignment, Request, ResourceCeilings, VerificationAmendment, VerificationDefect,
+    VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict, Verifier, VerifierType,
+    PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
 
+mod frontier;
 mod projection;
 mod schema;
 
+use frontier::{Competition, OccupiedWork, Resources, Work};
 use projection::{event_value, inspect_commission as project_commission};
 
 pub struct Store {
@@ -32,15 +35,29 @@ pub struct Store {
 
 struct ReadyAssignmentDispatch {
     assignment_id: String,
+    logical_id: String,
     goal: String,
     execution_json: String,
+    current_artifact_revision: Option<String>,
+    plan_revision: i64,
     mandate_revision: i64,
-    commission_revision: i64,
     accepted_at: i64,
     max_attempts: u32,
     max_elapsed_seconds: u64,
     max_worker_concurrency: u32,
     max_storage_bytes: u64,
+    max_model_spend_cents: u64,
+    max_paid_service_spend_cents: u64,
+    reserved_concurrency_slots: u32,
+    reserved_storage_bytes: u64,
+    reserved_model_spend_cents: u64,
+    reserved_paid_service_spend_cents: u64,
+    write_scopes: Vec<String>,
+    competition_group: Option<String>,
+    competition_uncertainty: Option<String>,
+    competition_rule: Option<String>,
+    purpose: String,
+    legacy: bool,
 }
 
 struct StoredCriterion {
@@ -60,6 +77,26 @@ struct CompletionTransition<'a> {
     assignment_id: &'a str,
     attempt_id: Option<&'a str>,
     lease_id: Option<&'a str>,
+    mandate_revision: i64,
+    artifact_revision: &'a str,
+    goal: &'a str,
+}
+
+struct PlannedAcceptance<'a> {
+    assignment_id: &'a str,
+    attempt_id: &'a str,
+    lease_id: &'a str,
+    result_id: &'a str,
+    mandate_revision: i64,
+}
+
+struct SuccessfulAttemptRelease<'a> {
+    attempt_id: &'a str,
+    lease_id: &'a str,
+}
+
+struct VerifiedCommissionCompletion<'a> {
+    commission_id: &'a str,
     mandate_revision: i64,
     artifact_revision: &'a str,
     goal: &'a str,
@@ -150,14 +187,20 @@ impl Store {
 
         let commission_id = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO commissions (id, goal, status, revision, created_at, execution_json)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            "INSERT INTO commissions (
+                id, goal, status, revision, created_at, execution_json, plan_json
+             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
             params![
                 commission_id,
                 proposal.goal,
                 CommissionStatus::Proposed.as_str(),
                 unix_timestamp()?,
                 serde_json::to_string(&proposal.execution)?,
+                proposal
+                    .plan
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ],
         )?;
 
@@ -690,6 +733,25 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn dispatch_snapshot(&self, commission_id: &str) -> Result<(u32, u32, u32), TyrionError> {
+        self.connection
+            .query_row(
+                "SELECT resource_ceilings.max_worker_concurrency,
+                    (SELECT COUNT(*) FROM assignments
+                     WHERE assignments.commission_id = commissions.id
+                       AND assignments.status = ?2),
+                    (SELECT COUNT(*) FROM attempts
+                     JOIN assignments ON assignments.id = attempts.assignment_id
+                     WHERE assignments.commission_id = commissions.id)
+             FROM commissions
+             JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
+             WHERE commissions.id = ?1",
+                params![commission_id, AssignmentStatus::Ready.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn accept_commission(
         &mut self,
         request: &Request,
@@ -715,15 +777,17 @@ impl Store {
             attachment::COMMISSION_ACCEPTANCE,
         )?;
 
-        let (status, current_revision, execution_json) = transaction
+        let (status, current_revision, execution_json, plan_json) = transaction
             .query_row(
-                "SELECT status, revision, execution_json FROM commissions WHERE id = ?1",
+                "SELECT status, revision, execution_json, plan_json
+                 FROM commissions WHERE id = ?1",
                 [commission_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
@@ -793,23 +857,19 @@ impl Store {
             mandate_revision,
         )?;
 
-        let assignment_id = Uuid::new_v4().to_string();
-        transaction.execute(
-            "INSERT INTO assignments (id, commission_id, plan_revision, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                assignment_id,
-                commission_id,
-                mandate_revision,
-                AssignmentStatus::Ready.as_str(),
-                accepted_at
-            ],
-        )?;
-        record_event(
+        let plan = plan_json
+            .as_deref()
+            .map(serde_json::from_str::<CommissionPlan>)
+            .transpose()?;
+        let legacy = plan.is_none();
+        let plan = proposal_plan_or_legacy(plan, commission_id, &transaction)?;
+        initialize_commission_plan(
             &transaction,
             commission_id,
-            EventKind::AssignmentReady,
             mandate_revision,
+            &plan,
+            legacy,
+            accepted_at,
         )?;
 
         let result = project_commission(&transaction, commission_id)?;
@@ -1200,23 +1260,41 @@ impl Store {
         commission_id: &str,
         worker: &worker::WorkerRuntime,
     ) -> Result<(), TyrionError> {
-        let transaction = self.connection.transaction()?;
-        let ready = transaction
-            .query_row(
-                "SELECT assignments.id, commissions.goal, assignments.plan_revision,
-                        commissions.revision,
-                        commissions.accepted_at, resource_ceilings.max_attempts,
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ready_candidates = {
+            let mut statement = transaction.prepare(
+                "SELECT assignments.id, assignment_metadata.logical_id,
+                        assignment_metadata.goal, assignments.plan_revision,
+                        commissions.revision, commissions.accepted_at,
+                        resource_ceilings.max_attempts,
                         resource_ceilings.max_elapsed_seconds,
                         resource_ceilings.max_worker_concurrency,
-                        resource_ceilings.max_storage_bytes, commissions.execution_json
+                        resource_ceilings.max_storage_bytes,
+                        resource_ceilings.max_model_spend_cents,
+                        resource_ceilings.max_paid_service_spend_cents,
+                        commissions.execution_json, commissions.artifact_revision,
+                        assignment_metadata.concurrency_slots,
+                        assignment_metadata.max_storage_bytes,
+                        assignment_metadata.max_model_spend_cents,
+                        assignment_metadata.max_paid_service_spend_cents,
+                        assignment_metadata.write_scopes_json,
+                        assignment_metadata.competition_group,
+                        assignment_metadata.competition_uncertainty,
+                        assignment_metadata.competition_rule,
+                        assignment_metadata.legacy,
+                        assignment_metadata.purpose
                  FROM assignments
+                 JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
                  JOIN commissions ON commissions.id = assignments.commission_id
                  JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
                  WHERE assignments.commission_id = ?1
                    AND assignments.status = ?2
                    AND commissions.status = ?3
-                 ORDER BY assignments.created_at, assignments.id
-                 LIMIT 1",
+                 ORDER BY assignment_metadata.position, assignments.id",
+            )?;
+            let rows = statement.query_map(
                 params![
                     commission_id,
                     AssignmentStatus::Ready.as_str(),
@@ -1225,32 +1303,131 @@ impl Store {
                 |row| {
                     Ok(ReadyAssignmentDispatch {
                         assignment_id: row.get(0)?,
-                        goal: row.get(1)?,
-                        mandate_revision: row.get(2)?,
-                        commission_revision: row.get(3)?,
-                        accepted_at: row.get(4)?,
-                        max_attempts: row.get(5)?,
-                        max_elapsed_seconds: row.get(6)?,
-                        max_worker_concurrency: row.get(7)?,
-                        max_storage_bytes: row.get(8)?,
-                        execution_json: row.get(9)?,
+                        logical_id: row.get(1)?,
+                        goal: row.get(2)?,
+                        plan_revision: row.get(3)?,
+                        mandate_revision: row.get(4)?,
+                        accepted_at: row.get(5)?,
+                        max_attempts: row.get(6)?,
+                        max_elapsed_seconds: row.get(7)?,
+                        max_worker_concurrency: row.get(8)?,
+                        max_storage_bytes: row.get(9)?,
+                        max_model_spend_cents: row.get(10)?,
+                        max_paid_service_spend_cents: row.get(11)?,
+                        execution_json: row.get(12)?,
+                        current_artifact_revision: row.get(13)?,
+                        reserved_concurrency_slots: row.get(14)?,
+                        reserved_storage_bytes: row.get(15)?,
+                        reserved_model_spend_cents: row.get(16)?,
+                        reserved_paid_service_spend_cents: row.get(17)?,
+                        write_scopes: string_vec_column(row, 18)?,
+                        competition_group: row.get(19)?,
+                        competition_uncertainty: row.get(20)?,
+                        competition_rule: row.get(21)?,
+                        legacy: row.get(22)?,
+                        purpose: row.get(23)?,
                     })
                 },
-            )
-            .optional()?;
-        let Some(ready) = ready else {
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if ready_candidates.is_empty() {
+            return Ok(());
+        }
+
+        let active_scopes = {
+            let mut statement = transaction.prepare(
+                "SELECT assignment_metadata.write_scopes_json,
+                        assignment_metadata.competition_group,
+                        assignment_metadata.competition_uncertainty,
+                        assignment_metadata.competition_rule
+                 FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+                 WHERE assignments.commission_id = ?1 AND attempts.status = ?2",
+            )?;
+            let rows = statement.query_map(
+                params![commission_id, AttemptStatus::Running.as_str()],
+                |row| {
+                    Ok((
+                        string_vec_column(row, 0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let (used_concurrency, used_storage, used_model_spend, used_paid_spend) = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(CASE WHEN status = 'active' THEN concurrency_slots ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN status = 'active' THEN storage_bytes ELSE 0 END), 0),
+                        COALESCE(SUM(model_spend_cents), 0),
+                        COALESCE(SUM(paid_service_spend_cents), 0)
+                 FROM resource_reservations
+                 WHERE commission_id = ?1",
+                [commission_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )?;
+        let ceilings = Resources {
+            concurrency: ready_candidates[0].max_worker_concurrency.into(),
+            storage: ready_candidates[0].max_storage_bytes,
+            model_spend: ready_candidates[0].max_model_spend_cents,
+            paid_spend: ready_candidates[0].max_paid_service_spend_cents,
+        };
+        let candidates = ready_candidates
+            .into_iter()
+            .map(|candidate| Work {
+                write_scopes: candidate.write_scopes.clone(),
+                competition: competition(
+                    &candidate.competition_group,
+                    &candidate.competition_uncertainty,
+                    &candidate.competition_rule,
+                ),
+                resources: Resources {
+                    concurrency: candidate.reserved_concurrency_slots.into(),
+                    storage: candidate.reserved_storage_bytes,
+                    model_spend: candidate.reserved_model_spend_cents,
+                    paid_spend: candidate.reserved_paid_service_spend_cents,
+                },
+                item: candidate,
+            })
+            .collect();
+        let occupied = active_scopes
+            .into_iter()
+            .map(|(write_scopes, group, uncertainty, rule)| OccupiedWork {
+                write_scopes,
+                competition: competition(&group, &uncertainty, &rule),
+            })
+            .collect();
+        let mut frontier = frontier::select(
+            candidates,
+            occupied,
+            Resources {
+                concurrency: used_concurrency.into(),
+                storage: used_storage,
+                model_spend: used_model_spend,
+                paid_spend: used_paid_spend,
+            },
+            ceilings,
+        );
+        let Some(ready) = frontier.selected.drain(..).next() else {
             return Ok(());
         };
-        let execution: ExecutionSpec = serde_json::from_str(&ready.execution_json)?;
-        if ready.mandate_revision != ready.commission_revision {
-            return Err(TyrionError::InvalidRequest(format!(
-                "ready Assignment {} is bound to mandate revision {}, but Commission {} is at revision {}",
-                ready.assignment_id,
-                ready.mandate_revision,
-                commission_id,
-                ready.commission_revision
-            )));
-        }
+        let proposed_execution: ExecutionSpec = serde_json::from_str(&ready.execution_json)?;
+        let execution = worker.assignment_execution(
+            &proposed_execution,
+            commission_id,
+            ready.current_artifact_revision.as_deref(),
+        );
 
         let attempt_count = transaction.query_row(
             "SELECT COUNT(*) FROM attempts
@@ -1268,16 +1445,6 @@ impl Store {
                 "max_attempts",
                 "Start a new Commission with a higher max_attempts ceiling.",
             );
-        }
-        let running_count = transaction.query_row(
-            "SELECT COUNT(*) FROM attempts
-             JOIN assignments ON assignments.id = attempts.assignment_id
-             WHERE assignments.commission_id = ?1 AND attempts.status = ?2",
-            params![commission_id, AttemptStatus::Running.as_str()],
-            |row| row.get::<_, u32>(0),
-        )?;
-        if running_count >= ready.max_worker_concurrency {
-            return Ok(());
         }
         let now = unix_timestamp()?;
         if now.saturating_sub(ready.accepted_at) as u64 >= ready.max_elapsed_seconds {
@@ -1303,8 +1470,23 @@ impl Store {
             );
         }
 
-        let criteria = load_criteria(&transaction, commission_id)?;
+        let criteria =
+            load_assignment_criteria(&transaction, commission_id, &ready.logical_id, ready.legacy)?;
+        let assembled_criteria = if ready.legacy {
+            Vec::new()
+        } else {
+            load_criteria(&transaction, commission_id)?
+        };
         let authorized_paths = load_authorized_paths(&transaction, commission_id)?;
+        let comparison_candidates = if ready.purpose == "reconciliation" {
+            load_comparison_candidates(
+                &transaction,
+                commission_id,
+                ready.competition_group.as_deref(),
+            )?
+        } else {
+            Vec::new()
+        };
         let configuration = worker.configuration(&execution)?;
         let lease_ttl_seconds = worker.lease_ttl_seconds(&execution)?;
         let commission_deadline = ready
@@ -1325,15 +1507,33 @@ impl Store {
         }
         let attempt_id = Uuid::new_v4().to_string();
         let lease_id = Uuid::new_v4().to_string();
+        let started_at_ms = unix_timestamp_millis()?;
         transaction.execute(
-            "INSERT INTO attempts (id, assignment_id, worker_configuration, status, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO attempts (
+                id, assignment_id, worker_configuration, status, started_at, started_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 attempt_id,
                 ready.assignment_id,
                 configuration,
                 AttemptStatus::Running.as_str(),
-                now
+                now,
+                started_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO resource_reservations (
+                attempt_id, commission_id, concurrency_slots, storage_bytes,
+                model_spend_cents, paid_service_spend_cents, status, reserved_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+            params![
+                attempt_id,
+                commission_id,
+                ready.reserved_concurrency_slots,
+                ready.reserved_storage_bytes,
+                ready.reserved_model_spend_cents,
+                ready.reserved_paid_service_spend_cents,
+                started_at_ms,
             ],
         )?;
         transaction.execute(
@@ -1363,11 +1563,32 @@ impl Store {
                 VerificationRecoveryStatus::Scheduled.as_str(),
             ],
         )?;
-        record_event(
+        record_event_with_payload(
             &transaction,
             commission_id,
             EventKind::AttemptStarted,
             ready.mandate_revision,
+            &serde_json::json!({
+                "assignment_id": ready.assignment_id,
+                "logical_id": ready.logical_id,
+                "plan_revision": ready.plan_revision,
+                "started_at_ms": started_at_ms,
+            }),
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::ResourcesReserved,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "assignment_id": ready.assignment_id,
+                "attempt_id": attempt_id,
+                "concurrency_slots": ready.reserved_concurrency_slots,
+                "storage_bytes": ready.reserved_storage_bytes,
+                "model_spend_cents": ready.reserved_model_spend_cents,
+                "paid_service_spend_cents": ready.reserved_paid_service_spend_cents,
+                "reserved_atomically": true,
+            }),
         )?;
         transaction.commit()?;
 
@@ -1376,11 +1597,14 @@ impl Store {
             assignment_id: ready.assignment_id.clone(),
             attempt_id: attempt_id.clone(),
             mandate_revision: ready.mandate_revision,
+            plan_revision: ready.plan_revision,
             goal: ready.goal.clone(),
             execution,
             criteria,
             authorized_paths,
-            max_storage_bytes: ready.max_storage_bytes,
+            declared_write_scopes: ready.write_scopes.clone(),
+            comparison_candidates,
+            max_storage_bytes: ready.reserved_storage_bytes,
             lease_expires_at,
         };
         let candidate = match worker.execute(&assignment) {
@@ -1397,7 +1621,12 @@ impl Store {
                 return Ok(());
             }
         };
+        let execution_completed_at_ms = unix_timestamp_millis()?;
         let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE attempts SET execution_completed_at_ms = ?2 WHERE id = ?1",
+            params![attempt_id, execution_completed_at_ms],
+        )?;
         let current_revision = transaction.query_row(
             "SELECT revision FROM commissions WHERE id = ?1 AND status = ?2",
             params![commission_id, CommissionStatus::Active.as_str()],
@@ -1418,9 +1647,9 @@ impl Store {
         transaction.execute(
             "INSERT INTO results (
                 id, attempt_id, output, artifact_revision, status, created_at,
-                mandate_revision, base_revision, candidate_commits_json,
+                mandate_revision, plan_revision, base_revision, candidate_commits_json,
                 changed_paths_json, artifacts_json, known_effects_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 result_id,
                 attempt_id,
@@ -1429,6 +1658,7 @@ impl Store {
                 ResultStatus::Candidate.as_str(),
                 result_created_at,
                 ready.mandate_revision,
+                ready.plan_revision,
                 candidate.base_revision,
                 candidate_commits_json,
                 changed_paths_json,
@@ -1443,6 +1673,27 @@ impl Store {
             ready.mandate_revision,
         )?;
         transaction.commit()?;
+
+        if !ready.legacy
+            && candidate.changed_paths.iter().any(|path| {
+                !ready
+                    .write_scopes
+                    .iter()
+                    .any(|scope| path_is_within_scope(path, scope))
+            })
+        {
+            self.require_reconciliation(
+                commission_id,
+                &ready,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                "unexpected_overlap",
+                "the Result changed an authorized path outside its declared artifact scope",
+                &candidate.changed_paths,
+            )?;
+            return Ok(());
+        }
 
         let candidate_verification = match worker.verify_candidate(&assignment, &candidate) {
             Ok(verification) => verification,
@@ -1475,19 +1726,44 @@ impl Store {
             &candidate_verification,
         )?;
         if !candidate_passed {
-            finish_failed_verification(
+            finish_verification(
                 &transaction,
                 &assignment.assignment_id,
                 &attempt_id,
                 &lease_id,
+                AssignmentStatus::VerificationFailed,
             )?;
             transaction.commit()?;
             return Ok(());
         }
         transaction.commit()?;
 
+        if ready.competition_group.is_some() && ready.purpose != "reconciliation" {
+            self.finish_competing_candidate(
+                commission_id,
+                &ready,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+            )?;
+            return Ok(());
+        }
+
         let integrated = match worker.integrate(&assignment, &candidate) {
             Ok(integrated) => integrated,
+            Err(TyrionError::IntegrationFailure { kind, message }) if !ready.legacy => {
+                self.require_reconciliation(
+                    commission_id,
+                    &ready,
+                    &attempt_id,
+                    &lease_id,
+                    &result_id,
+                    kind.as_str(),
+                    &message,
+                    &candidate.changed_paths,
+                )?;
+                return Ok(());
+            }
             Err(error) => {
                 self.fail_attempt(
                     commission_id,
@@ -1502,6 +1778,21 @@ impl Store {
         };
         let mut artifacts = candidate.artifacts.clone();
         artifacts.extend(integrated.artifacts.clone());
+        if !ready.legacy {
+            return self.finish_planned_assignment(
+                commission_id,
+                worker,
+                &ready,
+                &assignment,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                candidate_verification,
+                assembled_criteria,
+                artifacts,
+                integrated,
+            );
+        }
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "UPDATE results
@@ -1564,11 +1855,12 @@ impl Store {
             integrated.artifact_revision.as_str(),
         )?;
         if !integrated_passed {
-            finish_failed_verification(
+            finish_verification(
                 &transaction,
                 &assignment.assignment_id,
                 &attempt_id,
                 &lease_id,
+                AssignmentStatus::VerificationFailed,
             )?;
             transaction.commit()?;
             return Ok(());
@@ -1582,11 +1874,12 @@ impl Store {
             |row| row.get::<_, bool>(0),
         )?;
         if !every_criterion_passed {
-            finish_pending_verification(
+            finish_verification(
                 &transaction,
                 &assignment.assignment_id,
                 &attempt_id,
                 &lease_id,
+                AssignmentStatus::VerificationPending,
             )?;
             transaction.commit()?;
             return Ok(());
@@ -1610,6 +1903,648 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn finish_planned_assignment(
+        &mut self,
+        commission_id: &str,
+        worker: &worker::WorkerRuntime,
+        ready: &ReadyAssignmentDispatch,
+        assignment: &worker::AssignmentContext,
+        attempt_id: &str,
+        lease_id: &str,
+        result_id: &str,
+        candidate_verification: Vec<worker::VerificationRecord>,
+        assembled_criteria: Vec<worker::CriterionDefinition>,
+        artifacts: Vec<worker::ArtifactRecord>,
+        integrated: worker::IntegratedResult,
+    ) -> Result<(), TyrionError> {
+        let mut assembled_assignment = assignment.clone();
+        assembled_assignment.criteria = assembled_criteria;
+        let integrated_verification =
+            match worker.verify_integrated(&assembled_assignment, &integrated) {
+                Ok(verification) => verification,
+                Err(error) => {
+                    worker.rollback_integration(&integrated)?;
+                    self.require_reconciliation(
+                        commission_id,
+                        ready,
+                        attempt_id,
+                        lease_id,
+                        result_id,
+                        "integrated_verification_unavailable",
+                        &error.to_string(),
+                        &ready.write_scopes,
+                    )?;
+                    return Ok(());
+                }
+            };
+
+        let expected_criteria = {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT planned_assignment_criteria.criterion_id
+                 FROM planned_assignment_criteria
+                 LEFT JOIN assignment_metadata
+                   ON assignment_metadata.logical_id = planned_assignment_criteria.assignment_logical_id
+                 LEFT JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+                                      AND assignments.commission_id = planned_assignment_criteria.commission_id
+                 WHERE planned_assignment_criteria.commission_id = ?1
+                   AND (planned_assignment_criteria.assignment_logical_id = ?2
+                        OR assignments.status = ?3)",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    commission_id,
+                    ready.logical_id,
+                    AssignmentStatus::Accepted.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.collect::<Result<HashSet<_>, _>>()?
+        };
+        let integrated_regression = expected_criteria.iter().any(|criterion_id| {
+            let records = integrated_verification
+                .iter()
+                .filter(|record| &record.criterion_id == criterion_id)
+                .collect::<Vec<_>>();
+            records.is_empty() || records.iter().any(|record| !record.passed())
+        });
+        if integrated_regression {
+            let mut retained_verification = candidate_verification.clone();
+            retained_verification.extend(integrated_verification.clone());
+            let transaction = self.connection.transaction()?;
+            transaction.execute(
+                "UPDATE results SET verification_outcomes_json = ?2 WHERE id = ?1",
+                params![result_id, serde_json::to_string(&retained_verification)?],
+            )?;
+            record_evidence(
+                &transaction,
+                commission_id,
+                result_id,
+                ready.mandate_revision,
+                integrated.artifact_revision.as_str(),
+                &integrated_verification,
+            )?;
+            transaction.commit()?;
+            worker.rollback_integration(&integrated)?;
+            self.require_reconciliation(
+                commission_id,
+                ready,
+                attempt_id,
+                lease_id,
+                result_id,
+                "integrated_regression",
+                "fresh assembled-state verification regressed a criterion owned by integrated work",
+                &ready.write_scopes,
+            )?;
+            return Ok(());
+        }
+
+        let mut all_verification = candidate_verification;
+        all_verification.extend(integrated_verification.clone());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE results
+             SET artifacts_json = ?2, integrated_artifact_revision = ?3,
+                 verification_outcomes_json = ?4
+             WHERE id = ?1",
+            params![
+                result_id,
+                serde_json::to_string(&artifacts)?,
+                integrated.artifact_revision.as_str(),
+                serde_json::to_string(&all_verification)?,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE commissions SET artifact_revision = ?2 WHERE id = ?1",
+            params![commission_id, integrated.artifact_revision.as_str()],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::ResultIntegrated,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "assignment_id": ready.assignment_id,
+                "logical_id": ready.logical_id,
+                "result_id": result_id,
+                "plan_revision": ready.plan_revision,
+                "artifact_revision": integrated.artifact_revision.as_str(),
+                "serialized": true,
+            }),
+        )?;
+        record_evidence(
+            &transaction,
+            commission_id,
+            result_id,
+            ready.mandate_revision,
+            integrated.artifact_revision.as_str(),
+            &integrated_verification,
+        )?;
+        refresh_criterion_statuses(
+            &transaction,
+            commission_id,
+            ready.mandate_revision,
+            integrated.artifact_revision.as_str(),
+        )?;
+        accept_planned_result(
+            &transaction,
+            commission_id,
+            PlannedAcceptance {
+                assignment_id: &ready.assignment_id,
+                attempt_id,
+                lease_id,
+                result_id,
+                mandate_revision: ready.mandate_revision,
+            },
+        )?;
+        if ready.purpose == "reconciliation" {
+            if let Some(group) = ready.competition_group.as_deref() {
+                supersede_competing_candidates(
+                    &transaction,
+                    commission_id,
+                    group,
+                    &ready.assignment_id,
+                    result_id,
+                )?;
+            }
+        }
+        record_useful_concurrency(
+            &transaction,
+            commission_id,
+            attempt_id,
+            ready.mandate_revision,
+        )?;
+        advance_plan_after_evidence(
+            &transaction,
+            commission_id,
+            ready.mandate_revision,
+            result_id,
+        )?;
+
+        let every_assignment_accepted = transaction.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM planned_assignments
+                WHERE planned_assignments.commission_id = ?1
+                  AND planned_assignments.purpose != 'reconciliation'
+                  AND NOT EXISTS(
+                      SELECT 1 FROM assignment_metadata
+                      JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+                      WHERE assignments.commission_id = planned_assignments.commission_id
+                        AND assignment_metadata.logical_id = planned_assignments.logical_id
+                        AND assignments.status IN (?2, ?3)
+                  )
+             )",
+            params![
+                commission_id,
+                AssignmentStatus::Accepted.as_str(),
+                AssignmentStatus::Superseded.as_str()
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let every_criterion_passed = transaction.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM criteria WHERE commission_id = ?1 AND status != ?2
+             )",
+            params![commission_id, CriterionStatus::Passed.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if every_assignment_accepted && every_criterion_passed {
+            complete_planned_commission(
+                &transaction,
+                commission_id,
+                ready.mandate_revision,
+                integrated.artifact_revision.as_str(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn finish_competing_candidate(
+        &mut self,
+        commission_id: &str,
+        ready: &ReadyAssignmentDispatch,
+        attempt_id: &str,
+        lease_id: &str,
+        result_id: &str,
+    ) -> Result<(), TyrionError> {
+        let group = ready
+            .competition_group
+            .as_deref()
+            .expect("competing candidate has a group");
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        finish_verification(
+            &transaction,
+            &ready.assignment_id,
+            attempt_id,
+            lease_id,
+            AssignmentStatus::VerificationPending,
+        )?;
+        let (member_count, completed_count) = transaction.query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN assignments.status = ?3 THEN 1 ELSE 0 END)
+             FROM assignments
+             JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+             WHERE assignments.commission_id = ?1
+               AND assignment_metadata.competition_group = ?2
+               AND assignment_metadata.purpose != 'reconciliation'",
+            params![
+                commission_id,
+                group,
+                AssignmentStatus::VerificationPending.as_str()
+            ],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+        )?;
+        if member_count < 2 || member_count != completed_count {
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        let already_planned = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM planned_assignments
+                WHERE commission_id = ?1 AND purpose = 'reconciliation'
+                  AND competition_group = ?2
+             )",
+            params![commission_id, group],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if already_planned {
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        let plan_revision = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM commission_plans
+             WHERE commission_id = ?1",
+            [commission_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let logical_id = format!("compare-{}", Uuid::new_v4());
+        let uncertainty = ready
+            .competition_uncertainty
+            .as_deref()
+            .expect("competing candidate has an uncertainty");
+        let comparison_rule = ready
+            .competition_rule
+            .as_deref()
+            .expect("competing candidate has a comparison rule");
+        let contenders = {
+            let mut statement = transaction.prepare(
+                "SELECT results.id, results.artifact_revision, results.output,
+                        results.changed_paths_json
+                 FROM results
+                 JOIN attempts ON attempts.id = results.attempt_id
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+                 WHERE assignments.commission_id = ?1
+                   AND assignment_metadata.competition_group = ?2
+                   AND assignment_metadata.purpose != 'reconciliation'
+                   AND results.status = ?3
+                 ORDER BY assignment_metadata.position, results.id",
+            )?;
+            let rows = statement.query_map(
+                params![commission_id, group, ResultStatus::Candidate.as_str()],
+                |row| {
+                    Ok(serde_json::json!({
+                        "result_id": row.get::<_, String>(0)?,
+                        "artifact_revision": row.get::<_, String>(1)?,
+                        "summary": row.get::<_, String>(2)?,
+                        "changed_paths": serde_json::from_str::<Value>(&row.get::<_, String>(3)?)
+                            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            ))?,
+                    }))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let write_scopes = {
+            let mut scopes = Vec::new();
+            let mut statement = transaction.prepare(
+                "SELECT write_scopes_json FROM assignment_metadata
+                 JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+                 WHERE assignments.commission_id = ?1
+                   AND assignment_metadata.competition_group = ?2
+                   AND assignment_metadata.purpose != 'reconciliation'",
+            )?;
+            let rows = statement.query_map(params![commission_id, group], |row| {
+                string_vec_column(row, 0)
+            })?;
+            for member_scopes in rows {
+                for scope in member_scopes? {
+                    if !scopes.contains(&scope) {
+                        scopes.push(scope);
+                    }
+                }
+            }
+            scopes
+        };
+        let criteria_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT planned_assignment_criteria.criterion_id
+                 FROM planned_assignment_criteria
+                 JOIN planned_assignments
+                   ON planned_assignments.commission_id = planned_assignment_criteria.commission_id
+                  AND planned_assignments.logical_id = planned_assignment_criteria.assignment_logical_id
+                 WHERE planned_assignments.commission_id = ?1
+                   AND planned_assignments.competition_group = ?2
+                 ORDER BY planned_assignment_criteria.position,
+                          planned_assignment_criteria.criterion_id",
+            )?;
+            let rows = statement
+                .query_map(params![commission_id, group], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let comparison_budget = {
+            let mut statement = transaction.prepare(
+                "SELECT assignment_metadata.concurrency_slots,
+                        assignment_metadata.max_storage_bytes,
+                        assignment_metadata.max_model_spend_cents,
+                        assignment_metadata.max_paid_service_spend_cents
+                 FROM assignment_metadata
+                 JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+                 WHERE assignments.commission_id = ?1
+                   AND assignment_metadata.competition_group = ?2
+                   AND assignment_metadata.purpose != 'reconciliation'",
+            )?;
+            let rows = statement.query_map(params![commission_id, group], |row| {
+                Ok(Resources {
+                    concurrency: row.get(0)?,
+                    storage: row.get(1)?,
+                    model_spend: row.get(2)?,
+                    paid_spend: row.get(3)?,
+                })
+            })?;
+            comparison_resources(rows.collect::<Result<Vec<_>, _>>()?)?
+        };
+        let goal = format!(
+            "Reconcile competing Results for uncertainty: {uncertainty}. Apply comparison rule: {comparison_rule}. Candidate Evidence: {}. Authorized reconciliation write scope: {}",
+            serde_json::to_string(&contenders)?,
+            write_scopes.first().map(String::as_str).unwrap_or("")
+        );
+        transaction.execute(
+            "INSERT INTO planned_assignments (
+                commission_id, logical_id, position, goal, purpose,
+                read_scopes_json, write_scopes_json, concurrency_slots,
+                max_storage_bytes, max_model_spend_cents,
+                max_paid_service_spend_cents, competition_group,
+                competition_uncertainty, competition_rule, created_plan_revision
+             ) VALUES (
+                ?1, ?2,
+                (SELECT COALESCE(MAX(position), -1) + 1 FROM planned_assignments WHERE commission_id = ?1),
+                ?3, 'reconciliation', ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             )",
+            params![
+                commission_id,
+                logical_id,
+                goal,
+                serde_json::to_string(&write_scopes)?,
+                comparison_budget.concurrency,
+                comparison_budget.storage,
+                comparison_budget.model_spend,
+                comparison_budget.paid_spend,
+                group,
+                uncertainty,
+                comparison_rule,
+                plan_revision,
+            ],
+        )?;
+        for (position, criterion_id) in criteria_ids.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO planned_assignment_criteria (
+                    commission_id, assignment_logical_id, criterion_id, position
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![commission_id, logical_id, criterion_id, position as i64],
+            )?;
+        }
+        let now = unix_timestamp()?;
+        let reconciliation_id = insert_ready_assignment(
+            &transaction,
+            commission_id,
+            &logical_id,
+            plan_revision,
+            ready.mandate_revision,
+            false,
+            now,
+        )?;
+        let execution_frontier = execution_frontier_logical_ids(&transaction, commission_id)?;
+        let snapshot = serde_json::json!({
+            "reason": "competition_comparison",
+            "uncertainty": uncertainty,
+            "comparison_rule": comparison_rule,
+            "candidate_results": contenders,
+            "reconciliation_assignment_id": reconciliation_id,
+            "execution_frontier": execution_frontier,
+        });
+        transaction.execute(
+            "INSERT INTO commission_plans (
+                commission_id, revision, source, reason, snapshot_json, created_at
+             ) VALUES (?1, ?2, 'control_plane', ?3, ?4, ?5)",
+            params![
+                commission_id,
+                plan_revision,
+                goal,
+                serde_json::to_string(&snapshot)?,
+                now
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::PlanRevised,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "plan_revision": plan_revision,
+                "reason": "competition_comparison",
+                "source_result_id": result_id,
+                "execution_frontier": execution_frontier,
+            }),
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::ReconciliationRequired,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "kind": "competition_comparison",
+                "uncertainty": uncertainty,
+                "comparison_rule": comparison_rule,
+                "candidate_results": contenders,
+                "reconciliation_assignment_id": reconciliation_id,
+                "silent_winner_selected": false,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn require_reconciliation(
+        &mut self,
+        commission_id: &str,
+        ready: &ReadyAssignmentDispatch,
+        attempt_id: &str,
+        lease_id: &str,
+        result_id: &str,
+        kind: &str,
+        message: &str,
+        affected_paths: &[String],
+    ) -> Result<(), TyrionError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = unix_timestamp()?;
+        release_successful_attempt(
+            &transaction,
+            SuccessfulAttemptRelease {
+                attempt_id,
+                lease_id,
+            },
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![
+                ready.assignment_id,
+                AssignmentStatus::VerificationFailed.as_str()
+            ],
+        )?;
+
+        let plan_revision = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM commission_plans
+             WHERE commission_id = ?1",
+            [commission_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let logical_id = format!("reconcile-{}", Uuid::new_v4());
+        let competition_group = format!("reconciliation-{}", ready.assignment_id);
+        let comparison_rule =
+            "produce a fresh Result that passes candidate and assembled verification";
+        let reconciliation_budget = Resources {
+            concurrency: ready.reserved_concurrency_slots.into(),
+            storage: ready.max_storage_bytes,
+            model_spend: ready.reserved_model_spend_cents,
+            paid_spend: ready.reserved_paid_service_spend_cents,
+        };
+        let goal = format!(
+            "Reconcile {kind} for Assignment {} without selecting a silent winner: {message}. Authorized reconciliation write scope: {}",
+            ready.logical_id,
+            affected_paths.first().map(String::as_str).unwrap_or("")
+        );
+        transaction.execute(
+            "UPDATE assignment_metadata
+             SET competition_group = ?2, competition_uncertainty = ?3,
+                 competition_rule = ?4
+             WHERE assignment_id = ?1",
+            params![
+                ready.assignment_id,
+                competition_group,
+                message,
+                comparison_rule
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO planned_assignments (
+                commission_id, logical_id, position, goal, purpose,
+                read_scopes_json, write_scopes_json, concurrency_slots,
+                max_storage_bytes, max_model_spend_cents,
+                max_paid_service_spend_cents, competition_group,
+                competition_uncertainty, competition_rule, created_plan_revision
+             ) VALUES (
+                ?1, ?2,
+                (SELECT COALESCE(MAX(position), -1) + 1 FROM planned_assignments WHERE commission_id = ?1),
+                ?3, 'reconciliation', ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             )",
+            params![
+                commission_id,
+                logical_id,
+                goal,
+                serde_json::to_string(affected_paths)?,
+                reconciliation_budget.concurrency,
+                reconciliation_budget.storage,
+                reconciliation_budget.model_spend,
+                reconciliation_budget.paid_spend,
+                competition_group,
+                message,
+                comparison_rule,
+                plan_revision,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO planned_assignment_criteria (
+                commission_id, assignment_logical_id, criterion_id, position
+             )
+             SELECT commission_id, ?3, criterion_id, position
+             FROM planned_assignment_criteria
+             WHERE commission_id = ?1 AND assignment_logical_id = ?2",
+            params![commission_id, ready.logical_id, logical_id],
+        )?;
+        let reconciliation_id = insert_ready_assignment(
+            &transaction,
+            commission_id,
+            &logical_id,
+            plan_revision,
+            ready.mandate_revision,
+            false,
+            now,
+        )?;
+        let execution_frontier = execution_frontier_logical_ids(&transaction, commission_id)?;
+        let snapshot = serde_json::json!({
+            "reason": kind,
+            "source_result_id": result_id,
+            "reconciliation_assignment_id": reconciliation_id,
+            "affected_paths": affected_paths,
+            "execution_frontier": execution_frontier,
+        });
+        transaction.execute(
+            "INSERT INTO commission_plans (
+                commission_id, revision, source, reason, snapshot_json, created_at
+             ) VALUES (?1, ?2, 'control_plane', ?3, ?4, ?5)",
+            params![
+                commission_id,
+                plan_revision,
+                goal,
+                serde_json::to_string(&snapshot)?,
+                now
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::PlanRevised,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "plan_revision": plan_revision,
+                "reason": kind,
+                "source_result_id": result_id,
+                "execution_frontier": execution_frontier,
+            }),
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::ReconciliationRequired,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "kind": kind,
+                "message": message,
+                "source_assignment_id": ready.assignment_id,
+                "source_result_id": result_id,
+                "reconciliation_assignment_id": reconciliation_id,
+                "affected_paths": affected_paths,
+                "silent_winner_selected": false,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn fail_attempt(
         &mut self,
         commission_id: &str,
@@ -1621,9 +2556,12 @@ impl Store {
     ) -> Result<(), TyrionError> {
         let transaction = self.connection.transaction()?;
         let now = unix_timestamp()?;
+        let now_ms = unix_timestamp_millis()?;
         transaction.execute(
-            "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
-            params![attempt_id, AttemptStatus::Failed.as_str(), now],
+            "UPDATE attempts
+             SET status = ?2, completed_at = ?3, completed_at_ms = ?4
+             WHERE id = ?1",
+            params![attempt_id, AttemptStatus::Failed.as_str(), now, now_ms],
         )?;
         let (lease_status, assignment_status, blocker_code, requirement) = match error {
             TyrionError::WorkerLeaseExpired { .. } => (
@@ -1655,6 +2593,11 @@ impl Store {
             params![lease_id, lease_status.as_str(), now],
         )?;
         transaction.execute(
+            "UPDATE resource_reservations
+             SET status = 'revoked', released_at = ?2 WHERE attempt_id = ?1",
+            params![attempt_id, now_ms],
+        )?;
+        transaction.execute(
             "UPDATE assignments SET status = ?2 WHERE id = ?1",
             params![assignment_id, assignment_status.as_str()],
         )?;
@@ -1679,6 +2622,224 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn proposal_plan_or_legacy(
+    plan: Option<CommissionPlan>,
+    commission_id: &str,
+    transaction: &Transaction<'_>,
+) -> Result<CommissionPlan, TyrionError> {
+    if let Some(plan) = plan {
+        return Ok(plan);
+    }
+    let (goal, max_storage_bytes, max_model_spend_cents, max_paid_service_spend_cents) =
+        transaction.query_row(
+            "SELECT commissions.goal, resource_ceilings.max_storage_bytes,
+                    resource_ceilings.max_model_spend_cents,
+                    resource_ceilings.max_paid_service_spend_cents
+             FROM commissions
+             JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
+             WHERE commissions.id = ?1",
+            [commission_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        )?;
+    let criterion_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT criterion_id FROM criteria WHERE commission_id = ?1 ORDER BY position",
+        )?;
+        let rows = statement.query_map([commission_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(CommissionPlan {
+        assignments: vec![PlannedAssignment {
+            id: "legacy-assignment".into(),
+            goal,
+            dependencies: Vec::new(),
+            criterion_ids,
+            purpose: AssignmentPurpose::CriticalPath,
+            read_scopes: Vec::new(),
+            write_scopes: load_authorized_paths(transaction, commission_id)?,
+            resources: AssignmentResources {
+                concurrency_slots: 1,
+                max_storage_bytes,
+                max_model_spend_cents,
+                max_paid_service_spend_cents,
+            },
+            competition: None,
+        }],
+    })
+}
+
+fn initialize_commission_plan(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    plan: &CommissionPlan,
+    legacy: bool,
+    created_at: i64,
+) -> Result<(), TyrionError> {
+    let plan_revision = 1_i64;
+    transaction.execute(
+        "INSERT INTO commission_plans (
+            commission_id, revision, source, reason, snapshot_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            commission_id,
+            plan_revision,
+            if legacy {
+                "control_plane"
+            } else {
+                "entry_model"
+            },
+            "initial decomposition exposed the first safe Execution Frontier",
+            serde_json::to_string(plan)?,
+            created_at,
+        ],
+    )?;
+    record_event_with_payload(
+        transaction,
+        commission_id,
+        EventKind::PlanRevised,
+        mandate_revision,
+        &serde_json::json!({
+            "plan_revision": plan_revision,
+            "source": if legacy { "control_plane" } else { "entry_model" },
+            "reason": "initial_decomposition",
+        }),
+    )?;
+
+    for (position, assignment) in plan.assignments.iter().enumerate() {
+        let competition = assignment.competition.as_ref();
+        transaction.execute(
+            "INSERT INTO planned_assignments (
+                commission_id, logical_id, position, goal, purpose,
+                read_scopes_json, write_scopes_json, concurrency_slots,
+                max_storage_bytes, max_model_spend_cents,
+                max_paid_service_spend_cents, competition_group,
+                competition_uncertainty, competition_rule, created_plan_revision
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+             )",
+            params![
+                commission_id,
+                assignment.id,
+                position as i64,
+                assignment.goal,
+                assignment.purpose.as_str(),
+                serde_json::to_string(&assignment.read_scopes)?,
+                serde_json::to_string(&assignment.write_scopes)?,
+                assignment.resources.concurrency_slots,
+                assignment.resources.max_storage_bytes,
+                assignment.resources.max_model_spend_cents,
+                assignment.resources.max_paid_service_spend_cents,
+                competition.map(|item| item.group.as_str()),
+                competition.map(|item| item.uncertainty.as_str()),
+                competition.map(|item| item.comparison_rule.as_str()),
+                plan_revision,
+            ],
+        )?;
+        for (dependency_position, dependency) in assignment.dependencies.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO planned_assignment_dependencies (
+                    commission_id, assignment_logical_id, dependency_logical_id, position
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    commission_id,
+                    assignment.id,
+                    dependency,
+                    dependency_position as i64,
+                ],
+            )?;
+        }
+        for (criterion_position, criterion_id) in assignment.criterion_ids.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO planned_assignment_criteria (
+                    commission_id, assignment_logical_id, criterion_id, position
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    commission_id,
+                    assignment.id,
+                    criterion_id,
+                    criterion_position as i64,
+                ],
+            )?;
+        }
+    }
+
+    for assignment in plan
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.dependencies.is_empty())
+    {
+        insert_ready_assignment(
+            transaction,
+            commission_id,
+            &assignment.id,
+            plan_revision,
+            mandate_revision,
+            legacy,
+            created_at,
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_ready_assignment(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    logical_id: &str,
+    plan_revision: i64,
+    mandate_revision: i64,
+    legacy: bool,
+    created_at: i64,
+) -> Result<String, TyrionError> {
+    let assignment_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO assignments (id, commission_id, plan_revision, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            assignment_id,
+            commission_id,
+            plan_revision,
+            AssignmentStatus::Ready.as_str(),
+            created_at,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO assignment_metadata (
+            assignment_id, commission_id, logical_id, position, goal, purpose,
+            read_scopes_json, write_scopes_json, concurrency_slots,
+            max_storage_bytes, max_model_spend_cents,
+            max_paid_service_spend_cents, competition_group,
+            competition_uncertainty, competition_rule, legacy
+         )
+         SELECT ?1, ?2, logical_id, position, goal, purpose, read_scopes_json,
+                write_scopes_json, concurrency_slots, max_storage_bytes,
+                max_model_spend_cents, max_paid_service_spend_cents,
+                competition_group, competition_uncertainty, competition_rule, ?4
+         FROM planned_assignments
+         WHERE commission_id = ?2 AND logical_id = ?3",
+        params![assignment_id, commission_id, logical_id, legacy],
+    )?;
+    record_event_with_payload(
+        transaction,
+        commission_id,
+        EventKind::AssignmentReady,
+        mandate_revision,
+        &serde_json::json!({
+            "assignment_id": assignment_id,
+            "logical_id": logical_id,
+            "plan_revision": plan_revision,
+        }),
+    )?;
+    Ok(assignment_id)
 }
 
 fn load_criteria(
@@ -1727,6 +2888,56 @@ fn load_criteria(
     .collect()
 }
 
+fn load_assignment_criteria(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    logical_id: &str,
+    legacy: bool,
+) -> Result<Vec<worker::CriterionDefinition>, TyrionError> {
+    let criteria = load_criteria(transaction, commission_id)?;
+    if legacy {
+        return Ok(criteria);
+    }
+    let criterion_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT criterion_id FROM planned_assignment_criteria
+             WHERE commission_id = ?1 AND assignment_logical_id = ?2
+             ORDER BY position",
+        )?;
+        let rows = statement.query_map(params![commission_id, logical_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<HashSet<_>, _>>()?
+    };
+    Ok(criteria
+        .into_iter()
+        .filter(|criterion| criterion_ids.contains(&criterion.id))
+        .collect())
+}
+
+fn string_vec_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<String>> {
+    let encoded = row.get::<_, String>(index)?;
+    serde_json::from_str(&encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn competition(
+    group: &Option<String>,
+    uncertainty: &Option<String>,
+    rule: &Option<String>,
+) -> Option<Competition> {
+    Some(Competition {
+        group: group.clone()?,
+        uncertainty: uncertainty.clone()?,
+        rule: rule.clone()?,
+    })
+}
+
 fn load_authorized_paths(
     transaction: &Transaction<'_>,
     commission_id: &str,
@@ -1740,6 +2951,71 @@ fn load_authorized_paths(
         |row| row.get(0),
     )?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn load_comparison_candidates(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    competition_group: Option<&str>,
+) -> Result<Vec<worker::ComparisonCandidate>, TyrionError> {
+    let Some(competition_group) = competition_group else {
+        return Ok(Vec::new());
+    };
+    let mut statement = transaction.prepare(
+        "SELECT results.id, results.artifact_revision, results.output,
+                results.changed_paths_json, results.verification_outcomes_json,
+                results.artifacts_json
+         FROM results
+         JOIN attempts ON attempts.id = results.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+         WHERE assignments.commission_id = ?1
+           AND assignment_metadata.competition_group = ?2
+           AND assignment_metadata.purpose != 'reconciliation'
+           AND results.status = ?3
+         ORDER BY assignment_metadata.position, results.id",
+    )?;
+    let rows = statement.query_map(
+        params![
+            commission_id,
+            competition_group,
+            ResultStatus::Candidate.as_str()
+        ],
+        |row| {
+            let artifacts = serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
+                .map_err(|error| invalid_json_column(5, error))?;
+            let bundle_path = artifacts
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|artifact| artifact["kind"] == "candidate_git_bundle")
+                .and_then(|artifact| artifact["path"].as_str())
+                .ok_or_else(|| {
+                    invalid_json_column(
+                        5,
+                        serde_json::Error::io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "candidate Result has no candidate_git_bundle artifact",
+                        )),
+                    )
+                })?;
+            Ok(worker::ComparisonCandidate {
+                result_id: row.get(0)?,
+                artifact_revision: row.get(1)?,
+                summary: row.get(2)?,
+                changed_paths: serde_json::from_str(&row.get::<_, String>(3)?)
+                    .map_err(|error| invalid_json_column(3, error))?,
+                verification_outcomes: serde_json::from_str(&row.get::<_, String>(4)?)
+                    .map_err(|error| invalid_json_column(4, error))?,
+                bundle_path: Path::new(bundle_path).to_owned(),
+            })
+        },
+    )?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn invalid_json_column(index: usize, error: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
 }
 
 fn record_evidence(
@@ -2184,7 +3460,6 @@ fn complete_commission(
         ));
     }
 
-    let completed_at = unix_timestamp()?;
     let accepted_results = transaction.execute(
         "UPDATE results SET status = ?2 WHERE id = ?1 AND status = ?3",
         params![
@@ -2206,13 +3481,12 @@ fn complete_commission(
     )?;
     match (attempt_id, lease_id) {
         (Some(attempt_id), Some(lease_id)) => {
-            transaction.execute(
-                "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
-                params![attempt_id, AttemptStatus::Succeeded.as_str(), completed_at],
-            )?;
-            transaction.execute(
-                "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
-                params![lease_id, WorkerLeaseStatus::Released.as_str(), completed_at],
+            release_successful_attempt(
+                transaction,
+                SuccessfulAttemptRelease {
+                    attempt_id,
+                    lease_id,
+                },
             )?;
         }
         (None, None) => {}
@@ -2226,27 +3500,361 @@ fn complete_commission(
         "UPDATE assignments SET status = ?2 WHERE id = ?1",
         params![assignment_id, AssignmentStatus::Accepted.as_str()],
     )?;
-    let completion_revision = mandate_revision + 1;
-    let completed_commissions = transaction.execute(
+    finish_verified_commission(
+        transaction,
+        VerifiedCommissionCompletion {
+            commission_id,
+            mandate_revision,
+            artifact_revision,
+            goal,
+        },
+    )
+}
+
+fn accept_planned_result(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    acceptance: PlannedAcceptance<'_>,
+) -> Result<(), TyrionError> {
+    let accepted = transaction.execute(
+        "UPDATE results SET status = ?2 WHERE id = ?1 AND status = ?3",
+        params![
+            acceptance.result_id,
+            ResultStatus::Accepted.as_str(),
+            ResultStatus::Candidate.as_str(),
+        ],
+    )?;
+    if accepted != 1 {
+        return Err(TyrionError::InvalidRequest(
+            "planned Result acceptance requires one current candidate Result".into(),
+        ));
+    }
+    release_successful_attempt(
+        transaction,
+        SuccessfulAttemptRelease {
+            attempt_id: acceptance.attempt_id,
+            lease_id: acceptance.lease_id,
+        },
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![
+            acceptance.assignment_id,
+            AssignmentStatus::Accepted.as_str()
+        ],
+    )?;
+    record_event_with_payload(
+        transaction,
+        commission_id,
+        EventKind::ResultAccepted,
+        acceptance.mandate_revision,
+        &serde_json::json!({
+            "assignment_id": acceptance.assignment_id,
+            "attempt_id": acceptance.attempt_id,
+            "result_id": acceptance.result_id,
+        }),
+    )?;
+    Ok(())
+}
+
+fn supersede_competing_candidates(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    competition_group: &str,
+    reconciliation_assignment_id: &str,
+    reconciliation_result_id: &str,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "UPDATE results SET status = ?4
+         WHERE id != ?3 AND status = ?5
+           AND attempt_id IN (
+               SELECT attempts.id FROM attempts
+               JOIN assignments ON assignments.id = attempts.assignment_id
+               JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+               WHERE assignments.commission_id = ?1
+                 AND assignment_metadata.competition_group = ?2
+                 AND assignment_metadata.purpose != 'reconciliation'
+           )",
+        params![
+            commission_id,
+            competition_group,
+            reconciliation_result_id,
+            ResultStatus::Superseded.as_str(),
+            ResultStatus::Candidate.as_str(),
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET status = ?4
+         WHERE commission_id = ?1 AND id != ?3 AND status IN (?5, ?6)
+           AND id IN (
+               SELECT assignment_id FROM assignment_metadata
+               WHERE competition_group = ?2 AND purpose != 'reconciliation'
+           )",
+        params![
+            commission_id,
+            competition_group,
+            reconciliation_assignment_id,
+            AssignmentStatus::Superseded.as_str(),
+            AssignmentStatus::VerificationPending.as_str(),
+            AssignmentStatus::VerificationFailed.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_useful_concurrency(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    completed_attempt_id: &str,
+    mandate_revision: i64,
+) -> Result<(), TyrionError> {
+    let mut intervals = {
+        let mut statement = transaction.prepare(
+            "SELECT attempts.id, attempts.started_at_ms,
+                    attempts.execution_completed_at_ms
+             FROM attempts
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+             LEFT JOIN planned_assignments
+               ON planned_assignments.commission_id = assignments.commission_id
+              AND planned_assignments.logical_id = assignment_metadata.logical_id
+             JOIN results ON results.attempt_id = attempts.id
+             WHERE assignments.commission_id = ?1
+               AND attempts.status = ?2
+               AND (
+                   results.status = ?3
+                   OR (
+                       results.status = ?4
+                       AND assignment_metadata.competition_group IS NOT NULL
+                       AND assignment_metadata.purpose != 'reconciliation'
+                       AND planned_assignments.competition_group = assignment_metadata.competition_group
+                   )
+               )
+               AND attempts.execution_completed_at_ms IS NOT NULL
+             ORDER BY attempts.started_at_ms, attempts.id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                commission_id,
+                AttemptStatus::Succeeded.as_str(),
+                ResultStatus::Accepted.as_str(),
+                ResultStatus::Superseded.as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if intervals.len() < 2 {
+        return Ok(());
+    }
+    intervals.sort_by_key(|(_, started_at_ms, _)| *started_at_ms);
+    let first_started_at_ms = intervals[0].1;
+    let serial_execution_millis = intervals.iter().fold(0_i64, |total, (_, start, end)| {
+        total.saturating_add(end.saturating_sub(*start))
+    });
+    let mut union_execution_millis = 0_i64;
+    let mut current_start = intervals[0].1;
+    let mut current_end = intervals[0].2;
+    for (_, start, end) in intervals.iter().skip(1) {
+        if *start <= current_end {
+            current_end = current_end.max(*end);
+        } else {
+            union_execution_millis =
+                union_execution_millis.saturating_add(current_end.saturating_sub(current_start));
+            current_start = *start;
+            current_end = *end;
+        }
+    }
+    union_execution_millis =
+        union_execution_millis.saturating_add(current_end.saturating_sub(current_start));
+    let elapsed_time_reduction_millis =
+        serial_execution_millis.saturating_sub(union_execution_millis);
+    if elapsed_time_reduction_millis > 0 {
+        let attempt_ids = intervals
+            .iter()
+            .map(|(attempt_id, _, _)| attempt_id)
+            .collect::<Vec<_>>();
+        record_event_with_payload(
+            transaction,
+            commission_id,
+            EventKind::UsefulConcurrencyObserved,
+            mandate_revision,
+            &serde_json::json!({
+                "attempt_ids": attempt_ids,
+                "trigger_attempt_id": completed_attempt_id,
+                "overlap_millis": elapsed_time_reduction_millis,
+                "serial_execution_millis": serial_execution_millis,
+                "parallel_execution_window_millis": union_execution_millis,
+                "elapsed_time_reduction_millis": elapsed_time_reduction_millis,
+                "end_to_end_elapsed_millis": unix_timestamp_millis()?.saturating_sub(first_started_at_ms),
+                "success_metric": "verified execution elapsed-time reduction",
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn advance_plan_after_evidence(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    result_id: &str,
+) -> Result<(), TyrionError> {
+    let (prior_revision, prior_snapshot) = transaction.query_row(
+        "SELECT revision, snapshot_json FROM commission_plans
+         WHERE commission_id = ?1 ORDER BY revision DESC LIMIT 1",
+        [commission_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let next_revision = prior_revision + 1;
+    let ready_logical_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT planned_assignments.logical_id
+             FROM planned_assignments
+             WHERE planned_assignments.commission_id = ?1
+               AND planned_assignments.purpose != 'reconciliation'
+               AND NOT EXISTS(
+                   SELECT 1 FROM assignment_metadata
+                   JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+                   WHERE assignments.commission_id = planned_assignments.commission_id
+                     AND assignment_metadata.logical_id = planned_assignments.logical_id
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM planned_assignment_dependencies
+                   WHERE planned_assignment_dependencies.commission_id = planned_assignments.commission_id
+                     AND planned_assignment_dependencies.assignment_logical_id = planned_assignments.logical_id
+                     AND NOT EXISTS(
+                         SELECT 1 FROM assignment_metadata
+                         JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+                         WHERE assignments.commission_id = planned_assignments.commission_id
+                           AND assignment_metadata.logical_id = planned_assignment_dependencies.dependency_logical_id
+                           AND assignments.status IN (?2, ?3)
+                     )
+               )
+             ORDER BY planned_assignments.position",
+        )?;
+        let rows = statement.query_map(
+            params![
+                commission_id,
+                AssignmentStatus::Accepted.as_str(),
+                AssignmentStatus::Superseded.as_str()
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let now = unix_timestamp()?;
+    for logical_id in &ready_logical_ids {
+        insert_ready_assignment(
+            transaction,
+            commission_id,
+            logical_id,
+            next_revision,
+            mandate_revision,
+            false,
+            now,
+        )?;
+    }
+    let execution_frontier = execution_frontier_logical_ids(transaction, commission_id)?;
+    let mut snapshot = serde_json::from_str::<Value>(&prior_snapshot)?;
+    snapshot["evidence_result_id"] = Value::String(result_id.to_owned());
+    snapshot["execution_frontier"] = serde_json::to_value(&execution_frontier)?;
+    transaction.execute(
+        "INSERT INTO commission_plans (
+            commission_id, revision, source, reason, snapshot_json, created_at
+         ) VALUES (?1, ?2, 'control_plane', ?3, ?4, ?5)",
+        params![
+            commission_id,
+            next_revision,
+            "current Evidence advanced the safe Execution Frontier",
+            serde_json::to_string(&snapshot)?,
+            now,
+        ],
+    )?;
+    record_event_with_payload(
+        transaction,
+        commission_id,
+        EventKind::PlanRevised,
+        mandate_revision,
+        &serde_json::json!({
+            "plan_revision": next_revision,
+            "reason": "evidence_advanced_frontier",
+            "source_result_id": result_id,
+            "execution_frontier": execution_frontier,
+        }),
+    )?;
+    Ok(())
+}
+
+fn execution_frontier_logical_ids(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<Vec<String>, TyrionError> {
+    Ok(
+        project_commission(transaction, commission_id)?["execution_frontier"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|assignment| assignment["logical_id"].as_str())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn complete_planned_commission(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    artifact_revision: &str,
+) -> Result<(), TyrionError> {
+    let goal = transaction.query_row(
+        "SELECT goal FROM commissions WHERE id = ?1",
+        [commission_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    finish_verified_commission(
+        transaction,
+        VerifiedCommissionCompletion {
+            commission_id,
+            mandate_revision,
+            artifact_revision,
+            goal: &goal,
+        },
+    )
+}
+
+fn finish_verified_commission(
+    transaction: &Transaction<'_>,
+    completion: VerifiedCommissionCompletion<'_>,
+) -> Result<(), TyrionError> {
+    let completed_at = unix_timestamp()?;
+    let completion_revision = completion.mandate_revision + 1;
+    let updated = transaction.execute(
         "UPDATE commissions
          SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
          WHERE id = ?1 AND status = ?6 AND revision = ?7",
         params![
-            commission_id,
+            completion.commission_id,
             CommissionStatus::VerifiedComplete.as_str(),
             completion_revision,
             completed_at,
-            artifact_revision,
+            completion.artifact_revision,
             CommissionStatus::Active.as_str(),
-            mandate_revision,
+            completion.mandate_revision,
         ],
     )?;
-    if completed_commissions != 1 {
+    if updated != 1 {
         return Err(TyrionError::StaleRevision {
-            expected: mandate_revision,
+            expected: completion.mandate_revision,
             actual: transaction.query_row(
                 "SELECT revision FROM commissions WHERE id = ?1",
-                [commission_id],
+                [completion.commission_id],
                 |row| row.get(0),
             )?,
         });
@@ -2255,15 +3863,15 @@ fn complete_commission(
         "INSERT INTO completion_briefings (commission_id, summary, artifact_revision, created_at)
          VALUES (?1, ?2, ?3, ?4)",
         params![
-            commission_id,
-            format!("Verified Complete: {goal}"),
-            artifact_revision,
+            completion.commission_id,
+            format!("Verified Complete: {}", completion.goal),
+            completion.artifact_revision,
             completed_at,
         ],
     )?;
     record_event(
         transaction,
-        commission_id,
+        completion.commission_id,
         EventKind::CommissionVerifiedComplete,
         completion_revision,
     )?;
@@ -2451,49 +4059,51 @@ fn invalid_stored_enum(index: usize, field: &str, value: String) -> rusqlite::Er
     )
 }
 
-fn finish_failed_verification(
+fn finish_verification(
     transaction: &Transaction<'_>,
     assignment_id: &str,
     attempt_id: &str,
     lease_id: &str,
+    assignment_status: AssignmentStatus,
 ) -> Result<(), TyrionError> {
-    let now = unix_timestamp()?;
-    transaction.execute(
-        "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
-        params![attempt_id, AttemptStatus::Succeeded.as_str(), now],
-    )?;
-    transaction.execute(
-        "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
-        params![lease_id, WorkerLeaseStatus::Released.as_str(), now],
+    release_successful_attempt(
+        transaction,
+        SuccessfulAttemptRelease {
+            attempt_id,
+            lease_id,
+        },
     )?;
     transaction.execute(
         "UPDATE assignments SET status = ?2 WHERE id = ?1",
-        params![assignment_id, AssignmentStatus::VerificationFailed.as_str()],
+        params![assignment_id, assignment_status.as_str()],
     )?;
     Ok(())
 }
 
-fn finish_pending_verification(
+fn release_successful_attempt(
     transaction: &Transaction<'_>,
-    assignment_id: &str,
-    attempt_id: &str,
-    lease_id: &str,
+    release: SuccessfulAttemptRelease<'_>,
 ) -> Result<(), TyrionError> {
     let now = unix_timestamp()?;
+    let now_ms = unix_timestamp_millis()?;
     transaction.execute(
-        "UPDATE attempts SET status = ?2, completed_at = ?3 WHERE id = ?1",
-        params![attempt_id, AttemptStatus::Succeeded.as_str(), now],
+        "UPDATE attempts
+         SET status = ?2, completed_at = ?3, completed_at_ms = ?4 WHERE id = ?1",
+        params![
+            release.attempt_id,
+            AttemptStatus::Succeeded.as_str(),
+            now,
+            now_ms
+        ],
     )?;
     transaction.execute(
         "UPDATE worker_leases SET status = ?2, released_at = ?3 WHERE id = ?1",
-        params![lease_id, WorkerLeaseStatus::Released.as_str(), now],
+        params![release.lease_id, WorkerLeaseStatus::Released.as_str(), now],
     )?;
     transaction.execute(
-        "UPDATE assignments SET status = ?2 WHERE id = ?1",
-        params![
-            assignment_id,
-            AssignmentStatus::VerificationPending.as_str()
-        ],
+        "UPDATE resource_reservations
+         SET status = ?2, released_at = ?3 WHERE attempt_id = ?1",
+        params![release.attempt_id, "released", now_ms],
     )?;
     Ok(())
 }
@@ -2813,7 +4423,382 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
             "resource ceilings must fit in a signed 64-bit integer".into(),
         ));
     }
+    if let Some(plan) = &proposal.plan {
+        validate_commission_plan(proposal, plan)?;
+    }
     Ok(())
+}
+
+fn validate_commission_plan(
+    proposal: &CommissionProposal,
+    plan: &CommissionPlan,
+) -> Result<(), TyrionError> {
+    if !matches!(proposal.execution, ExecutionSpec::CodexGit { .. }) {
+        return Err(TyrionError::InvalidRequest(
+            "explicit multi-Assignment plans currently require codex_git execution".into(),
+        ));
+    }
+    if plan.assignments.len() < 2 {
+        return Err(TyrionError::InvalidRequest(
+            "an explicit Commission Plan must contain at least two Assignments".into(),
+        ));
+    }
+    if plan.assignments.len() as u32 > proposal.resource_ceilings.max_attempts {
+        return Err(TyrionError::InvalidRequest(
+            "max_attempts must cover every Assignment in the initial Commission Plan".into(),
+        ));
+    }
+    if proposal
+        .criteria
+        .iter()
+        .any(|criterion| criterion.verifier_type != VerifierType::Deterministic)
+    {
+        return Err(TyrionError::InvalidRequest(
+            "multi-Assignment Git plans currently require deterministic criterion Evidence".into(),
+        ));
+    }
+
+    let criterion_ids = proposal
+        .criteria
+        .iter()
+        .map(|criterion| criterion.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut assignment_ids = HashSet::new();
+    let mut owned_criteria = HashSet::new();
+    let mut competitions: HashMap<&str, (&str, &str, Vec<Resources>)> = HashMap::new();
+    let mut competition_assignments: HashMap<&str, Vec<&PlannedAssignment>> = HashMap::new();
+    let mut cumulative_model_spend = 0_u64;
+    let mut cumulative_paid_spend = 0_u64;
+    for assignment in &plan.assignments {
+        if assignment.id.trim().is_empty() || assignment.goal.trim().is_empty() {
+            return Err(TyrionError::InvalidRequest(
+                "planned Assignment id and goal must not be empty".into(),
+            ));
+        }
+        if !assignment_ids.insert(assignment.id.as_str()) {
+            return Err(TyrionError::InvalidRequest(format!(
+                "planned Assignment id {} is duplicated",
+                assignment.id
+            )));
+        }
+        if assignment.criterion_ids.is_empty() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "planned Assignment {} must own at least one Acceptance Criterion",
+                assignment.id
+            )));
+        }
+        for criterion_id in &assignment.criterion_ids {
+            if !criterion_ids.contains(criterion_id.as_str()) {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "planned Assignment {} names unknown criterion {}",
+                    assignment.id, criterion_id
+                )));
+            }
+            if !owned_criteria.insert(criterion_id.as_str()) {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Acceptance Criterion {criterion_id} is owned by more than one planned Assignment"
+                )));
+            }
+        }
+        validate_assignment_resources(
+            &assignment.id,
+            &assignment.resources,
+            &proposal.resource_ceilings,
+        )?;
+        cumulative_model_spend = cumulative_model_spend
+            .checked_add(assignment.resources.max_model_spend_cents)
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "planned cumulative model spend exceeds the Commission ceiling".into(),
+                )
+            })?;
+        cumulative_paid_spend = cumulative_paid_spend
+            .checked_add(assignment.resources.max_paid_service_spend_cents)
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
+                )
+            })?;
+        for scope in assignment
+            .read_scopes
+            .iter()
+            .chain(assignment.write_scopes.iter())
+        {
+            validate_relative_scope(scope)?;
+        }
+        for scope in &assignment.write_scopes {
+            if !proposal
+                .authority
+                .paths
+                .iter()
+                .any(|authorized| path_is_within_scope(scope, authorized))
+            {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "planned Assignment {} declares unauthorized write scope {}",
+                    assignment.id, scope
+                )));
+            }
+        }
+        if let Some(competition) = &assignment.competition {
+            competition_assignments
+                .entry(&competition.group)
+                .or_default()
+                .push(assignment);
+            if competition.group.trim().is_empty()
+                || competition.uncertainty.trim().is_empty()
+                || competition.comparison_rule.trim().is_empty()
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "competing work requires a group, uncertainty, and comparison rule".into(),
+                ));
+            }
+            let entry = competitions.entry(&competition.group).or_insert((
+                &competition.uncertainty,
+                &competition.comparison_rule,
+                Vec::new(),
+            ));
+            if entry.0 != competition.uncertainty || entry.1 != competition.comparison_rule {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "competition group {} must use one uncertainty and comparison rule",
+                    competition.group
+                )));
+            }
+            entry.2.push(Resources {
+                concurrency: assignment.resources.concurrency_slots.into(),
+                storage: assignment.resources.max_storage_bytes,
+                model_spend: assignment.resources.max_model_spend_cents,
+                paid_spend: assignment.resources.max_paid_service_spend_cents,
+            });
+        }
+    }
+    let comparison_requirements = competitions
+        .iter()
+        .map(|(group, (_, _, member_resources))| {
+            Ok((
+                *group,
+                member_resources.len(),
+                comparison_resources(member_resources.iter().copied())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, TyrionError>>()?;
+    let competition_attempts = comparison_requirements.len() as u32;
+    if (plan.assignments.len() as u32)
+        .checked_add(competition_attempts)
+        .is_none_or(|required| required > proposal.resource_ceilings.max_attempts)
+    {
+        return Err(TyrionError::InvalidRequest(
+            "max_attempts must include one comparison Assignment per competition group".into(),
+        ));
+    }
+    let reconciliation_model_spend = comparison_requirements
+        .iter()
+        .try_fold(0_u64, |total, (_, _, resources)| {
+            total.checked_add(resources.model_spend)
+        });
+    let reconciliation_paid_spend = comparison_requirements
+        .iter()
+        .try_fold(0_u64, |total, (_, _, resources)| {
+            total.checked_add(resources.paid_spend)
+        });
+    cumulative_model_spend = cumulative_model_spend
+        .checked_add(reconciliation_model_spend.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "planned cumulative model spend exceeds the Commission ceiling".into(),
+            )
+        })?)
+        .ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "planned cumulative model spend exceeds the Commission ceiling".into(),
+            )
+        })?;
+    cumulative_paid_spend = cumulative_paid_spend
+        .checked_add(reconciliation_paid_spend.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
+            )
+        })?)
+        .ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
+            )
+        })?;
+    if cumulative_model_spend > proposal.resource_ceilings.max_model_spend_cents {
+        return Err(TyrionError::InvalidRequest(
+            "planned cumulative model spend exceeds the Commission ceiling".into(),
+        ));
+    }
+    if cumulative_paid_spend > proposal.resource_ceilings.max_paid_service_spend_cents {
+        return Err(TyrionError::InvalidRequest(
+            "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
+        ));
+    }
+    if comparison_requirements
+        .iter()
+        .any(|(_, _, resources)| resources.storage > proposal.resource_ceilings.max_storage_bytes)
+    {
+        return Err(TyrionError::InvalidRequest(
+            "each competition comparison working set must fit the Commission storage ceiling"
+                .into(),
+        ));
+    }
+    if owned_criteria != criterion_ids {
+        return Err(TyrionError::InvalidRequest(
+            "every Acceptance Criterion must be owned by exactly one planned Assignment".into(),
+        ));
+    }
+    for assignment in &plan.assignments {
+        for dependency in &assignment.dependencies {
+            if dependency == &assignment.id || !assignment_ids.contains(dependency.as_str()) {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "planned Assignment {} has invalid dependency {}",
+                    assignment.id, dependency
+                )));
+            }
+        }
+    }
+    for (group, members) in competition_assignments {
+        let member_ids = members
+            .iter()
+            .map(|assignment| assignment.id.as_str())
+            .collect::<HashSet<_>>();
+        let expected_dependencies = members[0]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        for member in members {
+            if member
+                .dependencies
+                .iter()
+                .any(|dependency| member_ids.contains(dependency.as_str()))
+                || member
+                    .dependencies
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>()
+                    != expected_dependencies
+            {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "competition group {group} members must share one dependency frontier and cannot depend on each other"
+                )));
+            }
+        }
+    }
+    for (group, members, _) in comparison_requirements {
+        if members < 2 {
+            return Err(TyrionError::InvalidRequest(format!(
+                "competition group {group} must contain at least two planned Assignments"
+            )));
+        }
+    }
+    ensure_acyclic_plan(plan)?;
+    Ok(())
+}
+
+fn comparison_resources(
+    members: impl IntoIterator<Item = Resources>,
+) -> Result<Resources, TyrionError> {
+    let mut comparison = Resources::default();
+    let mut member_storage = 0_u64;
+    for member in members {
+        comparison.concurrency = comparison.concurrency.max(member.concurrency);
+        comparison.storage = comparison.storage.max(member.storage);
+        comparison.model_spend = comparison.model_spend.max(member.model_spend);
+        comparison.paid_spend = comparison.paid_spend.max(member.paid_spend);
+        member_storage = member_storage.checked_add(member.storage).ok_or_else(|| {
+            TyrionError::InvalidRequest("competition comparison storage budget overflows".into())
+        })?;
+    }
+    comparison.storage = member_storage
+        .checked_add(comparison.storage)
+        .ok_or_else(|| {
+            TyrionError::InvalidRequest("competition comparison storage budget overflows".into())
+        })?;
+    Ok(comparison)
+}
+
+fn validate_assignment_resources(
+    assignment_id: &str,
+    resources: &AssignmentResources,
+    ceilings: &ResourceCeilings,
+) -> Result<(), TyrionError> {
+    if resources.concurrency_slots == 0 || resources.max_storage_bytes == 0 {
+        return Err(TyrionError::InvalidRequest(format!(
+            "planned Assignment {assignment_id} requires positive concurrency and storage reservations"
+        )));
+    }
+    if resources.concurrency_slots > ceilings.max_worker_concurrency
+        || resources.max_storage_bytes > ceilings.max_storage_bytes
+        || resources.max_model_spend_cents > ceilings.max_model_spend_cents
+        || resources.max_paid_service_spend_cents > ceilings.max_paid_service_spend_cents
+    {
+        return Err(TyrionError::InvalidRequest(format!(
+            "planned Assignment {assignment_id} requests resources outside the Commission ceilings"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relative_scope(scope: &str) -> Result<(), TyrionError> {
+    let path = Path::new(scope);
+    if scope.trim().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "planned artifact scopes must be normalized relative paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn path_is_within_scope(path: &str, scope: &str) -> bool {
+    path == scope || path.starts_with(&format!("{scope}/"))
+}
+
+fn ensure_acyclic_plan(plan: &CommissionPlan) -> Result<(), TyrionError> {
+    fn visit<'a>(
+        id: &'a str,
+        assignments: &HashMap<&'a str, &'a PlannedAssignment>,
+        visiting: &mut HashSet<&'a str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> bool {
+        if visited.contains(id) {
+            return true;
+        }
+        if !visiting.insert(id) {
+            return false;
+        }
+        let acyclic = assignments[id]
+            .dependencies
+            .iter()
+            .all(|dependency| visit(dependency, assignments, visiting, visited));
+        visiting.remove(id);
+        if acyclic {
+            visited.insert(id);
+        }
+        acyclic
+    }
+
+    let assignments = plan
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.id.as_str(), assignment))
+        .collect::<HashMap<_, _>>();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    if assignments
+        .keys()
+        .all(|id| visit(id, &assignments, &mut visiting, &mut visited))
+    {
+        Ok(())
+    } else {
+        Err(TyrionError::InvalidRequest(
+            "Commission Plan dependencies must be acyclic".into(),
+        ))
+    }
 }
 
 fn validate_acceptance_criteria(
@@ -3134,4 +5119,13 @@ fn unix_timestamp() -> Result<i64, TyrionError> {
             TyrionError::InvalidRequest(format!("system clock is invalid: {error}"))
         })?;
     Ok(duration.as_secs() as i64)
+}
+
+fn unix_timestamp_millis() -> Result<i64, TyrionError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TyrionError::InvalidRequest("system clock is before Unix epoch".into()))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| TyrionError::InvalidRequest("system clock does not fit in SQLite".into()))
 }

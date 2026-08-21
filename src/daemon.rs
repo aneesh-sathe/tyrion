@@ -83,12 +83,38 @@ fn spawn_ready_assignment(
         .spawn(move || {
             let outcome = (|| {
                 loop {
-                    let mut store = Store::open(&database_path)?;
-                    store.run_ready_assignment(&commission_id, &worker)?;
-                    if !store
-                        .ready_commission_ids()?
-                        .iter()
-                        .any(|ready_id| ready_id == &commission_id)
+                    let store = Store::open(&database_path)?;
+                    let (parallelism, ready_before, attempts_before) =
+                        store.dispatch_snapshot(&commission_id)?;
+                    drop(store);
+                    if ready_before == 0 {
+                        break;
+                    }
+                    let round = (0..parallelism)
+                        .map(|index| {
+                            let database_path = database_path.clone();
+                            let worker = Arc::clone(&worker);
+                            let commission_id = commission_id.clone();
+                            thread::Builder::new()
+                                .name(format!("worker-{thread_label}-{index}"))
+                                .spawn(move || {
+                                    let mut store = Store::open(&database_path)?;
+                                    store.run_ready_assignment(&commission_id, &worker)
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for worker_thread in round {
+                        worker_thread.join().map_err(|_| {
+                            TyrionError::InvalidRequest(
+                                "Assignment dispatch thread terminated unexpectedly".into(),
+                            )
+                        })??;
+                    }
+                    let store = Store::open(&database_path)?;
+                    let (_, ready_after, attempts_after) =
+                        store.dispatch_snapshot(&commission_id)?;
+                    if ready_after == 0
+                        || (ready_after == ready_before && attempts_after == attempts_before)
                     {
                         break;
                     }

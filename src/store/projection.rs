@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use crate::domain::AuthorityScopeType;
 use crate::TyrionError;
 
+use super::frontier::{Competition, OccupiedWork, Resources, Work};
+
 pub(super) fn inspect_commission(
     connection: &Connection,
     commission_id: &str,
@@ -13,7 +15,7 @@ pub(super) fn inspect_commission(
     let commission = connection
         .query_row(
             "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at,
-                    artifact_revision, execution_json
+                    artifact_revision, execution_json, plan_json
              FROM commissions WHERE id = ?1",
             [commission_id],
             |row| {
@@ -28,6 +30,14 @@ pub(super) fn inspect_commission(
                     "completed_at": row.get::<_, Option<i64>>(6)?,
                     "artifact_revision": row.get::<_, Option<String>>(7)?,
                     "execution": execution,
+                    "proposed_plan": row.get::<_, Option<String>>(9)?
+                        .map(|encoded| serde_json::from_str::<Value>(&encoded))
+                        .transpose()
+                        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        ))?,
                 }))
             },
         )
@@ -202,17 +212,69 @@ pub(super) fn inspect_commission(
     commission["resource_ceilings"] = resource_ceilings;
     commission["known_uncertainties"] = Value::Array(known_uncertainties);
 
-    let assignments = query_values(
+    let plans = query_values(
         connection,
-        "SELECT id, plan_revision, status, created_at
-         FROM assignments WHERE commission_id = ?1 ORDER BY created_at, id",
+        "SELECT revision, source, reason, snapshot_json, created_at
+         FROM commission_plans WHERE commission_id = ?1 ORDER BY revision",
         commission_id,
         |row| {
             Ok(json!({
+                "revision": row.get::<_, i64>(0)?,
+                "source": row.get::<_, String>(1)?,
+                "reason": row.get::<_, String>(2)?,
+                "snapshot": json_column(row, 3)?,
+                "created_at": row.get::<_, i64>(4)?,
+            }))
+        },
+    )?;
+    let assignments = query_values(
+        connection,
+        "SELECT assignments.id, assignment_metadata.logical_id,
+                assignments.plan_revision, assignments.status, assignments.created_at,
+                assignment_metadata.purpose, assignment_metadata.read_scopes_json,
+                assignment_metadata.write_scopes_json,
+                assignment_metadata.concurrency_slots,
+                assignment_metadata.max_storage_bytes,
+                assignment_metadata.max_model_spend_cents,
+                assignment_metadata.max_paid_service_spend_cents,
+                assignment_metadata.competition_group,
+                assignment_metadata.competition_uncertainty,
+                assignment_metadata.competition_rule,
+                assignment_metadata.position
+         FROM assignments
+         JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+         WHERE assignments.commission_id = ?1
+         ORDER BY assignment_metadata.position, assignments.id",
+        commission_id,
+        |row| {
+            let competition_group = row.get::<_, Option<String>>(12)?;
+            let competition_uncertainty = row.get::<_, Option<String>>(13)?;
+            let competition_rule = row.get::<_, Option<String>>(14)?;
+            let competition = match (competition_group, competition_uncertainty, competition_rule) {
+                (Some(group), Some(uncertainty), Some(comparison_rule)) => Some(json!({
+                    "group": group,
+                    "uncertainty": uncertainty,
+                    "comparison_rule": comparison_rule,
+                })),
+                _ => None,
+            };
+            Ok(json!({
                 "id": row.get::<_, String>(0)?,
-                "plan_revision": row.get::<_, i64>(1)?,
-                "status": row.get::<_, String>(2)?,
-                "created_at": row.get::<_, i64>(3)?,
+                "logical_id": row.get::<_, String>(1)?,
+                "plan_revision": row.get::<_, i64>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, i64>(4)?,
+                "purpose": row.get::<_, String>(5)?,
+                "read_scopes": json_column(row, 6)?,
+                "write_scopes": json_column(row, 7)?,
+                "resources": {
+                    "concurrency_slots": row.get::<_, u32>(8)?,
+                    "max_storage_bytes": row.get::<_, u64>(9)?,
+                    "max_model_spend_cents": row.get::<_, u64>(10)?,
+                    "max_paid_service_spend_cents": row.get::<_, u64>(11)?,
+                },
+                "competition": competition,
+                "position": row.get::<_, i64>(15)?,
             }))
         },
     )?;
@@ -220,22 +282,29 @@ pub(super) fn inspect_commission(
         connection,
         "SELECT attempts.id, attempts.assignment_id, attempts.worker_configuration,
                 attempts.status, attempts.started_at, attempts.completed_at,
+                attempts.started_at_ms, attempts.execution_completed_at_ms, attempts.completed_at_ms,
                 worker_leases.id, worker_leases.issued_at, worker_leases.expires_at,
-                worker_leases.released_at, worker_leases.status
+                worker_leases.released_at, worker_leases.status,
+                resource_reservations.concurrency_slots,
+                resource_reservations.storage_bytes,
+                resource_reservations.model_spend_cents,
+                resource_reservations.paid_service_spend_cents,
+                resource_reservations.status
          FROM attempts
          JOIN assignments ON assignments.id = attempts.assignment_id
          LEFT JOIN worker_leases ON worker_leases.attempt_id = attempts.id
+         LEFT JOIN resource_reservations ON resource_reservations.attempt_id = attempts.id
          WHERE assignments.commission_id = ?1 ORDER BY attempts.started_at, attempts.id",
         commission_id,
         |row| {
-            let lease_id = row.get::<_, Option<String>>(6)?;
+            let lease_id = row.get::<_, Option<String>>(9)?;
             let lease = match lease_id {
                 Some(id) => Some(json!({
                     "id": id,
-                    "issued_at": row.get::<_, i64>(7)?,
-                    "expires_at": row.get::<_, i64>(8)?,
-                    "released_at": row.get::<_, Option<i64>>(9)?,
-                    "status": row.get::<_, String>(10)?,
+                    "issued_at": row.get::<_, i64>(10)?,
+                    "expires_at": row.get::<_, i64>(11)?,
+                    "released_at": row.get::<_, Option<i64>>(12)?,
+                    "status": row.get::<_, String>(13)?,
                 })),
                 None => None,
             };
@@ -246,7 +315,17 @@ pub(super) fn inspect_commission(
                 "status": row.get::<_, String>(3)?,
                 "started_at": row.get::<_, i64>(4)?,
                 "completed_at": row.get::<_, Option<i64>>(5)?,
+                "started_at_ms": row.get::<_, i64>(6)?,
+                "execution_completed_at_ms": row.get::<_, Option<i64>>(7)?,
+                "completed_at_ms": row.get::<_, Option<i64>>(8)?,
                 "lease": lease,
+                "reservation": {
+                    "concurrency_slots": row.get::<_, Option<u32>>(14)?,
+                    "storage_bytes": row.get::<_, Option<u64>>(15)?,
+                    "model_spend_cents": row.get::<_, Option<u64>>(16)?,
+                    "paid_service_spend_cents": row.get::<_, Option<u64>>(17)?,
+                    "status": row.get::<_, Option<String>>(18)?,
+                },
             }))
         },
     )?;
@@ -254,7 +333,7 @@ pub(super) fn inspect_commission(
         connection,
         "SELECT results.id, results.attempt_id, results.output, results.artifact_revision,
                 results.status, results.created_at, results.mandate_revision,
-                results.base_revision, results.candidate_commits_json,
+                results.plan_revision, results.base_revision, results.candidate_commits_json,
                 results.changed_paths_json, results.artifacts_json,
                 results.verification_outcomes_json, results.known_effects_json,
                 results.integrated_artifact_revision
@@ -272,13 +351,14 @@ pub(super) fn inspect_commission(
                 "status": row.get::<_, String>(4)?,
                 "created_at": row.get::<_, i64>(5)?,
                 "mandate_revision": row.get::<_, Option<i64>>(6)?,
-                "base_revision": row.get::<_, Option<String>>(7)?,
-                "candidate_commits": json_column(row, 8)?,
-                "changed_paths": json_column(row, 9)?,
-                "artifacts": json_column(row, 10)?,
-                "verification_outcomes": json_column(row, 11)?,
-                "known_effects": json_column(row, 12)?,
-                "integrated_artifact_revision": row.get::<_, Option<String>>(13)?,
+                "plan_revision": row.get::<_, Option<i64>>(7)?,
+                "base_revision": row.get::<_, Option<String>>(8)?,
+                "candidate_commits": json_column(row, 9)?,
+                "changed_paths": json_column(row, 10)?,
+                "artifacts": json_column(row, 11)?,
+                "verification_outcomes": json_column(row, 12)?,
+                "known_effects": json_column(row, 13)?,
+                "integrated_artifact_revision": row.get::<_, Option<String>>(14)?,
             }))
         },
     )?;
@@ -361,6 +441,131 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+
+    let concurrency_evidence = events
+        .iter()
+        .filter(|event| event["type"] == "useful_concurrency_observed")
+        .next_back()
+        .map(|event| &event["payload"]);
+    let metric = |name: &str| {
+        concurrency_evidence
+            .and_then(|payload| payload[name].as_u64())
+            .unwrap_or(0)
+    };
+    let overlap_millis = metric("overlap_millis");
+    let serial_execution_millis = metric("serial_execution_millis");
+    let activity_journal = json!({
+        "useful_concurrency": {
+            "occurred": overlap_millis > 0,
+            "overlap_millis": overlap_millis,
+            "elapsed_time_reduction_millis": metric("elapsed_time_reduction_millis"),
+            "serial_execution_millis": serial_execution_millis,
+            "serial_attempt_millis": serial_execution_millis,
+            "parallel_execution_window_millis": metric("parallel_execution_window_millis"),
+            "end_to_end_elapsed_millis": metric("end_to_end_elapsed_millis"),
+            "success_metric": "verified execution elapsed-time reduction",
+        }
+    });
+    let occupied = attempts
+        .iter()
+        .filter(|attempt| attempt["status"] == "running")
+        .filter_map(|attempt| {
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment["id"] == attempt["assignment_id"])?;
+            Some(OccupiedWork {
+                write_scopes: json_string_vec(&assignment["write_scopes"]),
+                competition: json_competition(&assignment["competition"]),
+            })
+        })
+        .collect::<Vec<_>>();
+    let reserved_concurrency = attempts
+        .iter()
+        .filter(|attempt| attempt["reservation"]["status"] == "active")
+        .filter_map(|attempt| attempt["reservation"]["concurrency_slots"].as_u64())
+        .sum::<u64>();
+    let reserved_storage = attempts
+        .iter()
+        .filter(|attempt| attempt["reservation"]["status"] == "active")
+        .filter_map(|attempt| attempt["reservation"]["storage_bytes"].as_u64())
+        .sum::<u64>();
+    let reserved_model_spend = attempts
+        .iter()
+        .filter_map(|attempt| attempt["reservation"]["model_spend_cents"].as_u64())
+        .sum::<u64>();
+    let reserved_paid_spend = attempts
+        .iter()
+        .filter_map(|attempt| attempt["reservation"]["paid_service_spend_cents"].as_u64())
+        .sum::<u64>();
+    let candidates = assignments
+        .iter()
+        .filter(|assignment| assignment["status"] == "ready")
+        .map(|assignment| {
+            let resources = &assignment["resources"];
+            Work {
+                item: assignment,
+                write_scopes: json_string_vec(&assignment["write_scopes"]),
+                competition: json_competition(&assignment["competition"]),
+                resources: Resources {
+                    concurrency: resources["concurrency_slots"].as_u64().unwrap_or(u64::MAX),
+                    storage: resources["max_storage_bytes"].as_u64().unwrap_or(u64::MAX),
+                    model_spend: resources["max_model_spend_cents"]
+                        .as_u64()
+                        .unwrap_or(u64::MAX),
+                    paid_spend: resources["max_paid_service_spend_cents"]
+                        .as_u64()
+                        .unwrap_or(u64::MAX),
+                },
+            }
+        })
+        .collect();
+    let frontier = super::frontier::select(
+        candidates,
+        occupied,
+        Resources {
+            concurrency: reserved_concurrency,
+            storage: reserved_storage,
+            model_spend: reserved_model_spend,
+            paid_spend: reserved_paid_spend,
+        },
+        Resources {
+            concurrency: commission["resource_ceilings"]["max_worker_concurrency"]
+                .as_u64()
+                .unwrap_or(0),
+            storage: commission["resource_ceilings"]["max_storage_bytes"]
+                .as_u64()
+                .unwrap_or(0),
+            model_spend: commission["resource_ceilings"]["max_model_spend_cents"]
+                .as_u64()
+                .unwrap_or(0),
+            paid_spend: commission["resource_ceilings"]["max_paid_service_spend_cents"]
+                .as_u64()
+                .unwrap_or(0),
+        },
+    );
+    let execution_frontier = frontier
+        .selected
+        .into_iter()
+        .map(|assignment| {
+            json!({
+                "assignment_id": assignment["id"],
+                "logical_id": assignment["logical_id"],
+                "purpose": assignment["purpose"],
+                "plan_revision": assignment["plan_revision"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let frontier_holds = frontier
+        .held
+        .into_iter()
+        .map(|(assignment, reason)| {
+            json!({
+                "assignment_id": assignment["id"],
+                "logical_id": assignment["logical_id"],
+                "reason": reason.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     let failed_criteria = criteria
         .iter()
@@ -468,6 +673,9 @@ pub(super) fn inspect_commission(
         "criterion_versions": criterion_versions,
         "verification_gates": verification_gates,
         "verification_recoveries": verification_recoveries,
+        "plans": plans,
+        "execution_frontier": execution_frontier,
+        "frontier_holds": frontier_holds,
         "assignments": assignments,
         "attempts": attempts,
         "results": results,
@@ -476,6 +684,7 @@ pub(super) fn inspect_commission(
         "events": events,
         "blockers": blockers,
         "attachments": attachments,
+        "activity_journal": activity_journal,
         "verification": verification,
     }))
 }
@@ -488,6 +697,24 @@ fn json_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value>
             rusqlite::types::Type::Text,
             Box::new(error),
         )
+    })
+}
+
+fn json_string_vec(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn json_competition(value: &Value) -> Option<Competition> {
+    Some(Competition {
+        group: value["group"].as_str()?.to_owned(),
+        uncertainty: value["uncertainty"].as_str()?.to_owned(),
+        rule: value["comparison_rule"].as_str()?.to_owned(),
     })
 }
 

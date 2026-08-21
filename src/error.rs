@@ -2,6 +2,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationFailureKind {
+    StaleBase,
+    Conflict,
+}
+
+impl IntegrationFailureKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleBase => "stale_base",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+impl std::fmt::Display for IntegrationFailureKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -45,6 +66,11 @@ pub enum TyrionError {
         required_bytes: u64,
         ceiling_bytes: u64,
     },
+    #[error("Integration {kind}: {message}")]
+    IntegrationFailure {
+        kind: IntegrationFailureKind,
+        message: String,
+    },
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("database failure: {0}")]
@@ -64,9 +90,9 @@ impl TyrionError {
             Self::StaleControlRevision { .. } => ErrorCode::StaleControlRevision,
             Self::AttachmentRejected(_) => ErrorCode::AttachmentRejected,
             Self::ControlDenied(_) => ErrorCode::ControlDenied,
-            Self::WorkerLeaseExpired { .. } | Self::StorageCeilingExceeded { .. } => {
-                ErrorCode::InvalidRequest
-            }
+            Self::WorkerLeaseExpired { .. }
+            | Self::StorageCeilingExceeded { .. }
+            | Self::IntegrationFailure { .. } => ErrorCode::InvalidRequest,
             Self::Io(_) | Self::Database(_) | Self::Serialization(_) => ErrorCode::Internal,
         }
     }

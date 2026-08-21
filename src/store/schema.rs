@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS commissions (
     accepted_at INTEGER,
     completed_at INTEGER,
     artifact_revision TEXT,
-    execution_json TEXT NOT NULL DEFAULT '{"kind":"deterministic"}'
+    execution_json TEXT NOT NULL DEFAULT '{"kind":"deterministic"}',
+    plan_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS criteria (
@@ -76,14 +77,92 @@ CREATE TABLE IF NOT EXISTS known_uncertainties (
     PRIMARY KEY (commission_id, position)
 );
 
+CREATE TABLE IF NOT EXISTS commission_plans (
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    revision INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('entry_model', 'control_plane')),
+    reason TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (commission_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS planned_assignments (
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    logical_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    goal TEXT NOT NULL,
+    purpose TEXT NOT NULL CHECK (purpose IN (
+        'critical_path', 'uncertainty_reduction', 'independent_verification', 'reconciliation'
+    )),
+    read_scopes_json TEXT NOT NULL,
+    write_scopes_json TEXT NOT NULL,
+    concurrency_slots INTEGER NOT NULL,
+    max_storage_bytes INTEGER NOT NULL,
+    max_model_spend_cents INTEGER NOT NULL,
+    max_paid_service_spend_cents INTEGER NOT NULL,
+    competition_group TEXT,
+    competition_uncertainty TEXT,
+    competition_rule TEXT,
+    created_plan_revision INTEGER NOT NULL,
+    PRIMARY KEY (commission_id, logical_id)
+);
+
+CREATE TABLE IF NOT EXISTS planned_assignment_dependencies (
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_logical_id TEXT NOT NULL,
+    dependency_logical_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (commission_id, assignment_logical_id, dependency_logical_id),
+    FOREIGN KEY (commission_id, assignment_logical_id)
+        REFERENCES planned_assignments(commission_id, logical_id),
+    FOREIGN KEY (commission_id, dependency_logical_id)
+        REFERENCES planned_assignments(commission_id, logical_id)
+);
+
+CREATE TABLE IF NOT EXISTS planned_assignment_criteria (
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_logical_id TEXT NOT NULL,
+    criterion_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (commission_id, assignment_logical_id, criterion_id),
+    FOREIGN KEY (commission_id, assignment_logical_id)
+        REFERENCES planned_assignments(commission_id, logical_id),
+    FOREIGN KEY (commission_id, criterion_id) REFERENCES criteria(commission_id, criterion_id)
+);
+
 CREATE TABLE IF NOT EXISTS assignments (
     id TEXT PRIMARY KEY,
     commission_id TEXT NOT NULL REFERENCES commissions(id),
     plan_revision INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN (
-        'ready', 'running', 'accepted', 'verification_pending', 'verification_failed', 'resource_blocked'
+        'ready', 'running', 'accepted', 'superseded', 'verification_pending', 'verification_failed', 'resource_blocked'
     )),
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    UNIQUE (id, commission_id)
+);
+
+CREATE TABLE IF NOT EXISTS assignment_metadata (
+    assignment_id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL,
+    logical_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    goal TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    read_scopes_json TEXT NOT NULL,
+    write_scopes_json TEXT NOT NULL,
+    concurrency_slots INTEGER NOT NULL,
+    max_storage_bytes INTEGER NOT NULL,
+    max_model_spend_cents INTEGER NOT NULL,
+    max_paid_service_spend_cents INTEGER NOT NULL,
+    competition_group TEXT,
+    competition_uncertainty TEXT,
+    competition_rule TEXT,
+    legacy INTEGER NOT NULL CHECK (legacy IN (0, 1)),
+    UNIQUE (assignment_id, logical_id),
+    FOREIGN KEY (assignment_id, commission_id) REFERENCES assignments(id, commission_id),
+    FOREIGN KEY (commission_id, logical_id)
+        REFERENCES planned_assignments(commission_id, logical_id)
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -92,7 +171,22 @@ CREATE TABLE IF NOT EXISTS attempts (
     worker_configuration TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
     started_at INTEGER NOT NULL,
-    completed_at INTEGER
+    completed_at INTEGER,
+    started_at_ms INTEGER NOT NULL,
+    execution_completed_at_ms INTEGER,
+    completed_at_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS resource_reservations (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    concurrency_slots INTEGER NOT NULL,
+    storage_bytes INTEGER NOT NULL,
+    model_spend_cents INTEGER NOT NULL,
+    paid_service_spend_cents INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'released', 'revoked')),
+    reserved_at INTEGER NOT NULL,
+    released_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS worker_leases (
@@ -112,6 +206,7 @@ CREATE TABLE IF NOT EXISTS results (
     status TEXT NOT NULL CHECK (status IN ('candidate', 'accepted', 'superseded')),
     created_at INTEGER NOT NULL,
     mandate_revision INTEGER,
+    plan_revision INTEGER,
     base_revision TEXT,
     candidate_commits_json TEXT NOT NULL DEFAULT '[]',
     changed_paths_json TEXT NOT NULL DEFAULT '[]',
@@ -242,7 +337,9 @@ CREATE TABLE IF NOT EXISTS events (
     commission_id TEXT NOT NULL REFERENCES commissions(id),
     event_type TEXT NOT NULL CHECK (event_type IN (
         'commission_proposed', 'commission_accepted', 'commission_amended', 'assignment_ready',
-        'attempt_started', 'result_submitted', 'result_accepted', 'result_integrated',
+        'plan_revised', 'attempt_started', 'resources_reserved', 'result_submitted',
+        'result_accepted', 'result_integrated', 'reconciliation_required',
+        'useful_concurrency_observed',
         'evidence_recorded',
         'commission_verified_complete', 'assignment_blocked',
         'attachment_joined', 'active_attachment_changed'
@@ -273,10 +370,14 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             [],
         )?;
     }
+    if !column_exists(connection, "commissions", "plan_json")? {
+        connection.execute("ALTER TABLE commissions ADD COLUMN plan_json TEXT", [])?;
+    }
     upgrade_criteria(connection)?;
     backfill_criterion_versions(connection)?;
     upgrade_assignments(connection)?;
     upgrade_attempts(connection)?;
+    add_attempt_timing_columns(connection)?;
     upgrade_evidence(connection)?;
     connection.execute_batch(
         r#"
@@ -299,42 +400,55 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let needs_event_upgrade = events_schema.is_some_and(|schema| {
+    let needs_event_upgrade = events_schema.as_deref().is_some_and(|schema| {
         !schema.contains("active_attachment_changed")
             || !schema.contains("payload_json")
             || !schema.contains("result_integrated")
             || !schema.contains("commission_amended")
+            || !schema.contains("useful_concurrency_observed")
     });
     if needs_event_upgrade {
-        connection.execute_batch(
+        let payload_projection = if events_schema
+            .as_deref()
+            .is_some_and(|schema| schema.contains("payload_json"))
+        {
+            "payload_json"
+        } else {
+            "'{}'"
+        };
+        connection.execute_batch(&format!(
             r#"
             BEGIN IMMEDIATE;
-            ALTER TABLE events RENAME TO events_before_attachments;
+            ALTER TABLE events RENAME TO events_before_parallelism;
             CREATE TABLE events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 commission_id TEXT NOT NULL REFERENCES commissions(id),
                 event_type TEXT NOT NULL CHECK (event_type IN (
                     'commission_proposed', 'commission_accepted', 'commission_amended', 'assignment_ready',
-                    'attempt_started', 'result_submitted', 'result_accepted', 'result_integrated',
+                    'plan_revised', 'attempt_started', 'resources_reserved', 'result_submitted',
+                    'result_accepted', 'result_integrated', 'reconciliation_required',
+                    'useful_concurrency_observed',
                     'evidence_recorded',
                     'commission_verified_complete', 'assignment_blocked',
                     'attachment_joined', 'active_attachment_changed'
                 )),
                 commission_revision INTEGER NOT NULL,
-                payload_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{{}}',
                 created_at INTEGER NOT NULL
             );
             INSERT INTO events (
                 sequence, commission_id, event_type, commission_revision, payload_json, created_at
             )
-            SELECT sequence, commission_id, event_type, commission_revision, '{}', created_at
-            FROM events_before_attachments;
-            DROP TABLE events_before_attachments;
+            SELECT sequence, commission_id, event_type, commission_revision, {payload_projection}, created_at
+            FROM events_before_parallelism;
+            DROP TABLE events_before_parallelism;
             COMMIT;
-            "#,
-        )?;
+            "#
+        ))?;
     }
-    connection.pragma_update(None, "user_version", 5)?;
+    backfill_planned_assignments(connection)?;
+    backfill_assignment_metadata(connection)?;
+    connection.pragma_update(None, "user_version", 6)?;
     Ok(())
 }
 
@@ -350,9 +464,10 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let attempts_schema = table_schema(connection, "attempts")?;
     let evidence_schema = table_schema(connection, "evidence")?;
     let results_schema = table_schema(connection, "results")?;
-    Ok(user_version < 5
+    Ok(user_version < 6
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
+        || !column_exists(connection, "commissions", "plan_json")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || results_schema.is_some_and(|schema| !schema.contains("'superseded'"))
@@ -360,8 +475,17 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
+        || !table_exists(connection, "commission_plans")?
+        || !table_exists(connection, "planned_assignments")?
+        || !table_exists(connection, "assignment_metadata")?
+        || !column_exists(connection, "assignment_metadata", "commission_id")?
+        || !table_exists(connection, "resource_reservations")?
+        || !column_exists(connection, "attempts", "started_at_ms")?
+        || !column_exists(connection, "attempts", "execution_completed_at_ms")?
         || criteria_schema.is_some_and(|schema| !schema.contains("required_evidence"))
-        || assignments_schema.is_some_and(|schema| !schema.contains("'verification_pending'"))
+        || assignments_schema.is_some_and(|schema| {
+            !schema.contains("'verification_pending'") || !schema.contains("'superseded'")
+        })
         || attempts_schema.is_some_and(|schema| !schema.contains("'failed'"))
         || evidence_schema.is_some_and(|schema| !schema.contains("verification_attempt_id"))
         || events_schema.is_some_and(|schema| {
@@ -369,6 +493,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
                 || !schema.contains("payload_json")
                 || !schema.contains("result_integrated")
                 || !schema.contains("commission_amended")
+                || !schema.contains("useful_concurrency_observed")
         }))
 }
 
@@ -376,7 +501,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v5", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v6", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -403,15 +528,23 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 5
+    if user_version != 6
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
+        || !column_exists(connection, "commissions", "plan_json")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || !table_exists(connection, "worker_leases")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
+        || !table_exists(connection, "commission_plans")?
+        || !table_exists(connection, "planned_assignments")?
+        || !table_exists(connection, "assignment_metadata")?
+        || !column_exists(connection, "assignment_metadata", "commission_id")?
+        || !table_exists(connection, "resource_reservations")?
+        || !column_exists(connection, "attempts", "started_at_ms")?
+        || !column_exists(connection, "attempts", "execution_completed_at_ms")?
     {
         return Err(TyrionError::InvalidRequest(
             "schema migration verification failed".into(),
@@ -439,6 +572,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !events_schema.contains("payload_json")
         || !events_schema.contains("result_integrated")
         || !events_schema.contains("commission_amended")
+        || !events_schema.contains("useful_concurrency_observed")
     {
         return Err(TyrionError::InvalidRequest(
             "events schema migration verification failed".into(),
@@ -447,6 +581,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     if !criteria_schema.contains("required_evidence")
         || !criteria_schema.contains("'prompt'")
         || !assignments_schema.contains("'verification_pending'")
+        || !assignments_schema.contains("'superseded'")
         || !attempts_schema.contains("'failed'")
         || !results_schema.contains("'superseded'")
         || !evidence_schema.contains("verification_attempt_id")
@@ -539,7 +674,7 @@ fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
     let Some(schema) = table_schema(connection, "assignments")? else {
         return Ok(());
     };
-    if schema.contains("'verification_pending'") {
+    if schema.contains("'verification_pending'") && schema.contains("'superseded'") {
         return Ok(());
     }
     connection.execute_batch(
@@ -551,10 +686,11 @@ fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
             commission_id TEXT NOT NULL REFERENCES commissions(id),
             plan_revision INTEGER NOT NULL,
             status TEXT NOT NULL CHECK (status IN (
-                'ready', 'running', 'accepted', 'verification_pending',
+                'ready', 'running', 'accepted', 'superseded', 'verification_pending',
                 'verification_failed', 'resource_blocked'
             )),
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            UNIQUE (id, commission_id)
         );
         INSERT INTO assignments_v5 SELECT * FROM assignments;
         DROP TABLE assignments;
@@ -591,6 +727,102 @@ fn upgrade_attempts(connection: &Connection) -> Result<(), TyrionError> {
         COMMIT;
         PRAGMA foreign_keys = ON;
         "#,
+    )?;
+    Ok(())
+}
+
+fn add_attempt_timing_columns(connection: &Connection) -> Result<(), TyrionError> {
+    if !column_exists(connection, "attempts", "started_at_ms")? {
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN started_at_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE attempts SET started_at_ms = started_at * 1000 WHERE started_at_ms = 0",
+            [],
+        )?;
+    }
+    if !column_exists(connection, "attempts", "completed_at_ms")? {
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN completed_at_ms INTEGER",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE attempts SET completed_at_ms = completed_at * 1000 WHERE completed_at IS NOT NULL",
+            [],
+        )?;
+    }
+    if !column_exists(connection, "attempts", "execution_completed_at_ms")? {
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN execution_completed_at_ms INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_assignment_metadata(connection: &Connection) -> Result<(), TyrionError> {
+    connection.execute(
+        "INSERT INTO assignment_metadata (
+            assignment_id, commission_id, logical_id, position, goal, purpose,
+            read_scopes_json, write_scopes_json,
+            concurrency_slots, max_storage_bytes, max_model_spend_cents,
+            max_paid_service_spend_cents, legacy
+         )
+         SELECT assignments.id, assignments.commission_id, assignments.id, 0,
+                commissions.goal, 'critical_path', '[]',
+                COALESCE((
+                    SELECT json_group_array(value) FROM authority_scopes
+                    WHERE authority_scopes.commission_id = assignments.commission_id
+                      AND scope_type = 'path'
+                ), '[]'),
+                1, resource_ceilings.max_storage_bytes,
+                resource_ceilings.max_model_spend_cents,
+                resource_ceilings.max_paid_service_spend_cents, 1
+         FROM assignments
+         JOIN commissions ON commissions.id = assignments.commission_id
+         JOIN resource_ceilings ON resource_ceilings.commission_id = assignments.commission_id
+         WHERE NOT EXISTS (
+             SELECT 1 FROM assignment_metadata
+             WHERE assignment_metadata.assignment_id = assignments.id
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn backfill_planned_assignments(connection: &Connection) -> Result<(), TyrionError> {
+    connection.execute(
+        "INSERT INTO planned_assignments (
+            commission_id, logical_id, position, goal, purpose,
+            read_scopes_json, write_scopes_json, concurrency_slots,
+            max_storage_bytes, max_model_spend_cents,
+            max_paid_service_spend_cents, created_plan_revision
+         )
+         SELECT assignments.commission_id, assignments.id, 0, commissions.goal,
+                'critical_path', '[]',
+                COALESCE((
+                    SELECT json_group_array(value) FROM authority_scopes
+                    WHERE authority_scopes.commission_id = assignments.commission_id
+                      AND scope_type = 'path'
+                ), '[]'),
+                1, resource_ceilings.max_storage_bytes,
+                resource_ceilings.max_model_spend_cents,
+                resource_ceilings.max_paid_service_spend_cents,
+                assignments.plan_revision
+         FROM assignments
+         JOIN commissions ON commissions.id = assignments.commission_id
+         JOIN resource_ceilings ON resource_ceilings.commission_id = assignments.commission_id
+         WHERE NOT EXISTS (
+             SELECT 1 FROM assignment_metadata
+             WHERE assignment_metadata.assignment_id = assignments.id
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM planned_assignments
+             WHERE planned_assignments.commission_id = assignments.commission_id
+               AND planned_assignments.logical_id = assignments.id
+         )",
+        [],
     )?;
     Ok(())
 }
@@ -668,6 +900,7 @@ fn upgrade_evidence(connection: &Connection) -> Result<(), TyrionError> {
 fn add_result_columns(connection: &Connection) -> Result<(), TyrionError> {
     let columns = [
         ("mandate_revision", "INTEGER"),
+        ("plan_revision", "INTEGER"),
         ("base_revision", "TEXT"),
         ("candidate_commits_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("changed_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -706,6 +939,7 @@ fn upgrade_results(connection: &Connection) -> Result<(), TyrionError> {
             status TEXT NOT NULL CHECK (status IN ('candidate', 'accepted', 'superseded')),
             created_at INTEGER NOT NULL,
             mandate_revision INTEGER,
+            plan_revision INTEGER,
             base_revision TEXT,
             candidate_commits_json TEXT NOT NULL DEFAULT '[]',
             changed_paths_json TEXT NOT NULL DEFAULT '[]',
@@ -714,7 +948,17 @@ fn upgrade_results(connection: &Connection) -> Result<(), TyrionError> {
             known_effects_json TEXT NOT NULL DEFAULT '[]',
             integrated_artifact_revision TEXT
         );
-        INSERT INTO results_v5 SELECT * FROM results;
+        INSERT INTO results_v5 (
+            id, attempt_id, output, artifact_revision, status, created_at,
+            mandate_revision, base_revision, candidate_commits_json,
+            changed_paths_json, artifacts_json, verification_outcomes_json,
+            known_effects_json, integrated_artifact_revision
+        )
+        SELECT id, attempt_id, output, artifact_revision, status, created_at,
+               mandate_revision, base_revision, candidate_commits_json,
+               changed_paths_json, artifacts_json, verification_outcomes_json,
+               known_effects_json, integrated_artifact_revision
+        FROM results;
         DROP TABLE results;
         ALTER TABLE results_v5 RENAME TO results;
         COMMIT;

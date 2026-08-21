@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +7,7 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,6 +17,7 @@ use super::{
     VerificationScope,
 };
 use crate::domain::EvidenceOutcome;
+use crate::error::IntegrationFailureKind;
 use crate::protocol::Verifier;
 use crate::TyrionError;
 
@@ -82,6 +84,8 @@ pub(super) struct GitCandidateState {
     candidate_bundle: PathBuf,
     base_revision: String,
     candidate_revision: String,
+    candidate_commits: Vec<String>,
+    read_only: bool,
 }
 
 pub(super) struct GitIntegrated {
@@ -92,6 +96,9 @@ pub(super) struct GitIntegrated {
 
 pub(super) struct GitIntegratedState {
     integrated_bundle: PathBuf,
+    integration_repository: PathBuf,
+    _integration_lock: File,
+    previous_revision: String,
 }
 
 impl ContainedCodexRuntime {
@@ -122,6 +129,13 @@ impl ContainedCodexRuntime {
         self.config.lease_ttl_seconds
     }
 
+    pub(super) fn integration_repository(&self, commission_id: &str) -> PathBuf {
+        self.data_dir
+            .join("integrations")
+            .join(commission_id)
+            .join("repository")
+    }
+
     pub(super) fn execute(
         &self,
         assignment: &AssignmentContext,
@@ -139,7 +153,14 @@ impl ContainedCodexRuntime {
         let base_bundle = artifact_dir.join("base.bundle");
         create_base_bundle(&repository, base_revision, &base_bundle)?;
         let base_artifact = artifact("base_git_bundle", &base_bundle)?;
-        enforce_storage_ceiling(&[&base_bundle], assignment.max_storage_bytes)?;
+        let mut input_bundles = vec![base_bundle.as_path()];
+        input_bundles.extend(
+            assignment
+                .comparison_candidates
+                .iter()
+                .map(|candidate| candidate.bundle_path.as_path()),
+        );
+        enforce_storage_ceiling(&input_bundles, assignment.max_storage_bytes)?;
 
         let sandbox_name = sandbox_name("attempt", &assignment.attempt_id);
         let sandbox = Sandbox::create(self, &sandbox_name, assignment.lease_expires_at)?;
@@ -149,6 +170,13 @@ impl ContainedCodexRuntime {
             "/sandbox/base.bundle",
             assignment.lease_expires_at,
         )?;
+        for (index, contender) in assignment.comparison_candidates.iter().enumerate() {
+            sandbox.upload(
+                &contender.bundle_path,
+                &format!("/sandbox/contenders/{index}.bundle"),
+                assignment.lease_expires_at,
+            )?;
+        }
         sandbox.upload(
             &self.config.codex_binary,
             "/sandbox/codex",
@@ -186,7 +214,11 @@ impl ContainedCodexRuntime {
         let attempt_script_path = artifact_dir.join("run-attempt.sh");
         fs::write(
             &attempt_script_path,
-            attempt_script(base_revision, &self.config.model),
+            attempt_script(
+                base_revision,
+                &self.config.model,
+                assignment.declared_write_scopes.is_empty(),
+            ),
         )?;
         fs::set_permissions(&attempt_script_path, fs::Permissions::from_mode(0o700))?;
         sandbox.upload(
@@ -215,16 +247,21 @@ impl ContainedCodexRuntime {
         sandbox.delete()?;
 
         let candidate_artifact = artifact("candidate_git_bundle", &candidate_bundle)?;
-        enforce_storage_ceiling(
-            &[&base_bundle, &candidate_bundle],
-            assignment.max_storage_bytes,
-        )?;
+        let mut stored_bundles = vec![base_bundle.as_path(), candidate_bundle.as_path()];
+        stored_bundles.extend(
+            assignment
+                .comparison_candidates
+                .iter()
+                .map(|candidate| candidate.bundle_path.as_path()),
+        );
+        enforce_storage_ceiling(&stored_bundles, assignment.max_storage_bytes)?;
         let validated = validate_candidate_bundle(
             &artifact_dir,
             &base_bundle,
             &candidate_bundle,
             base_revision,
             &assignment.authorized_paths,
+            assignment.declared_write_scopes.is_empty(),
         )?;
         let codex_result: Value = serde_json::from_slice(&fs::read(result_path)?)?;
         let output = codex_result
@@ -262,7 +299,7 @@ impl ContainedCodexRuntime {
         Ok(GitCandidate {
             output,
             candidate_revision: validated.candidate_revision.clone(),
-            candidate_commits: validated.commits,
+            candidate_commits: validated.commits.clone(),
             changed_paths: validated.changed_paths,
             artifacts: vec![base_artifact, candidate_artifact],
             known_effects,
@@ -271,6 +308,8 @@ impl ContainedCodexRuntime {
                 candidate_bundle,
                 base_revision: base_revision.to_owned(),
                 candidate_revision: validated.candidate_revision,
+                candidate_commits: validated.commits,
+                read_only: assignment.declared_write_scopes.is_empty(),
             },
         })
     }
@@ -300,6 +339,15 @@ impl ContainedCodexRuntime {
             .join("integrations")
             .join(&assignment.commission_id);
         create_private_dir(&integration_root)?;
+        let integration_lock_path = integration_root.join("integration.lock");
+        let integration_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&integration_lock_path)?;
+        fs::set_permissions(&integration_lock_path, fs::Permissions::from_mode(0o600))?;
+        integration_lock.lock_exclusive()?;
         let repository = integration_root.join("repository");
         if !repository.exists() {
             git_checked(
@@ -322,34 +370,62 @@ impl ContainedCodexRuntime {
             )?;
         }
         let current = git_text(&repository, &[os("rev-parse"), os("HEAD")])?;
-        if current.trim() != candidate.base_revision {
-            return Err(TyrionError::InvalidRequest(format!(
-                "integration base is {}, but Result requires {}",
-                current.trim(),
-                candidate.base_revision
-            )));
-        }
-        git_checked(
+        let previous_revision = current.trim().to_owned();
+        let base_is_ancestor = git_output(
             Some(&repository),
             &[
-                os("fetch"),
-                os("--quiet"),
-                candidate.candidate_bundle.as_os_str().to_owned(),
-                os("refs/heads/tyrion-result:refs/heads/tyrion-candidate"),
+                os("merge-base"),
+                os("--is-ancestor"),
+                os(&candidate.base_revision),
+                os(&previous_revision),
             ],
         )?;
-        git_checked(
-            Some(&repository),
-            &[os("merge"), os("--ff-only"), os("tyrion-candidate")],
-        )?;
+        if !base_is_ancestor.status.success() {
+            return Err(TyrionError::IntegrationFailure {
+                kind: IntegrationFailureKind::StaleBase,
+                message: format!(
+                    "authoritative Integration is {previous_revision}, but the Result base {} is not its ancestor",
+                    candidate.base_revision
+                ),
+            });
+        }
+        if !candidate.read_only {
+            git_checked(
+                Some(&repository),
+                &[
+                    os("fetch"),
+                    os("--quiet"),
+                    candidate.candidate_bundle.as_os_str().to_owned(),
+                    os("+refs/heads/tyrion-result:refs/heads/tyrion-candidate"),
+                ],
+            )?;
+            if previous_revision == candidate.base_revision {
+                git_checked(
+                    Some(&repository),
+                    &[os("merge"), os("--ff-only"), os("tyrion-candidate")],
+                )?;
+            } else {
+                for commit in &candidate.candidate_commits {
+                    let cherry_pick = git_output(
+                        Some(&repository),
+                        &[os("cherry-pick"), os("--no-edit"), os(commit)],
+                    )?;
+                    if !cherry_pick.status.success() {
+                        let _ = git_output(Some(&repository), &[os("cherry-pick"), os("--abort")]);
+                        return Err(TyrionError::IntegrationFailure {
+                            kind: IntegrationFailureKind::Conflict,
+                            message: format!(
+                                "candidate commit {commit} conflicts with authoritative revision {previous_revision}: {}",
+                                String::from_utf8_lossy(&cherry_pick.stderr).trim()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         let integrated_revision = git_text(&repository, &[os("rev-parse"), os("HEAD")])?
             .trim()
             .to_owned();
-        if integrated_revision != candidate.candidate_revision {
-            return Err(TyrionError::InvalidRequest(
-                "integrated revision does not match the accepted candidate".into(),
-            ));
-        }
         git_checked(
             Some(&repository),
             &[os("branch"), os("-f"), os("tyrion-integration"), os("HEAD")],
@@ -388,7 +464,12 @@ impl ContainedCodexRuntime {
         Ok(GitIntegrated {
             integrated_revision,
             artifacts: vec![integrated_artifact],
-            state: GitIntegratedState { integrated_bundle },
+            state: GitIntegratedState {
+                integrated_bundle,
+                integration_repository: repository,
+                _integration_lock: integration_lock,
+                previous_revision,
+            },
         })
     }
 
@@ -408,6 +489,26 @@ impl ContainedCodexRuntime {
             &integrated.integrated_bundle,
             &revision,
         )
+    }
+
+    pub(super) fn rollback_integration(
+        &self,
+        integrated: &GitIntegratedState,
+    ) -> Result<(), TyrionError> {
+        git_checked(
+            Some(&integrated.integration_repository),
+            &[os("reset"), os("--hard"), os(&integrated.previous_revision)],
+        )?;
+        git_checked(
+            Some(&integrated.integration_repository),
+            &[
+                os("branch"),
+                os("-f"),
+                os("tyrion-integration"),
+                os(&integrated.previous_revision),
+            ],
+        )?;
+        Ok(())
     }
 
     fn verify_bundles(
@@ -870,6 +971,7 @@ fn validate_candidate_bundle(
     candidate_bundle: &Path,
     base_revision: &str,
     authorized_paths: &[String],
+    allow_empty_changes: bool,
 ) -> Result<ValidatedCandidate, TyrionError> {
     let quarantine = artifact_dir.join("quarantine");
     git_checked(
@@ -963,7 +1065,7 @@ fn validate_candidate_bundle(
             "Codex Result contains no candidate commits".into(),
         ));
     }
-    if changed_paths.is_empty() {
+    if changed_paths.is_empty() && !allow_empty_changes {
         return Err(TyrionError::InvalidRequest(
             "Codex Result contains no changed paths".into(),
         ));
@@ -989,7 +1091,7 @@ fn validate_candidate_bundle(
     })
 }
 
-fn attempt_script(base_revision: &str, model: &str) -> String {
+fn attempt_script(base_revision: &str, model: &str, allow_empty_changes: bool) -> String {
     let auth_setup = r#": "${CODEX_AUTH_ACCESS_TOKEN:?missing brokered Codex access placeholder}"
 : "${CODEX_AUTH_REFRESH_TOKEN:?missing brokered Codex refresh placeholder}"
 : "${CODEX_AUTH_ACCOUNT_ID:?missing brokered Codex account placeholder}"
@@ -1018,6 +1120,11 @@ AUTH
 chmod 600 "$root/home/.codex/auth.json"
 codex_auth_env="CODEX_AUTH_ACCESS_TOKEN=$CODEX_AUTH_ACCESS_TOKEN CODEX_AUTH_REFRESH_TOKEN=$CODEX_AUTH_REFRESH_TOKEN CODEX_AUTH_ACCOUNT_ID=$CODEX_AUTH_ACCOUNT_ID CODEX_AUTH_ID_TOKEN=$CODEX_AUTH_ID_TOKEN"
 "#;
+    let empty_change_action = if allow_empty_changes {
+        "git -C \"$root/repository\" commit --allow-empty -qm 'test: record read-only assignment'"
+    } else {
+        "echo 'Codex produced no changes' >&2\n  exit 41"
+    };
     format!(
         r#"#!/bin/sh
 set -eu
@@ -1040,13 +1147,13 @@ env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/hom
   <"$root/prompt.txt" >"$root/codex-events.jsonl"
 git -C "$root/repository" add -A
 if git -C "$root/repository" diff --cached --quiet; then
-  echo 'Codex produced no changes' >&2
-  exit 41
+  {empty_change_action}
+else
+  env -i PATH=/usr/local/bin:/usr/bin:/bin \
+    GIT_AUTHOR_NAME=Tyrion GIT_AUTHOR_EMAIL=worker@tyrion.invalid \
+    GIT_COMMITTER_NAME=Tyrion GIT_COMMITTER_EMAIL=worker@tyrion.invalid \
+    git -C "$root/repository" commit -qm 'feat: implement assignment'
 fi
-env -i PATH=/usr/local/bin:/usr/bin:/bin \
-  GIT_AUTHOR_NAME=Tyrion GIT_AUTHOR_EMAIL=worker@tyrion.invalid \
-  GIT_COMMITTER_NAME=Tyrion GIT_COMMITTER_EMAIL=worker@tyrion.invalid \
-  git -C "$root/repository" commit -qm 'feat: implement assignment'
 git -C "$root/repository" branch -f tyrion-result HEAD
 git -C "$root/repository" bundle create "$root/candidate.bundle" \
   refs/heads/tyrion-result ^{base}
@@ -1055,16 +1162,35 @@ sync
         base = shell_quote(base_revision),
         model = shell_quote(model),
         auth_setup = auth_setup,
+        empty_change_action = empty_change_action,
     )
 }
 
 fn worker_prompt(assignment: &AssignmentContext, base_revision: &str) -> String {
+    let comparison_candidates = assignment
+        .comparison_candidates
+        .iter()
+        .enumerate()
+        .map(|(index, contender)| {
+            serde_json::json!({
+                "result_id": contender.result_id,
+                "artifact_revision": contender.artifact_revision,
+                "summary": contender.summary,
+                "changed_paths": contender.changed_paths,
+                "verification_outcomes": contender.verification_outcomes,
+                "bundle": format!("/sandbox/contenders/{index}.bundle"),
+            })
+        })
+        .collect::<Vec<_>>();
     format!(
-        "Implement this Assignment in the current Git repository.\n\nGoal: {}\n\nMandate revision: {}\nImmutable base: {}\nAllowed changed paths: {}\n\nDo not use credentials or perform external effects. The authorized repository edit is the Result artifact, not an external effect, so known_effects must be an empty array. Return only the required structured final response.",
+        "Implement this Assignment in the current Git repository.\n\nGoal: {}\n\nMandate revision: {}\nPlan revision: {}\nImmutable base: {}\nAllowed changed paths: {}\nCompeting candidate bundles and Evidence: {}\n\nWhen candidate bundles are present, inspect each Git bundle and apply the declared comparison rule before editing. Do not use credentials or perform external effects. The authorized repository edit is the Result artifact, not an external effect, so known_effects must be an empty array. Return only the required structured final response.",
         assignment.goal,
         assignment.mandate_revision,
+        assignment.plan_revision,
         base_revision,
-        assignment.authorized_paths.join(", ")
+        assignment.declared_write_scopes.join(", "),
+        serde_json::to_string(&comparison_candidates)
+            .expect("comparison candidate metadata is serializable"),
     )
 }
 
@@ -1314,7 +1440,11 @@ mod tests {
 
     #[test]
     fn codex_receives_only_the_brokered_network_environment() {
-        let script = attempt_script("0123456789012345678901234567890123456789", "test-model");
+        let script = attempt_script(
+            "0123456789012345678901234567890123456789",
+            "test-model",
+            false,
+        );
         for required in [
             "HTTP_PROXY=\"${HTTP_PROXY:-}\"",
             "HTTPS_PROXY=\"${HTTPS_PROXY:-}\"",
@@ -1331,7 +1461,11 @@ mod tests {
 
     #[test]
     fn codex_auth_file_is_locally_parseable_without_raw_credentials() {
-        let script = attempt_script("0123456789012345678901234567890123456789", "test-model");
+        let script = attempt_script(
+            "0123456789012345678901234567890123456789",
+            "test-model",
+            false,
+        );
         let auth_file = script
             .split("cat >\"$root/home/.codex/auth.json\" <<AUTH\n")
             .nth(1)

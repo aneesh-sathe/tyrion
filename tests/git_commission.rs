@@ -207,6 +207,702 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
 }
 
 #[test]
+fn disjoint_useful_assignments_run_concurrently_and_complete_the_assembled_artifact() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let fake_state = temp.path().join("fake-openshell");
+    fs::create_dir(&fake_state).unwrap();
+    let fake_openshell = write_executable(
+        &temp.path().join("openshell"),
+        include_str!("fixtures/fake_openshell.sh"),
+    );
+    let fake_codex = write_executable(
+        &temp.path().join("codex"),
+        include_str!("fixtures/fake_codex.sh"),
+    );
+    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("parallel-proposal.json");
+    write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+
+    let started = Instant::now();
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+
+    let elapsed_millis = started.elapsed().as_millis() as u64;
+    let serial_attempt_millis = completed["activity_journal"]["useful_concurrency"]
+        ["serial_attempt_millis"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        elapsed_millis < serial_attempt_millis,
+        "parallel end-to-end time {elapsed_millis}ms did not beat the {serial_attempt_millis}ms serial Attempt time"
+    );
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    assert_eq!(completed["assignments"].as_array().unwrap().len(), 2);
+    assert!(completed["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|assignment| assignment["status"] == "accepted"));
+    assert_eq!(completed["results"].as_array().unwrap().len(), 2);
+    assert!(completed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["status"] == "accepted"));
+    assert!(completed["criteria"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|criterion| criterion["status"] == "passed"));
+    assert!(completed["plans"].as_array().unwrap().len() >= 2);
+    assert!(
+        completed["activity_journal"]["useful_concurrency"]["overlap_millis"]
+            .as_u64()
+            .is_some_and(|overlap| overlap > 0)
+    );
+    assert!(completed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["type"] == "useful_concurrency_observed"));
+    let concurrency = &completed["activity_journal"]["useful_concurrency"];
+    assert!(concurrency["serial_execution_millis"].as_u64().unwrap() > 0);
+    assert!(
+        concurrency["parallel_execution_window_millis"]
+            .as_u64()
+            .unwrap()
+            < concurrency["serial_execution_millis"].as_u64().unwrap()
+    );
+    assert!(concurrency["end_to_end_elapsed_millis"].as_u64().unwrap() > 0);
+    let reservations = completed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "resources_reserved")
+        .collect::<Vec<_>>();
+    assert_eq!(reservations.len(), 2);
+    assert!(reservations
+        .iter()
+        .all(|event| event["payload"]["reserved_atomically"] == true));
+}
+
+#[test]
+fn concurrent_read_only_assignments_verify_without_mutating_the_artifact() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("read-only-proposal.json");
+    write_parallel_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    for (position, assignment) in proposal["plan"]["assignments"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        assignment["goal"] = json!(format!(
+            "TYRION_FIXTURE_READ_ONLY=1 TYRION_FIXTURE_DELAY=1 inspect README pass {}",
+            position + 1
+        ));
+        assignment["purpose"] = json!("independent_verification");
+        assignment["read_scopes"] = json!(["README.md"]);
+        assignment["write_scopes"] = json!([]);
+    }
+    for criterion in proposal["criteria"].as_array_mut().unwrap() {
+        criterion["verifier"]["argv"] = json!(["sh", "-c", "test -f README.md"]);
+    }
+    proposal["authority"]["paths"] = json!(["README.md"]);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+
+    assert_eq!(
+        completed["commission"]["artifact_revision"],
+        fixture.base_revision
+    );
+    assert!(completed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["changed_paths"] == json!([])));
+    assert_eq!(
+        completed["activity_journal"]["useful_concurrency"]["occurred"],
+        true
+    );
+}
+
+#[test]
+fn planned_spend_reservations_cannot_exceed_the_commission_ceiling() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("oversubscribed-spend.json");
+    write_parallel_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(10);
+    proposal["plan"]["assignments"][0]["resources"]["max_model_spend_cents"] = json!(6);
+    proposal["plan"]["assignments"][1]["resources"]["max_model_spend_cents"] = json!(6);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args(["--socket", path_text(&daemon.socket_path)])
+        .args([
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "reject-oversubscribed-spend",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cumulative model spend"));
+}
+
+#[test]
+fn competition_members_must_share_one_dependency_frontier() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture
+        .temp
+        .path()
+        .join("invalid-competition-frontier.json");
+    write_competing_conflict_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["plan"]["assignments"][1]["dependencies"] = json!(["backend"]);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args(["--socket", path_text(&daemon.socket_path)])
+        .args([
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "reject-invalid-competition-frontier",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("share one dependency frontier"));
+}
+
+#[test]
+fn comparison_working_set_must_fit_the_commission_storage_ceiling() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("under-resourced-comparison.json");
+    write_competing_conflict_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["resource_ceilings"]["max_storage_bytes"] = json!(10_485_760);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args(["--socket", path_text(&daemon.socket_path)])
+        .args([
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "reject-under-resourced-comparison",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("comparison working set"));
+}
+
+#[test]
+fn declared_overlapping_writes_serialize_against_the_latest_integrated_revision() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("serialized-proposal.json");
+    write_overlapping_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+        false,
+    );
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let created = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "create-serialized-commission",
+        ],
+    );
+    let commission_id = created["commission"]["id"].as_str().unwrap();
+    let accepted = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "commission",
+            "accept",
+            commission_id,
+            "--expected-revision",
+            "0",
+            "--idempotency-key",
+            "accept-serialized-commission",
+        ],
+    );
+    assert_eq!(accepted["execution_frontier"].as_array().unwrap().len(), 1);
+    assert_eq!(accepted["frontier_holds"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        accepted["frontier_holds"][0]["reason"],
+        "declared_write_overlap"
+    );
+
+    let completed = wait_for_completion(&daemon, &attachment_token, commission_id);
+    let attempts = completed["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts[0]["completed_at_ms"].as_i64().unwrap()
+            <= attempts[1]["started_at_ms"].as_i64().unwrap(),
+        "declared overlapping writes ran concurrently: {attempts:?}"
+    );
+    assert_eq!(
+        completed["activity_journal"]["useful_concurrency"]["occurred"],
+        false
+    );
+    assert!(completed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["status"] == "accepted"));
+}
+
+#[test]
+fn unexpected_scope_overlap_creates_an_explicit_reconciliation_assignment() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("unexpected-overlap.json");
+    write_parallel_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["plan"]["assignments"][0]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=unexpected TYRION_FIXTURE_DELAY=1"
+    );
+    proposal["criteria"][0]["verifier"]["argv"] = json!(["sh", "-c", "test -f frontend.txt"]);
+    proposal["criteria"][1]["verifier"]["argv"] = json!(["sh", "-c", "test -f frontend.txt"]);
+    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(10);
+    proposal["resource_ceilings"]["max_paid_service_spend_cents"] = json!(10);
+    for assignment in proposal["plan"]["assignments"].as_array_mut().unwrap() {
+        assignment["resources"]["max_model_spend_cents"] = json!(3);
+        assignment["resources"]["max_paid_service_spend_cents"] = json!(2);
+    }
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let reconciled = wait_for_reconciliation(&daemon, &attachment_token, &commission_id);
+    assert_eq!(reconciled["commission"]["status"], "active");
+    let reconciliation = reconciled["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assignment| assignment["purpose"] == "reconciliation")
+        .expect("an explicit reconciliation Assignment should exist");
+    assert_ne!(reconciliation["status"], "resource_blocked");
+    assert_eq!(
+        reconciliation["resources"],
+        json!({
+            "concurrency_slots": 1,
+            "max_storage_bytes": 10_485_760,
+            "max_model_spend_cents": 3,
+            "max_paid_service_spend_cents": 2,
+        })
+    );
+    let event = reconciled["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "reconciliation_required")
+        .unwrap();
+    assert_eq!(event["payload"]["kind"], "unexpected_overlap");
+    assert_eq!(event["payload"]["silent_winner_selected"], false);
+    assert!(reconciled["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| result["status"] == "candidate"
+            && result["integrated_artifact_revision"].is_null()));
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(
+        completed["activity_journal"]["useful_concurrency"]["occurred"],
+        false
+    );
+}
+
+#[test]
+fn competing_writes_record_their_question_and_reconcile_an_integration_conflict() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("competing-conflict.json");
+    write_competing_conflict_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let reconciled = wait_for_reconciliation(&daemon, &attachment_token, &commission_id);
+    let competing = reconciled["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|assignment| {
+            assignment["competition"].is_object() && assignment["purpose"] != "reconciliation"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(competing.len(), 2);
+    assert!(competing.iter().all(|assignment| {
+        assignment["competition"]["uncertainty"] == "which implementation should own shared.txt"
+            && assignment["competition"]["comparison_rule"]
+                == "prefer the candidate that preserves assembled verification"
+    }));
+    let event = reconciled["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "reconciliation_required")
+        .unwrap();
+    assert_eq!(event["payload"]["kind"], "competition_comparison");
+    assert_eq!(event["payload"]["silent_winner_selected"], false);
+    assert_eq!(
+        reconciled["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|result| result["status"] == "accepted")
+            .count(),
+        0
+    );
+    let reconciliation = reconciled["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assignment| assignment["purpose"] == "reconciliation")
+        .unwrap();
+    assert_ne!(reconciliation["status"], "resource_blocked");
+    assert_eq!(reconciliation["resources"]["max_storage_bytes"], 15_728_640);
+
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    assert_eq!(
+        completed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|result| result["status"] == "accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        completed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|result| result["status"] == "superseded")
+            .count(),
+        2
+    );
+    let log = fs::read_to_string(fixture.fake_state.join("commands.log")).unwrap();
+    assert!(log.matches("/sandbox/contenders/").count() >= 2);
+    assert_eq!(
+        completed["activity_journal"]["useful_concurrency"]["occurred"],
+        true
+    );
+}
+
+#[test]
+fn comparison_plan_snapshot_respects_active_resource_reservations() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("held-comparison.json");
+    write_competing_conflict_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["criteria"].as_array_mut().unwrap().push(json!({
+        "id": "other-file",
+        "description": "The assembled repository contains unrelated work",
+        "required_evidence": "command_output",
+        "verifier_type": "deterministic",
+        "verification_depth": "standard",
+        "verifier": {
+            "kind": "command",
+            "argv": ["sh", "-c", "test -f other.txt"]
+        }
+    }));
+    proposal["plan"]["assignments"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "other",
+            "goal": "TYRION_FIXTURE_WRITE=other.txt TYRION_FIXTURE_CONTENT=other TYRION_FIXTURE_DELAY=5",
+            "dependencies": [],
+            "criterion_ids": ["other-file"],
+            "purpose": "critical_path",
+            "read_scopes": [],
+            "write_scopes": ["other.txt"],
+            "resources": {
+                "concurrency_slots": 1,
+                "max_storage_bytes": 5_242_880,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0
+            }
+        }));
+    proposal["authority"]["paths"] = json!(["shared.txt", "other.txt"]);
+    proposal["resource_ceilings"]["max_attempts"] = json!(4);
+    proposal["resource_ceilings"]["max_worker_concurrency"] = json!(3);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let reconciled = wait_for_reconciliation(&daemon, &attachment_token, &commission_id);
+    let comparison = reconciled["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assignment| assignment["purpose"] == "reconciliation")
+        .unwrap();
+    let latest_plan = reconciled["plans"].as_array().unwrap().last().unwrap();
+    assert!(latest_plan["snapshot"]["execution_frontier"]
+        .as_array()
+        .is_some_and(|frontier| !frontier.iter().any(|id| id == &comparison["logical_id"])));
+    assert!(reconciled["frontier_holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hold| hold["logical_id"] == comparison["logical_id"]
+            && hold["reason"] == "complete_resource_budget_unavailable"));
+}
+
+#[test]
+fn assembled_state_regression_rolls_back_before_reconciliation() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("integrated-regression.json");
+    write_overlapping_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+        false,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["plan"]["assignments"][1]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=shared/frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELETE=shared/backend.txt TYRION_FIXTURE_DELAY=1"
+    );
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let reconciled = wait_for_reconciliation(&daemon, &attachment_token, &commission_id);
+    let event = reconciled["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "reconciliation_required")
+        .unwrap();
+    assert_eq!(event["payload"]["kind"], "integrated_regression");
+    let accepted_revision = reconciled["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["status"] == "accepted")
+        .unwrap()["integrated_artifact_revision"]
+        .clone();
+    assert_eq!(
+        reconciled["commission"]["artifact_revision"],
+        accepted_revision
+    );
+    assert!(reconciled["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| result["status"] == "candidate"
+            && result["integrated_artifact_revision"].is_null()));
+    let regressed_result_id = event["payload"]["source_result_id"].as_str().unwrap();
+    let regressed_result = reconciled["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["id"] == regressed_result_id)
+        .unwrap();
+    assert!(regressed_result["verification_outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|outcome| outcome["scope"] == "integrated" && outcome["outcome"] == "failed"));
+    assert!(reconciled["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|evidence| evidence["result_id"] == regressed_result_id
+            && evidence["scope"] == "integrated"
+            && evidence["outcome"] == "failed"));
+}
+
+#[test]
+fn evidence_revision_exposes_a_new_dependency_satisfied_frontier() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("incremental-plan.json");
+    write_incremental_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["plans"][0]["source"], "entry_model");
+    assert_eq!(
+        completed["plans"][0]["snapshot"]["assignments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let assembly = completed["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assignment| assignment["logical_id"] == "assembly")
+        .unwrap();
+    assert!(assembly["plan_revision"].as_i64().unwrap() > 1);
+    assert!(completed["plans"].as_array().unwrap().iter().any(|plan| {
+        plan["snapshot"]["execution_frontier"]
+            .as_array()
+            .is_some_and(|frontier| frontier.iter().any(|id| id == "assembly"))
+    }));
+    let assembly_attempt = completed["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["assignment_id"] == assembly["id"])
+        .unwrap();
+    let final_concurrency_event = completed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "useful_concurrency_observed")
+        .next_back()
+        .unwrap();
+    assert_eq!(
+        final_concurrency_event["payload"]["trigger_attempt_id"],
+        assembly_attempt["id"]
+    );
+}
+
+#[test]
+fn evolving_plan_snapshot_excludes_work_held_by_a_running_overlap() {
+    let fixture = ParallelFixture::new();
+    let proposal_path = fixture.temp.path().join("held-incremental-plan.json");
+    write_incremental_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["plan"]["assignments"][1]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=5"
+    );
+    proposal["plan"]["assignments"][2]["dependencies"] = json!(["backend"]);
+    proposal["plan"]["assignments"][2]["write_scopes"] = json!(["frontend.txt"]);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let inspected = wait_for_frontier_hold(&daemon, &attachment_token, &commission_id, "assembly");
+    let latest_plan = inspected["plans"].as_array().unwrap().last().unwrap();
+    assert!(
+        latest_plan["snapshot"]["execution_frontier"]
+            .as_array()
+            .is_some_and(|frontier| !frontier.iter().any(|id| id == "assembly")),
+        "held Assignment leaked into plan frontier: {latest_plan}"
+    );
+}
+
+#[test]
 fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
@@ -478,6 +1174,44 @@ struct FailedFixture {
     proposal_path: PathBuf,
 }
 
+struct ParallelFixture {
+    temp: TempDir,
+    principal_checkout: PathBuf,
+    base_revision: String,
+    fake_state: PathBuf,
+    runtime: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl ParallelFixture {
+    fn new() -> Self {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let principal_checkout = temp.path().join("principal-checkout");
+        let base_revision = create_principal_repository(&principal_checkout);
+        let fake_state = temp.path().join("fake-openshell");
+        fs::create_dir(&fake_state).unwrap();
+        let fake_openshell = write_executable(
+            &temp.path().join("openshell"),
+            include_str!("fixtures/fake_openshell.sh"),
+        );
+        let fake_codex = write_executable(
+            &temp.path().join("codex"),
+            include_str!("fixtures/fake_codex.sh"),
+        );
+        let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+        let data_dir = temp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        Self {
+            temp,
+            principal_checkout,
+            base_revision,
+            fake_state,
+            runtime,
+            data_dir,
+        }
+    }
+}
+
 impl FailedFixture {
     fn new(marker: &str) -> Self {
         let temp = TempDir::new().expect("temporary directory should be created");
@@ -569,6 +1303,192 @@ fn write_git_proposal(path: &Path, principal_checkout: &Path, base_revision: &st
         .unwrap(),
     )
     .unwrap();
+}
+
+fn write_parallel_git_proposal(path: &Path, principal_checkout: &Path, base_revision: &str) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "goal": "Add independently implemented backend and frontend artifacts.",
+            "execution": {
+                "kind": "codex_git",
+                "repository": principal_checkout,
+                "base_revision": base_revision,
+            },
+            "criteria": [
+                {
+                    "id": "backend-file",
+                    "description": "The assembled repository contains the backend artifact",
+                    "required_evidence": "command_output",
+                    "verifier_type": "deterministic",
+                    "verification_depth": "standard",
+                    "verifier": {
+                        "kind": "command",
+                        "argv": ["sh", "-c", "test \"$(cat backend.txt)\" = backend"]
+                    }
+                },
+                {
+                    "id": "frontend-file",
+                    "description": "The assembled repository contains the frontend artifact",
+                    "required_evidence": "command_output",
+                    "verifier_type": "deterministic",
+                    "verification_depth": "standard",
+                    "verifier": {
+                        "kind": "command",
+                        "argv": ["sh", "-c", "test \"$(cat frontend.txt)\" = frontend"]
+                    }
+                }
+            ],
+            "plan": {
+                "assignments": [
+                    {
+                        "id": "backend",
+                        "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+                        "dependencies": [],
+                        "criterion_ids": ["backend-file"],
+                        "purpose": "critical_path",
+                        "read_scopes": [],
+                        "write_scopes": ["backend.txt"],
+                        "resources": {
+                            "concurrency_slots": 1,
+                            "max_storage_bytes": 5242880,
+                            "max_model_spend_cents": 0,
+                            "max_paid_service_spend_cents": 0
+                        }
+                    },
+                    {
+                        "id": "frontend",
+                        "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+                        "dependencies": [],
+                        "criterion_ids": ["frontend-file"],
+                        "purpose": "critical_path",
+                        "read_scopes": [],
+                        "write_scopes": ["frontend.txt"],
+                        "resources": {
+                            "concurrency_slots": 1,
+                            "max_storage_bytes": 5242880,
+                            "max_model_spend_cents": 0,
+                            "max_paid_service_spend_cents": 0
+                        }
+                    }
+                ]
+            },
+            "authority": {
+                "repositories": [principal_checkout],
+                "paths": ["backend.txt", "frontend.txt"],
+                "actions": ["codex.git_change"],
+                "destinations": [],
+                "effects": []
+            },
+            "resource_ceilings": {
+                "max_attempts": 3,
+                "max_elapsed_seconds": 30,
+                "max_worker_concurrency": 2,
+                "max_storage_bytes": 10485760,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0
+            },
+            "known_uncertainties": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_overlapping_git_proposal(
+    path: &Path,
+    principal_checkout: &Path,
+    base_revision: &str,
+    competing: bool,
+) {
+    write_parallel_git_proposal(path, principal_checkout, base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    proposal["plan"]["assignments"][0]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=shared/backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1"
+    );
+    proposal["plan"]["assignments"][1]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=shared/frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1"
+    );
+    proposal["plan"]["assignments"][0]["write_scopes"] = json!(["shared"]);
+    proposal["plan"]["assignments"][1]["write_scopes"] = json!(["shared"]);
+    proposal["criteria"][0]["verifier"]["argv"] =
+        json!(["sh", "-c", "test \"$(cat shared/backend.txt)\" = backend"]);
+    proposal["criteria"][1]["verifier"]["argv"] =
+        json!(["sh", "-c", "test \"$(cat shared/frontend.txt)\" = frontend"]);
+    proposal["authority"]["paths"] = json!(["shared"]);
+    if competing {
+        let comparison = json!({
+            "group": "shared-implementation",
+            "uncertainty": "which isolated implementation best preserves the shared contract",
+            "comparison_rule": "prefer the candidate whose assembled verification passes all contract checks"
+        });
+        proposal["plan"]["assignments"][0]["competition"] = comparison.clone();
+        proposal["plan"]["assignments"][1]["competition"] = comparison;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+}
+
+fn write_competing_conflict_proposal(path: &Path, principal_checkout: &Path, base_revision: &str) {
+    write_parallel_git_proposal(path, principal_checkout, base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    proposal["plan"]["assignments"][0]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=shared.txt TYRION_FIXTURE_CONTENT=first TYRION_FIXTURE_DELAY=1"
+    );
+    proposal["plan"]["assignments"][1]["goal"] = json!(
+        "TYRION_FIXTURE_WRITE=shared.txt TYRION_FIXTURE_CONTENT=second TYRION_FIXTURE_DELAY=1"
+    );
+    proposal["plan"]["assignments"][0]["write_scopes"] = json!(["shared.txt"]);
+    proposal["plan"]["assignments"][1]["write_scopes"] = json!(["shared.txt"]);
+    let competition = json!({
+        "group": "shared-owner",
+        "uncertainty": "which implementation should own shared.txt",
+        "comparison_rule": "prefer the candidate that preserves assembled verification"
+    });
+    proposal["plan"]["assignments"][0]["competition"] = competition.clone();
+    proposal["plan"]["assignments"][1]["competition"] = competition;
+    proposal["criteria"][0]["verifier"]["argv"] = json!(["sh", "-c", "test -f shared.txt"]);
+    proposal["criteria"][1]["verifier"]["argv"] = json!(["sh", "-c", "test -f shared.txt"]);
+    proposal["authority"]["paths"] = json!(["shared.txt"]);
+    proposal["resource_ceilings"]["max_attempts"] = json!(3);
+    proposal["resource_ceilings"]["max_storage_bytes"] = json!(15_728_640);
+    fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+}
+
+fn write_incremental_git_proposal(path: &Path, principal_checkout: &Path, base_revision: &str) {
+    write_parallel_git_proposal(path, principal_checkout, base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    proposal["criteria"].as_array_mut().unwrap().push(json!({
+        "id": "assembly-file",
+        "description": "The assembled repository records final assembly",
+        "required_evidence": "command_output",
+        "verifier_type": "deterministic",
+        "verification_depth": "standard",
+        "verifier": {
+            "kind": "command",
+            "argv": ["sh", "-c", "test \"$(cat assembly.txt)\" = assembled"]
+        }
+    }));
+    proposal["plan"]["assignments"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "assembly",
+            "goal": "TYRION_FIXTURE_WRITE=assembly.txt TYRION_FIXTURE_CONTENT=assembled",
+            "dependencies": ["backend", "frontend"],
+            "criterion_ids": ["assembly-file"],
+            "purpose": "critical_path",
+            "read_scopes": ["backend.txt", "frontend.txt"],
+            "write_scopes": ["assembly.txt"],
+            "resources": {
+                "concurrency_slots": 1,
+                "max_storage_bytes": 5242880,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0
+            }
+        }));
+    proposal["authority"]["paths"] = json!(["backend.txt", "frontend.txt", "assembly.txt"]);
+    proposal["resource_ceilings"]["max_attempts"] = json!(3);
+    fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
 }
 
 fn create_principal_repository(path: &Path) -> String {
@@ -897,6 +1817,71 @@ fn wait_for_verification_failure(
         assert!(
             Instant::now() < deadline,
             "Verification did not fail: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_reconciliation(
+    daemon: &RunningDaemon,
+    attachment_token: &str,
+    commission_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let inspected = run_cli(
+            &daemon.socket_path,
+            &[
+                "--attachment-token",
+                attachment_token,
+                "commission",
+                "inspect",
+                commission_id,
+            ],
+        );
+        if inspected["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["type"] == "reconciliation_required")
+        }) {
+            return inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Reconciliation was not created: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_frontier_hold(
+    daemon: &RunningDaemon,
+    attachment_token: &str,
+    commission_id: &str,
+    logical_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let inspected = run_cli(
+            &daemon.socket_path,
+            &[
+                "--attachment-token",
+                attachment_token,
+                "commission",
+                "inspect",
+                commission_id,
+            ],
+        );
+        if inspected["frontier_holds"].as_array().is_some_and(|holds| {
+            holds.iter().any(|hold| {
+                hold["logical_id"] == logical_id && hold["reason"] == "declared_write_overlap"
+            })
+        }) {
+            return inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Assignment was not held from the frontier: {inspected}"
         );
         thread::sleep(Duration::from_millis(25));
     }

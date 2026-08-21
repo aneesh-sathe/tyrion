@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -22,17 +22,31 @@ pub(crate) struct WorkerRuntime {
     incorrect_result_commissions: Mutex<std::collections::HashSet<String>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct AssignmentContext {
     pub commission_id: String,
     pub assignment_id: String,
     pub attempt_id: String,
     pub mandate_revision: i64,
+    pub plan_revision: i64,
     pub goal: String,
     pub execution: ExecutionSpec,
     pub criteria: Vec<CriterionDefinition>,
     pub authorized_paths: Vec<String>,
+    pub declared_write_scopes: Vec<String>,
+    pub comparison_candidates: Vec<ComparisonCandidate>,
     pub max_storage_bytes: u64,
     pub lease_expires_at: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ComparisonCandidate {
+    pub result_id: String,
+    pub artifact_revision: String,
+    pub summary: String,
+    pub changed_paths: Vec<String>,
+    pub verification_outcomes: serde_json::Value,
+    pub bundle_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -172,6 +186,30 @@ impl WorkerRuntime {
                         "codex_git execution requires --codex-worker-config".into(),
                     )
                 }),
+        }
+    }
+
+    pub(crate) fn assignment_execution(
+        &self,
+        proposed: &ExecutionSpec,
+        commission_id: &str,
+        current_artifact_revision: Option<&str>,
+    ) -> ExecutionSpec {
+        match (
+            proposed,
+            current_artifact_revision,
+            self.contained_codex.as_ref(),
+        ) {
+            (ExecutionSpec::CodexGit { .. }, Some(base_revision), Some(contained_codex)) => {
+                ExecutionSpec::CodexGit {
+                    repository: contained_codex
+                        .integration_repository(commission_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                    base_revision: base_revision.to_owned(),
+                }
+            }
+            _ => proposed.clone(),
         }
     }
 
@@ -319,6 +357,20 @@ impl WorkerRuntime {
                 .as_ref()
                 .expect("integrated codex Result requires its runtime")
                 .verify_integrated(assignment, state),
+        }
+    }
+
+    pub(crate) fn rollback_integration(
+        &self,
+        integrated: &IntegratedResult,
+    ) -> Result<(), TyrionError> {
+        match &integrated.state {
+            IntegratedState::Deterministic(_) => Ok(()),
+            IntegratedState::CodexGit(state) => self
+                .contained_codex
+                .as_ref()
+                .expect("integrated codex Result requires its runtime")
+                .rollback_integration(state),
         }
     }
 }

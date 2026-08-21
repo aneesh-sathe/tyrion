@@ -10,11 +10,72 @@ pub struct CommissionProposal {
     pub goal: String,
     #[serde(default)]
     pub execution: ExecutionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<CommissionPlan>,
     pub criteria: Vec<AcceptanceCriterion>,
     pub authority: AuthorityEnvelope,
     pub resource_ceilings: ResourceCeilings,
     #[serde(default)]
     pub known_uncertainties: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommissionPlan {
+    pub assignments: Vec<PlannedAssignment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedAssignment {
+    pub id: String,
+    pub goal: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    pub criterion_ids: Vec<String>,
+    pub purpose: AssignmentPurpose,
+    #[serde(default)]
+    pub read_scopes: Vec<String>,
+    #[serde(default)]
+    pub write_scopes: Vec<String>,
+    pub resources: AssignmentResources,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub competition: Option<CompetitionPlan>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentPurpose {
+    CriticalPath,
+    UncertaintyReduction,
+    IndependentVerification,
+}
+
+impl AssignmentPurpose {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CriticalPath => "critical_path",
+            Self::UncertaintyReduction => "uncertainty_reduction",
+            Self::IndependentVerification => "independent_verification",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentResources {
+    pub concurrency_slots: u32,
+    pub max_storage_bytes: u64,
+    pub max_model_spend_cents: u64,
+    pub max_paid_service_spend_cents: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompetitionPlan {
+    pub group: String,
+    pub uncertainty: String,
+    pub comparison_rule: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
