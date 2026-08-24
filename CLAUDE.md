@@ -90,3 +90,4 @@
 - Inspection derives a resumable Blocker only when unresolved criteria have no running Attempt or safe Execution Frontier, and includes the exact next requirement plus retained Evidence, artifacts, failed approaches, and resource use.
 - Run `cargo test --test commission_effects` for operation classification, exact approval, amendment, ceiling, cancellation, and adversarial authority coverage.
 - Run `cargo test --test cross_harness_routing` for hard gates, ranking visibility, Entry Session neutrality, cross-harness Assignment routing, approximately equal fallback, Attention Conditions, stable Handles, steering, and interruption.
+- After verified issue-backed work is committed and pushed, close the completed issue and confirm its final state.
