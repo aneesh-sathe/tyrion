@@ -1,3 +1,5 @@
+#[path = "worker/adapter_contract.rs"]
+pub mod adapter_contract;
 mod artifact;
 mod attachment;
 mod client;

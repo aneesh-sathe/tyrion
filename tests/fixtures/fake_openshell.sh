@@ -94,7 +94,9 @@ case "$operation" in
                 '/home/sandbox/.aws'
                 '/home/sandbox/.config/gh'
                 '/home/sandbox/.codex'
+                '/home/sandbox/.claude'
                 'OPENAI_API_KEY'
+                'ANTHROPIC_API_KEY'
                 'AWS_ACCESS_KEY_ID'
                 'GH_TOKEN'
                 'GITHUB_TOKEN'
@@ -135,12 +137,13 @@ case "$operation" in
             printf '%s\n' 'simulated integrated verification failure' >&2
             exit 7
         fi
-        TYRION_WORKSPACE_ROOT="$root" \
-        CODEX_AUTH_ACCESS_TOKEN=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN \
-        CODEX_AUTH_REFRESH_TOKEN=openshell:resolve:env:CODEX_AUTH_REFRESH_TOKEN \
-        CODEX_AUTH_ACCOUNT_ID=openshell:resolve:env:CODEX_AUTH_ACCOUNT_ID \
-        CODEX_AUTH_ID_TOKEN=openshell:resolve:env:CODEX_AUTH_ID_TOKEN \
-        "${mapped[@]}"
+        exec env \
+            TYRION_WORKSPACE_ROOT="$root" \
+            CODEX_AUTH_ACCESS_TOKEN=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN \
+            CODEX_AUTH_REFRESH_TOKEN=openshell:resolve:env:CODEX_AUTH_REFRESH_TOKEN \
+            CODEX_AUTH_ACCOUNT_ID=openshell:resolve:env:CODEX_AUTH_ACCOUNT_ID \
+            CODEX_AUTH_ID_TOKEN=openshell:resolve:env:CODEX_AUTH_ID_TOKEN \
+            "${mapped[@]}"
         ;;
     delete)
         name=${1:-}

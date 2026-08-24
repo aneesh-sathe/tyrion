@@ -36,6 +36,14 @@
   "codex_sha256": "e23d0be344d2496986c985cd3db61e6f649b1ddd900e6afc1b5aaabbffcbb4e2",
   "model": "gpt-5.5",
   "openshell_provider": "tyrion-codex",
+  "claude": {
+    "policy_path": "/absolute/path/to/tyrion/runtime/openshell/hard-landlock-claude-policy.yaml",
+    "policy_sha256": "89ec4d87f6a6b4bd8c581ec878ff82cb2e2acf96a5a581e94e3f0b10d84feccf",
+    "openshell_provider": "tyrion-claude",
+    "binary": "/absolute/path/to/linux-aarch64/claude",
+    "version": "replace-with-the-pinned-claude-version",
+    "sha256": "replace-with-the-pinned-claude-sha256"
+  },
   "lease_ttl_seconds": 900,
   "vcpus": 2,
   "memory_mib": 2048,

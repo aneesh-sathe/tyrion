@@ -12,8 +12,10 @@ pub(crate) const EVENT_REPLAY: &str = "event_replay";
 pub(crate) const CONTROL_TAKEOVER: &str = "control_takeover";
 pub(crate) const MATERIAL_NOTIFICATIONS: &str = "material_notifications";
 pub(crate) const PERSISTENT_MODE_DISPLAY: &str = "persistent_mode_display";
+pub(crate) const WORKER_STEERING: &str = "worker_steering";
+pub(crate) const WORKER_INTERRUPTION: &str = "worker_interruption";
 
-const CAPABILITIES: [Capability; 7] = [
+const CAPABILITIES: [Capability; 9] = [
     Capability {
         name: PROPOSAL_CREATION,
         missing_effect: "This Entry Session cannot create Commission Proposals.",
@@ -41,6 +43,14 @@ const CAPABILITIES: [Capability; 7] = [
     Capability {
         name: PERSISTENT_MODE_DISPLAY,
         missing_effect: "Every Commission summary must repeat the Attachment Mode warning.",
+    },
+    Capability {
+        name: WORKER_STEERING,
+        missing_effect: "This Entry Session cannot steer an active Worker.",
+    },
+    Capability {
+        name: WORKER_INTERRUPTION,
+        missing_effect: "This Entry Session cannot interrupt an active Worker.",
     },
 ];
 

@@ -32,6 +32,10 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: AttachmentCommand,
     },
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +144,38 @@ enum CommissionCommand {
         expected_revision: i64,
         #[arg(long)]
         expected_control_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    Steer {
+        commission_id: String,
+        worker_handle: String,
+        #[arg(long)]
+        clarification: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Interrupt {
+        commission_id: String,
+        worker_handle: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Retry {
+        commission_id: String,
+        worker_handle: String,
+        #[arg(long)]
+        expected_revision: i64,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -401,6 +437,61 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                 },
                 None,
                 None,
+                None,
+            ),
+            TopLevelCommand::Worker {
+                command:
+                    WorkerCommand::Steer {
+                        commission_id,
+                        worker_handle,
+                        clarification,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::SteerWorker {
+                    commission_id: commission_id.clone(),
+                    worker_handle: worker_handle.clone(),
+                    clarification: clarification.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Worker {
+                command:
+                    WorkerCommand::Interrupt {
+                        commission_id,
+                        worker_handle,
+                        reason,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::InterruptWorker {
+                    commission_id: commission_id.clone(),
+                    worker_handle: worker_handle.clone(),
+                    reason: reason.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Worker {
+                command:
+                    WorkerCommand::Retry {
+                        commission_id,
+                        worker_handle,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::RetryWorker {
+                    commission_id: commission_id.clone(),
+                    worker_handle: worker_handle.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
                 None,
             ),
         };

@@ -37,6 +37,26 @@ impl RunningDaemon {
         daemon
     }
 
+    fn start_with_catalog(data_dir: &Path, worker_config: &Path, catalog: &Path) -> Self {
+        let socket_path = data_dir.join("tyrion.sock");
+        let child = Command::new(env!("CARGO_BIN_EXE_tyriond"))
+            .args([
+                "--data-dir",
+                path_text(data_dir),
+                "--socket",
+                path_text(&socket_path),
+                "--codex-worker-config",
+                path_text(worker_config),
+                "--worker-catalog",
+                path_text(catalog),
+            ])
+            .spawn()
+            .expect("daemon should start");
+        let mut daemon = Self { child, socket_path };
+        daemon.wait_until_ready();
+        daemon
+    }
+
     fn wait_until_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -160,8 +180,36 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert_eq!(completed["attempts"][0]["lease"]["status"], "released");
     assert!(completed["attempts"][0]["worker_configuration"]
         .as_str()
+        .is_some_and(|configuration| configuration.starts_with("contained-codex-")));
+    assert_eq!(completed["workers"][0]["handle"], "Arya");
+    assert_eq!(
+        completed["workers"][0]["configuration"]["adapter"]["kind"],
+        "contained_codex"
+    );
+    assert_eq!(
+        completed["workers"][0]["configuration"]["model"],
+        "fixture-model"
+    );
+    assert_eq!(
+        completed["workers"][0]["configuration"]["settings"]["vcpus"],
+        2
+    );
+    assert_eq!(
+        completed["workers"][0]["configuration"]["settings"]["runtime_configuration_sha256"],
+        sha256_file(&runtime)
+    );
+    assert!(!completed["workers"][0]["configuration"]["capabilities"]
+        .as_array()
         .unwrap()
-        .contains("codex-cli 0.147.0"));
+        .iter()
+        .any(|capability| capability == "semantic_interrupt"));
+    assert_eq!(
+        completed["workers"][0]["elapsed_time_ms"],
+        completed["attempts"][0]["execution_completed_at_ms"]
+            .as_i64()
+            .unwrap()
+            - completed["attempts"][0]["started_at_ms"].as_i64().unwrap()
+    );
 
     let result = &completed["results"][0];
     assert_eq!(result["status"], "accepted");
@@ -204,6 +252,113 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert!(!log.lines().any(|line| {
         line.contains("sandbox upload") && line.contains(path_text(&principal_checkout))
     }));
+}
+
+#[test]
+fn codex_and_claude_structured_adapters_complete_one_git_commission() {
+    let fixture = ParallelFixture::new();
+    add_claude_runtime_fixture(fixture.temp.path(), &fixture.runtime);
+    let catalog = fixture.temp.path().join("structured-worker-catalog.json");
+    let adapter_script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fake_structured_adapter.sh"
+    );
+    let configuration = |id: &str, harness: &str, kind: &str, skill: &str, score: u16| {
+        json!({
+            "id": id,
+            "harness": harness,
+            "adapter": {
+                "kind": kind,
+                "version": "contract-fixture-v1",
+                "sha256": sha256_file(Path::new(adapter_script)),
+                "command": [adapter_script, harness]
+            },
+            "model": format!("{harness}-fixture-model"),
+            "settings": {"mode": "structured_git"},
+            "tools": ["git"],
+            "skills": [skill],
+            "context": {"strategy": "fresh", "capacity_tokens": 100000},
+            "resource_limits": {
+                "max_concurrency_slots": 1,
+                "max_storage_bytes": 5242880,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0
+            },
+            "capabilities": [
+                "structured_lifecycle", "semantic_interrupt", "terminal_state", "usage",
+                "skills", "result_submission", "contained"
+            ],
+            "authority_actions": ["codex.git_change"],
+            "authority_scope_types": ["repository", "path", "action"],
+            "assignment_constraints": ["coding"],
+            "containment_profile": "openshell-repaired-v0.0.104",
+            "replacement_class": "structured-git",
+            "available": true,
+            "metrics": {
+                "expected_verified_correctness": score,
+                "preference_adherence": 9000,
+                "first_pass_acceptance": 9000,
+                "commission_elapsed_time_contribution_ms": 1000,
+                "cost_cents": 0,
+                "continuity": 0
+            }
+        })
+    };
+    fs::write(
+        &catalog,
+        serde_json::to_vec_pretty(&json!({
+            "configurations": [
+                configuration("codex-structured-git", "codex", "codex_app_server", "backend", 9500),
+                configuration("claude-structured-git", "claude", "claude_agent_sdk", "frontend", 9600)
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let proposal = fixture.temp.path().join("structured-git-proposal.json");
+    write_parallel_git_proposal(
+        &proposal,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut value: Value = serde_json::from_slice(&fs::read(&proposal).unwrap()).unwrap();
+    value["plan"]["assignments"][0]["worker_requirements"] = json!({
+        "capabilities": ["structured_lifecycle", "semantic_interrupt"],
+        "tools": ["git"],
+        "skills": ["backend"],
+        "min_context_tokens": 100000,
+        "assignment_constraints": ["coding"]
+    });
+    value["plan"]["assignments"][1]["worker_requirements"] = json!({
+        "capabilities": ["structured_lifecycle", "semantic_interrupt"],
+        "tools": ["git"],
+        "skills": ["frontend"],
+        "min_context_tokens": 100000,
+        "assignment_constraints": ["coding"]
+    });
+    fs::write(&proposal, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    let daemon = RunningDaemon::start_with_catalog(&fixture.data_dir, &fixture.runtime, &catalog);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    let harnesses = completed["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|worker| worker["configuration"]["harness"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        harnesses,
+        std::collections::HashSet::from(["codex", "claude"])
+    );
+    assert!(completed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["status"] == "accepted"));
 }
 
 #[test]
@@ -1589,6 +1744,29 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path) -> PathBuf
     config
 }
 
+fn add_claude_runtime_fixture(root: &Path, runtime: &Path) {
+    let policy = root.join("hard-claude-policy.yaml");
+    fs::write(
+        &policy,
+        include_bytes!("../runtime/openshell/hard-landlock-claude-policy.yaml"),
+    )
+    .unwrap();
+    let claude = write_executable(
+        &root.join("claude"),
+        include_str!("fixtures/fake_claude.sh"),
+    );
+    let mut config: Value = serde_json::from_slice(&fs::read(runtime).unwrap()).unwrap();
+    config["claude"] = json!({
+        "policy_path": policy,
+        "policy_sha256": sha256_file(&policy),
+        "openshell_provider": "fixture-claude",
+        "binary": claude,
+        "version": "2.1.204 (Claude Code)",
+        "sha256": sha256_file(&claude)
+    });
+    fs::write(runtime, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
 fn write_executable(path: &Path, contents: &str) -> PathBuf {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1662,6 +1840,10 @@ fn connect_full_entry(daemon: &RunningDaemon) -> String {
             "material_notifications",
             "--capability",
             "persistent_mode_display",
+            "--capability",
+            "worker_steering",
+            "--capability",
+            "worker_interruption",
             "--idempotency-key",
             "connect-git-session",
         ],
@@ -1839,11 +2021,20 @@ fn wait_for_reconciliation(
                 commission_id,
             ],
         );
-        if inspected["events"].as_array().is_some_and(|events| {
+        let reconciliation_event_exists = inspected["events"].as_array().is_some_and(|events| {
             events
                 .iter()
                 .any(|event| event["type"] == "reconciliation_required")
-        }) {
+        });
+        let reconciliation_assignment_exists =
+            inspected["assignments"]
+                .as_array()
+                .is_some_and(|assignments| {
+                    assignments
+                        .iter()
+                        .any(|assignment| assignment["purpose"] == "reconciliation")
+                });
+        if reconciliation_event_exists && reconciliation_assignment_exists {
             return inspected;
         }
         assert!(

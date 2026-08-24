@@ -208,7 +208,7 @@ fn connect_full_entry(daemon: &RunningDaemon, label: &str) -> String {
         .to_owned()
 }
 
-fn full_entry_capabilities() -> [&'static str; 7] {
+fn full_entry_capabilities() -> [&'static str; 9] {
     [
         "proposal_creation",
         "commission_acceptance",
@@ -217,6 +217,8 @@ fn full_entry_capabilities() -> [&'static str; 7] {
         "control_takeover",
         "material_notifications",
         "persistent_mode_display",
+        "worker_steering",
+        "worker_interruption",
     ]
 }
 
@@ -410,6 +412,35 @@ fn wait_for_event(
         thread::sleep(Duration::from_millis(20));
     }
     panic!("event {event_type} was not durably recorded before the deadline");
+}
+
+fn wait_for_assignment_status(
+    daemon: &RunningDaemon,
+    session_token: &str,
+    commission_id: &str,
+    expected_status: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let inspected = run_cli(
+            &daemon.socket_path,
+            &[
+                "--attachment-token",
+                session_token,
+                "commission",
+                "inspect",
+                commission_id,
+            ],
+        );
+        if inspected["assignments"][0]["status"] == expected_status {
+            return inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Assignment did not reach {expected_status} before the deadline: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -617,8 +648,10 @@ fn accepted_commission_completes_with_criterion_linked_evidence() {
             "plan_revised",
             "assignment_ready",
             "attempt_started",
+            "worker_activity",
             "resources_reserved",
             "result_submitted",
+            "worker_activity",
             "evidence_recorded",
             "evidence_recorded",
             "result_integrated",
@@ -981,15 +1014,11 @@ fn expired_ceiling_blocks_only_its_assignment_after_restart() {
     thread::sleep(Duration::from_millis(1_100));
 
     let restarted = RunningDaemon::start(temp.path());
-    let blocked = run_cli(
-        &restarted.socket_path,
-        &[
-            "--attachment-token",
-            &attachment_id,
-            "commission",
-            "inspect",
-            &commission_id,
-        ],
+    let blocked = wait_for_assignment_status(
+        &restarted,
+        &attachment_id,
+        &commission_id,
+        "resource_blocked",
     );
     assert_eq!(blocked["commission"]["status"], "active");
     assert_eq!(blocked["assignments"][0]["status"], "resource_blocked");

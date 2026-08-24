@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS commissions (
     completed_at INTEGER,
     artifact_revision TEXT,
     execution_json TEXT NOT NULL DEFAULT '{"kind":"deterministic"}',
+    worker_requirements_json TEXT NOT NULL DEFAULT '{}',
     plan_json TEXT
 );
 
@@ -101,6 +102,7 @@ CREATE TABLE IF NOT EXISTS planned_assignments (
     max_storage_bytes INTEGER NOT NULL,
     max_model_spend_cents INTEGER NOT NULL,
     max_paid_service_spend_cents INTEGER NOT NULL,
+    worker_requirements_json TEXT NOT NULL DEFAULT '{}',
     competition_group TEXT,
     competition_uncertainty TEXT,
     competition_rule TEXT,
@@ -136,7 +138,8 @@ CREATE TABLE IF NOT EXISTS assignments (
     commission_id TEXT NOT NULL REFERENCES commissions(id),
     plan_revision INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN (
-        'ready', 'running', 'accepted', 'superseded', 'verification_pending', 'verification_failed', 'resource_blocked'
+        'ready', 'running', 'accepted', 'superseded', 'verification_pending', 'verification_failed',
+        'resource_blocked', 'attention_required'
     )),
     created_at INTEGER NOT NULL,
     UNIQUE (id, commission_id)
@@ -169,12 +172,61 @@ CREATE TABLE IF NOT EXISTS attempts (
     id TEXT PRIMARY KEY,
     assignment_id TEXT NOT NULL REFERENCES assignments(id),
     worker_configuration TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
     started_at INTEGER NOT NULL,
     completed_at INTEGER,
     started_at_ms INTEGER NOT NULL,
     execution_completed_at_ms INTEGER,
     completed_at_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS assignment_routes (
+    assignment_id TEXT PRIMARY KEY REFERENCES assignments(id),
+    status TEXT NOT NULL CHECK (status IN ('selected', 'attention_required')),
+    selected_configuration_json TEXT,
+    rationale_json TEXT NOT NULL,
+    decided_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attention_conditions (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    code TEXT NOT NULL,
+    requirement TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS workers (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),
+    handle TEXT NOT NULL,
+    configuration_json TEXT NOT NULL,
+    routing_rationale_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
+    native_session_id TEXT,
+    latest_activity TEXT NOT NULL,
+    activity_at_ms INTEGER NOT NULL,
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (commission_id, handle)
+);
+
+CREATE TABLE IF NOT EXISTS worker_commands (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    worker_id TEXT NOT NULL REFERENCES workers(id),
+    attachment_id TEXT NOT NULL REFERENCES attachments(id),
+    kind TEXT NOT NULL CHECK (kind IN ('steer', 'interrupt')),
+    payload_json TEXT NOT NULL,
+    mandate_revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'failed')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS resource_reservations (
@@ -196,6 +248,20 @@ CREATE TABLE IF NOT EXISTS worker_leases (
     expires_at INTEGER NOT NULL,
     released_at INTEGER,
     status TEXT NOT NULL CHECK (status IN ('active', 'released', 'revoked', 'expired'))
+);
+
+CREATE TABLE IF NOT EXISTS sandbox_cleanups (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_configuration_failures (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    configuration_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (assignment_id, configuration_id)
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -342,7 +408,8 @@ CREATE TABLE IF NOT EXISTS events (
         'useful_concurrency_observed',
         'evidence_recorded',
         'commission_verified_complete', 'assignment_blocked',
-        'attachment_joined', 'active_attachment_changed'
+        'attachment_joined', 'active_attachment_changed',
+        'worker_steered', 'worker_interrupted', 'worker_activity'
     )),
     commission_revision INTEGER NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -356,6 +423,46 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     created_at INTEGER NOT NULL
 );
 "#;
+
+fn upgrade_worker_commands(connection: &Connection) -> Result<(), TyrionError> {
+    let schema = table_schema(connection, "worker_commands")?;
+    if schema.is_none()
+        || schema.as_deref().is_some_and(|definition| {
+            definition.contains("'pending'") && definition.contains("idempotency_key")
+        })
+    {
+        return Ok(());
+    }
+    connection.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        ALTER TABLE worker_commands RENAME TO worker_commands_before_outbox;
+        CREATE TABLE worker_commands (
+            id TEXT PRIMARY KEY,
+            commission_id TEXT NOT NULL REFERENCES commissions(id),
+            worker_id TEXT NOT NULL REFERENCES workers(id),
+            attachment_id TEXT NOT NULL REFERENCES attachments(id),
+            kind TEXT NOT NULL CHECK (kind IN ('steer', 'interrupt')),
+            payload_json TEXT NOT NULL,
+            mandate_revision INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'failed')),
+            idempotency_key TEXT NOT NULL UNIQUE,
+            request_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO worker_commands (
+            id, commission_id, worker_id, attachment_id, kind, payload_json,
+            mandate_revision, status, idempotency_key, request_hash, created_at
+        )
+        SELECT id, commission_id, worker_id, attachment_id, kind, payload_json,
+               mandate_revision, status, 'legacy:' || id, '', created_at
+        FROM worker_commands_before_outbox;
+        DROP TABLE worker_commands_before_outbox;
+        COMMIT;
+        "#,
+    )?;
+    Ok(())
+}
 
 pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     if !column_exists(connection, "commissions", "control_revision")? {
@@ -372,6 +479,22 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     }
     if !column_exists(connection, "commissions", "plan_json")? {
         connection.execute("ALTER TABLE commissions ADD COLUMN plan_json TEXT", [])?;
+    }
+    if !column_exists(connection, "commissions", "worker_requirements_json")? {
+        connection.execute(
+            "ALTER TABLE commissions ADD COLUMN worker_requirements_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    if !column_exists(
+        connection,
+        "planned_assignments",
+        "worker_requirements_json",
+    )? {
+        connection.execute(
+            "ALTER TABLE planned_assignments ADD COLUMN worker_requirements_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
     }
     upgrade_criteria(connection)?;
     backfill_criterion_versions(connection)?;
@@ -406,6 +529,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             || !schema.contains("result_integrated")
             || !schema.contains("commission_amended")
             || !schema.contains("useful_concurrency_observed")
+            || !schema.contains("worker_steered")
     });
     if needs_event_upgrade {
         let payload_projection = if events_schema
@@ -430,7 +554,8 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
                     'useful_concurrency_observed',
                     'evidence_recorded',
                     'commission_verified_complete', 'assignment_blocked',
-                    'attachment_joined', 'active_attachment_changed'
+                    'attachment_joined', 'active_attachment_changed',
+                    'worker_steered', 'worker_interrupted', 'worker_activity'
                 )),
                 commission_revision INTEGER NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{{}}',
@@ -448,7 +573,8 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     }
     backfill_planned_assignments(connection)?;
     backfill_assignment_metadata(connection)?;
-    connection.pragma_update(None, "user_version", 6)?;
+    upgrade_worker_commands(connection)?;
+    connection.pragma_update(None, "user_version", 10)?;
     Ok(())
 }
 
@@ -464,19 +590,34 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let attempts_schema = table_schema(connection, "attempts")?;
     let evidence_schema = table_schema(connection, "evidence")?;
     let results_schema = table_schema(connection, "results")?;
-    Ok(user_version < 6
+    Ok(user_version < 10
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
+        || !column_exists(connection, "commissions", "worker_requirements_json")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || results_schema.is_some_and(|schema| !schema.contains("'superseded'"))
         || !table_exists(connection, "worker_leases")?
+        || !table_exists(connection, "sandbox_cleanups")?
+        || !table_exists(connection, "worker_configuration_failures")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
         || !table_exists(connection, "commission_plans")?
         || !table_exists(connection, "planned_assignments")?
+        || !column_exists(
+            connection,
+            "planned_assignments",
+            "worker_requirements_json",
+        )?
+        || !table_exists(connection, "assignment_routes")?
+        || !table_exists(connection, "attention_conditions")?
+        || !table_exists(connection, "workers")?
+        || !table_exists(connection, "worker_commands")?
+        || !column_exists(connection, "worker_commands", "idempotency_key")?
+        || table_schema(connection, "worker_commands")?
+            .is_some_and(|schema| !schema.contains("'pending'"))
         || !table_exists(connection, "assignment_metadata")?
         || !column_exists(connection, "assignment_metadata", "commission_id")?
         || !table_exists(connection, "resource_reservations")?
@@ -484,9 +625,13 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
         || !column_exists(connection, "attempts", "execution_completed_at_ms")?
         || criteria_schema.is_some_and(|schema| !schema.contains("required_evidence"))
         || assignments_schema.is_some_and(|schema| {
-            !schema.contains("'verification_pending'") || !schema.contains("'superseded'")
+            !schema.contains("'verification_pending'")
+                || !schema.contains("'superseded'")
+                || !schema.contains("'attention_required'")
         })
-        || attempts_schema.is_some_and(|schema| !schema.contains("'failed'"))
+        || attempts_schema.is_some_and(|schema| {
+            !schema.contains("'failed'") || !schema.contains("'interrupted'")
+        })
         || evidence_schema.is_some_and(|schema| !schema.contains("verification_attempt_id"))
         || events_schema.is_some_and(|schema| {
             !schema.contains("active_attachment_changed")
@@ -494,6 +639,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
                 || !schema.contains("result_integrated")
                 || !schema.contains("commission_amended")
                 || !schema.contains("useful_concurrency_observed")
+                || !schema.contains("worker_steered")
         }))
 }
 
@@ -501,7 +647,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v6", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v10", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -528,18 +674,31 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 6
+    if user_version != 10
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
+        || !column_exists(connection, "commissions", "worker_requirements_json")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || !table_exists(connection, "worker_leases")?
+        || !table_exists(connection, "sandbox_cleanups")?
+        || !table_exists(connection, "worker_configuration_failures")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
         || !table_exists(connection, "commission_plans")?
         || !table_exists(connection, "planned_assignments")?
+        || !column_exists(
+            connection,
+            "planned_assignments",
+            "worker_requirements_json",
+        )?
+        || !table_exists(connection, "assignment_routes")?
+        || !table_exists(connection, "attention_conditions")?
+        || !table_exists(connection, "workers")?
+        || !table_exists(connection, "worker_commands")?
+        || !column_exists(connection, "worker_commands", "idempotency_key")?
         || !table_exists(connection, "assignment_metadata")?
         || !column_exists(connection, "assignment_metadata", "commission_id")?
         || !table_exists(connection, "resource_reservations")?
@@ -573,6 +732,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !events_schema.contains("result_integrated")
         || !events_schema.contains("commission_amended")
         || !events_schema.contains("useful_concurrency_observed")
+        || !events_schema.contains("worker_steered")
     {
         return Err(TyrionError::InvalidRequest(
             "events schema migration verification failed".into(),
@@ -582,7 +742,9 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !criteria_schema.contains("'prompt'")
         || !assignments_schema.contains("'verification_pending'")
         || !assignments_schema.contains("'superseded'")
+        || !assignments_schema.contains("'attention_required'")
         || !attempts_schema.contains("'failed'")
+        || !attempts_schema.contains("'interrupted'")
         || !results_schema.contains("'superseded'")
         || !evidence_schema.contains("verification_attempt_id")
     {
@@ -674,7 +836,10 @@ fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
     let Some(schema) = table_schema(connection, "assignments")? else {
         return Ok(());
     };
-    if schema.contains("'verification_pending'") && schema.contains("'superseded'") {
+    if schema.contains("'verification_pending'")
+        && schema.contains("'superseded'")
+        && schema.contains("'attention_required'")
+    {
         return Ok(());
     }
     connection.execute_batch(
@@ -687,7 +852,7 @@ fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
             plan_revision INTEGER NOT NULL,
             status TEXT NOT NULL CHECK (status IN (
                 'ready', 'running', 'accepted', 'superseded', 'verification_pending',
-                'verification_failed', 'resource_blocked'
+                'verification_failed', 'resource_blocked', 'attention_required'
             )),
             created_at INTEGER NOT NULL,
             UNIQUE (id, commission_id)
@@ -706,7 +871,7 @@ fn upgrade_attempts(connection: &Connection) -> Result<(), TyrionError> {
     let Some(schema) = table_schema(connection, "attempts")? else {
         return Ok(());
     };
-    if schema.contains("'failed'") {
+    if schema.contains("'failed'") && schema.contains("'interrupted'") {
         return Ok(());
     }
     connection.execute_batch(
@@ -717,11 +882,20 @@ fn upgrade_attempts(connection: &Connection) -> Result<(), TyrionError> {
             id TEXT PRIMARY KEY,
             assignment_id TEXT NOT NULL REFERENCES assignments(id),
             worker_configuration TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
             started_at INTEGER NOT NULL,
-            completed_at INTEGER
+            completed_at INTEGER,
+            started_at_ms INTEGER NOT NULL,
+            execution_completed_at_ms INTEGER,
+            completed_at_ms INTEGER
         );
-        INSERT INTO attempts_v5 SELECT * FROM attempts;
+        INSERT INTO attempts_v5 (
+            id, assignment_id, worker_configuration, status, started_at, completed_at,
+            started_at_ms, execution_completed_at_ms, completed_at_ms
+        )
+        SELECT id, assignment_id, worker_configuration, status, started_at, completed_at,
+               started_at_ms, execution_completed_at_ms, completed_at_ms
+        FROM attempts;
         DROP TABLE attempts;
         ALTER TABLE attempts_v5 RENAME TO attempts;
         COMMIT;
@@ -1080,5 +1254,72 @@ mod tests {
         let connection = Connection::open(database_path).expect("migrated database should open");
         verify(&connection).unwrap();
         assert!(!migration_required(&connection).unwrap());
+    }
+
+    #[test]
+    fn version_six_attempt_timing_survives_interrupted_status_migration() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let database_path = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                DROP TABLE attempts;
+                CREATE TABLE attempts (
+                    id TEXT PRIMARY KEY,
+                    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+                    worker_configuration TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    started_at_ms INTEGER NOT NULL,
+                    execution_completed_at_ms INTEGER,
+                    completed_at_ms INTEGER
+                );
+                INSERT INTO commissions (id, goal, status, revision, created_at)
+                VALUES ('commission-v6', 'migration fixture', 'active', 1, 1);
+                INSERT INTO assignments (id, commission_id, plan_revision, status, created_at)
+                VALUES ('assignment-v6', 'commission-v6', 1, 'ready', 1);
+                INSERT INTO attempts (
+                    id, assignment_id, worker_configuration, status, started_at, completed_at,
+                    started_at_ms, execution_completed_at_ms, completed_at_ms
+                ) VALUES (
+                    'attempt-v6', 'assignment-v6', 'legacy-worker', 'succeeded',
+                    10, 20, 10001, 15002, 20003
+                );
+                PRAGMA user_version = 6;
+                PRAGMA foreign_keys = ON;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(super::super::Store::open(&database_path).unwrap());
+        let connection = Connection::open(database_path).unwrap();
+        let attempts_schema = table_schema(&connection, "attempts").unwrap().unwrap();
+        assert!(attempts_schema.contains("'interrupted'"));
+        assert!(column_exists(&connection, "attempts", "started_at_ms").unwrap());
+        assert!(column_exists(&connection, "attempts", "execution_completed_at_ms").unwrap());
+        assert!(column_exists(&connection, "attempts", "completed_at_ms").unwrap());
+        let timing = connection
+            .query_row(
+                "SELECT started_at, completed_at, started_at_ms,
+                        execution_completed_at_ms, completed_at_ms
+                 FROM attempts WHERE id = 'attempt-v6'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(timing, (10, 20, 10001, 15002, 20003));
     }
 }

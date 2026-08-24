@@ -10,6 +10,8 @@ pub struct CommissionProposal {
     pub goal: String,
     #[serde(default)]
     pub execution: ExecutionSpec,
+    #[serde(default)]
+    pub worker_requirements: WorkerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<CommissionPlan>,
     pub criteria: Vec<AcceptanceCriterion>,
@@ -39,8 +41,31 @@ pub struct PlannedAssignment {
     #[serde(default)]
     pub write_scopes: Vec<String>,
     pub resources: AssignmentResources,
+    #[serde(default)]
+    pub worker_requirements: WorkerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub competition: Option<CompetitionPlan>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRequirements {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub min_context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_strategy: Option<String>,
+    #[serde(default)]
+    pub assignment_constraints: Vec<String>,
+    #[serde(default)]
+    pub require_configurations: Vec<String>,
+    #[serde(default)]
+    pub exclude_configurations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -316,6 +341,20 @@ pub enum Command {
     ReplayEvents {
         commission_id: String,
         after_sequence: i64,
+    },
+    SteerWorker {
+        commission_id: String,
+        worker_handle: String,
+        clarification: String,
+    },
+    InterruptWorker {
+        commission_id: String,
+        worker_handle: String,
+        reason: String,
+    },
+    RetryWorker {
+        commission_id: String,
+        worker_handle: String,
     },
 }
 

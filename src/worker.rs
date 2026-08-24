@@ -1,25 +1,199 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::process::ChildStdin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::artifact::ArtifactRevision;
 use crate::domain::EvidenceOutcome;
 use crate::protocol::{
-    ExecutionSpec, VerificationDefect, VerificationDepth, Verifier, VerifierType,
+    AssignmentResources, AuthorityEnvelope, ExecutionSpec, VerificationDefect, VerificationDepth,
+    Verifier, VerifierType, WorkerRequirements,
 };
 use crate::TyrionError;
 
 mod contained_codex;
+mod routing;
+mod structured_process;
 
 pub const DETERMINISTIC_ACTION: &str = "deterministic.echo";
 pub const CODEX_GIT_ACTION: &str = "codex.git_change";
 
 pub(crate) struct WorkerRuntime {
     contained_codex: Option<contained_codex::ContainedCodexRuntime>,
+    catalog: routing::WorkerCatalog,
     corrupt_artifact_revision: bool,
     incorrect_first_result: bool,
     incorrect_result_commissions: Mutex<std::collections::HashSet<String>>,
+    controls: Mutex<std::collections::HashMap<String, Arc<WorkerControl>>>,
+    hold_for_control: bool,
+}
+
+pub(super) struct WorkerControl {
+    mandate_revision: i64,
+    interrupted: AtomicBool,
+    interrupt_reason: Mutex<Option<(String, String)>>,
+    clarifications: Mutex<Vec<(String, String)>>,
+    delivered_commands: Mutex<std::collections::HashSet<String>>,
+    changed: Condvar,
+    adapter_input: Mutex<Option<ChildStdin>>,
+    adapter_was_attached: AtomicBool,
+    adapter_detached: AtomicBool,
+    telemetry: Mutex<LiveWorkerTelemetry>,
+}
+
+#[derive(Clone, Default)]
+struct LiveWorkerTelemetry {
+    native_session_id: Option<String>,
+    latest_activity: Option<String>,
+    activity_at_ms: Option<i64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    usage_reported: bool,
+}
+
+impl WorkerControl {
+    pub(super) fn attach_adapter_input(&self, mut input: ChildStdin) -> Result<(), TyrionError> {
+        let mut adapter_input = self.adapter_input.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker adapter control channel is unavailable".into())
+        })?;
+        for (command_id, clarification) in self
+            .clarifications
+            .lock()
+            .map_err(|_| {
+                TyrionError::InvalidRequest("Worker clarification channel is unavailable".into())
+            })?
+            .iter()
+        {
+            write_adapter_control(
+                &mut input,
+                &serde_json::json!({
+                    "type": "tyrion.worker.steer",
+                    "command_id": command_id,
+                    "scope": "assignment_clarification_only",
+                    "mandate_revision": self.mandate_revision,
+                    "immutable": ["goal", "authority", "criteria", "resource_ceilings"],
+                    "clarification": clarification,
+                }),
+            )?;
+        }
+        if self.interrupted.load(Ordering::SeqCst) {
+            let (command_id, reason) = self
+                .interrupt_reason
+                .lock()
+                .map_err(|_| {
+                    TyrionError::InvalidRequest("Worker interruption channel is unavailable".into())
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    TyrionError::InvalidRequest("Worker interruption reason is unavailable".into())
+                })?;
+            write_adapter_control(
+                &mut input,
+                &serde_json::json!({
+                    "type": "tyrion.worker.interrupt",
+                    "command_id": command_id,
+                    "mandate_revision": self.mandate_revision,
+                    "reason": reason,
+                }),
+            )?;
+        }
+        *adapter_input = Some(input);
+        self.adapter_was_attached.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(super) fn detach_adapter_input(&self) -> Result<(), TyrionError> {
+        let mut adapter_input = self.adapter_input.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker adapter control channel is unavailable".into())
+        })?;
+        if self.adapter_was_attached.load(Ordering::SeqCst) {
+            self.adapter_detached.store(true, Ordering::SeqCst);
+        }
+        adapter_input.take();
+        Ok(())
+    }
+
+    pub(super) fn was_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
+
+    pub(in crate::worker) fn observe_adapter_event(
+        &self,
+        kind: routing::WorkerAdapterKind,
+        event: &serde_json::Value,
+    ) -> Result<(), TyrionError> {
+        let mut telemetry = self.telemetry.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker telemetry channel is unavailable".into())
+        })?;
+        let mut meaningful_activity = None;
+        if event["type"] == "tyrion.adapter.ready" {
+            telemetry.native_session_id = event["native_session_id"].as_str().map(str::to_owned);
+            meaningful_activity = Some("Structured adapter ready");
+        }
+        match kind {
+            routing::WorkerAdapterKind::CodexAppServer => match event["method"].as_str() {
+                Some("turn/started") => meaningful_activity = Some("Codex turn started"),
+                Some("item/completed") => {
+                    meaningful_activity = Some("Codex produced a structured Result")
+                }
+                Some("thread/tokenUsage/updated") => {
+                    let total = &event["params"]["tokenUsage"]["total"];
+                    if let (Some(input), Some(output)) = (
+                        total["inputTokens"].as_u64(),
+                        total["outputTokens"].as_u64(),
+                    ) {
+                        telemetry.input_tokens = input;
+                        telemetry.output_tokens = output;
+                        telemetry.usage_reported = true;
+                    }
+                }
+                Some("error") => meaningful_activity = Some("Codex adapter reported an error"),
+                _ => {}
+            },
+            routing::WorkerAdapterKind::ClaudeAgentSdk => match event["type"].as_str() {
+                Some("session.status_running") => {
+                    meaningful_activity = Some("Claude session started")
+                }
+                Some("agent.message") => {
+                    meaningful_activity = Some("Claude produced a structured Result")
+                }
+                Some("span.model_request_end") => {
+                    if let (Some(input), Some(output)) = (
+                        event["usage"]["input_tokens"].as_u64(),
+                        event["usage"]["output_tokens"].as_u64(),
+                    ) {
+                        telemetry.input_tokens = telemetry.input_tokens.saturating_add(input);
+                        telemetry.output_tokens = telemetry.output_tokens.saturating_add(output);
+                        telemetry.usage_reported = true;
+                    }
+                }
+                Some("session.error") => {
+                    meaningful_activity = Some("Claude adapter reported an error")
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        if let Some(activity) = meaningful_activity {
+            telemetry.latest_activity = Some(activity.into());
+            telemetry.activity_at_ms = Some(current_time_millis()?);
+        }
+        Ok(())
+    }
+}
+
+fn write_adapter_control(
+    input: &mut ChildStdin,
+    value: &serde_json::Value,
+) -> Result<(), TyrionError> {
+    serde_json::to_writer(&mut *input, value)?;
+    input.write_all(b"\n")?;
+    input.flush()?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -31,11 +205,15 @@ pub(crate) struct AssignmentContext {
     pub plan_revision: i64,
     pub goal: String,
     pub execution: ExecutionSpec,
+    pub selected_configuration: serde_json::Value,
     pub criteria: Vec<CriterionDefinition>,
+    pub authority: AuthorityEnvelope,
     pub authorized_paths: Vec<String>,
     pub declared_write_scopes: Vec<String>,
     pub comparison_candidates: Vec<ComparisonCandidate>,
     pub max_storage_bytes: u64,
+    pub max_model_spend_cents: u64,
+    pub max_paid_service_spend_cents: u64,
     pub lease_expires_at: i64,
 }
 
@@ -49,7 +227,7 @@ pub(crate) struct ComparisonCandidate {
     pub bundle_path: PathBuf,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub(crate) struct CriterionDefinition {
     pub id: String,
     pub required_evidence: String,
@@ -68,6 +246,9 @@ pub(crate) struct CandidateResult {
     pub changed_paths: Vec<String>,
     pub artifacts: Vec<ArtifactRecord>,
     pub known_effects: Vec<String>,
+    pub native_session_id: Option<String>,
+    pub usage: serde_json::Value,
+    pub latest_meaningful_activity: String,
     state: CandidateState,
 }
 
@@ -157,36 +338,244 @@ impl WorkerRuntime {
     pub(crate) fn load(
         data_dir: &Path,
         codex_worker_config: Option<&Path>,
+        worker_catalog: Option<&Path>,
         corrupt_artifact_revision: bool,
         incorrect_first_result: bool,
+        hold_for_control: bool,
     ) -> Result<Self, TyrionError> {
         let contained_codex = codex_worker_config
             .map(|path| contained_codex::ContainedCodexRuntime::load(path, data_dir))
             .transpose()?;
+        let mut catalog = routing::WorkerCatalog::load(
+            worker_catalog,
+            contained_codex
+                .as_ref()
+                .map(contained_codex::ContainedCodexRuntime::routing_descriptor),
+        )?;
+        if contained_codex.is_none() && catalog.requires_structured_runtime() {
+            return Err(TyrionError::InvalidRequest(
+                "available structured Worker Configurations require --codex-worker-config for Tyrion-owned containment"
+                    .into(),
+            ));
+        }
+        catalog.materialize_structured_adapters(data_dir)?;
         Ok(Self {
             contained_codex,
+            catalog,
             corrupt_artifact_revision,
             incorrect_first_result,
             incorrect_result_commissions: Mutex::new(std::collections::HashSet::new()),
+            controls: Mutex::new(std::collections::HashMap::new()),
+            hold_for_control,
         })
     }
 
-    pub(crate) fn configuration(&self, execution: &ExecutionSpec) -> Result<String, TyrionError> {
-        match execution {
-            ExecutionSpec::Deterministic if self.corrupt_artifact_revision => {
-                Ok("fault-corrupt-artifact-revision-v1".into())
-            }
-            ExecutionSpec::Deterministic => Ok("deterministic-local-v1".into()),
-            ExecutionSpec::CodexGit { .. } => self
-                .contained_codex
-                .as_ref()
-                .map(contained_codex::ContainedCodexRuntime::configuration)
-                .ok_or_else(|| {
-                    TyrionError::InvalidRequest(
-                        "codex_git execution requires --codex-worker-config".into(),
-                    )
-                }),
+    pub(crate) fn begin_attempt(
+        &self,
+        attempt_id: &str,
+        mandate_revision: i64,
+    ) -> Result<(), TyrionError> {
+        let mut controls = self.controls.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker control registry is unavailable".into())
+        })?;
+        controls.insert(
+            attempt_id.to_owned(),
+            Arc::new(WorkerControl {
+                mandate_revision,
+                interrupted: AtomicBool::new(false),
+                interrupt_reason: Mutex::new(None),
+                clarifications: Mutex::new(Vec::new()),
+                delivered_commands: Mutex::new(std::collections::HashSet::new()),
+                changed: Condvar::new(),
+                adapter_input: Mutex::new(None),
+                adapter_was_attached: AtomicBool::new(false),
+                adapter_detached: AtomicBool::new(false),
+                telemetry: Mutex::new(LiveWorkerTelemetry::default()),
+            }),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn steer(
+        &self,
+        attempt_id: &str,
+        command_id: &str,
+        clarification: &str,
+    ) -> Result<(), TyrionError> {
+        let control = self.control(attempt_id)?;
+        let mut delivered = control.delivered_commands.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker command registry is unavailable".into())
+        })?;
+        if delivered.contains(command_id) {
+            return Ok(());
         }
+        let mut adapter_input = control.adapter_input.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker adapter control channel is unavailable".into())
+        })?;
+        if control.adapter_detached.load(Ordering::SeqCst) {
+            return Err(TyrionError::ControlDenied(
+                "the structured Worker has already reached a terminal boundary".into(),
+            ));
+        }
+        if control.interrupted.load(Ordering::SeqCst) {
+            return Err(TyrionError::ControlDenied(
+                "the Worker has already been interrupted".into(),
+            ));
+        }
+        control
+            .clarifications
+            .lock()
+            .map_err(|_| {
+                TyrionError::InvalidRequest("Worker clarification channel is unavailable".into())
+            })?
+            .push((command_id.to_owned(), clarification.to_owned()));
+        if let Some(input) = adapter_input.as_mut() {
+            write_adapter_control(
+                input,
+                &serde_json::json!({
+                    "type": "tyrion.worker.steer",
+                    "command_id": command_id,
+                    "scope": "assignment_clarification_only",
+                    "mandate_revision": control.mandate_revision,
+                    "immutable": ["goal", "authority", "criteria", "resource_ceilings"],
+                    "clarification": clarification,
+                }),
+            )?;
+        }
+        delivered.insert(command_id.to_owned());
+        control.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn interrupt(
+        &self,
+        attempt_id: &str,
+        command_id: &str,
+        reason: &str,
+    ) -> Result<(), TyrionError> {
+        let control = self.control(attempt_id)?;
+        let mut delivered = control.delivered_commands.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker command registry is unavailable".into())
+        })?;
+        if delivered.contains(command_id) {
+            return Ok(());
+        }
+        let mut adapter_input = control.adapter_input.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker adapter control channel is unavailable".into())
+        })?;
+        if control.adapter_detached.load(Ordering::SeqCst) {
+            return Err(TyrionError::ControlDenied(
+                "the structured Worker has already reached a terminal boundary".into(),
+            ));
+        }
+        if control.interrupted.load(Ordering::SeqCst) {
+            return Err(TyrionError::ControlDenied(
+                "the Worker has already been interrupted".into(),
+            ));
+        }
+        let mut interrupt_reason = control.interrupt_reason.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Worker interruption channel is unavailable".into())
+        })?;
+        if let Some(input) = adapter_input.as_mut() {
+            write_adapter_control(
+                input,
+                &serde_json::json!({
+                    "type": "tyrion.worker.interrupt",
+                    "command_id": command_id,
+                    "mandate_revision": control.mandate_revision,
+                    "reason": reason,
+                }),
+            )?;
+        }
+        *interrupt_reason = Some((command_id.to_owned(), reason.to_owned()));
+        control.interrupted.store(true, Ordering::SeqCst);
+        delivered.insert(command_id.to_owned());
+        control.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn end_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
+        self.controls
+            .lock()
+            .map_err(|_| {
+                TyrionError::InvalidRequest("Worker control registry is unavailable".into())
+            })?
+            .remove(attempt_id);
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_stranded_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
+        if let Some(runtime) = self.contained_codex.as_ref() {
+            runtime.cleanup_stranded_attempt(attempt_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_attempt_active(&self, attempt_id: &str) -> bool {
+        self.controls
+            .lock()
+            .is_ok_and(|controls| controls.contains_key(attempt_id))
+    }
+
+    pub(crate) fn accepts_live_control(&self, attempt_id: &str) -> bool {
+        self.controls
+            .lock()
+            .ok()
+            .and_then(|controls| controls.get(attempt_id).cloned())
+            .is_some_and(|control| {
+                !control.interrupted.load(Ordering::SeqCst)
+                    && !control.adapter_detached.load(Ordering::SeqCst)
+            })
+    }
+
+    pub(crate) fn live_telemetry(&self, attempt_id: &str) -> Option<serde_json::Value> {
+        let control = self.controls.lock().ok()?.get(attempt_id).cloned()?;
+        let telemetry = control.telemetry.lock().ok()?.clone();
+        Some(serde_json::json!({
+            "native_session_id": telemetry.native_session_id,
+            "latest_meaningful_activity": telemetry.latest_activity,
+            "activity_at_ms": telemetry.activity_at_ms,
+            "usage": if telemetry.usage_reported {
+                serde_json::json!({
+                    "input_tokens": telemetry.input_tokens,
+                    "output_tokens": telemetry.output_tokens,
+                })
+            } else {
+                serde_json::json!({})
+            },
+        }))
+    }
+
+    fn control(&self, attempt_id: &str) -> Result<Arc<WorkerControl>, TyrionError> {
+        self.controls
+            .lock()
+            .map_err(|_| {
+                TyrionError::InvalidRequest("Worker control registry is unavailable".into())
+            })?
+            .get(attempt_id)
+            .cloned()
+            .ok_or_else(|| TyrionError::ControlDenied("the Worker is no longer active".into()))
+    }
+
+    pub(crate) fn route(
+        &self,
+        requirements: &WorkerRequirements,
+        resources: &AssignmentResources,
+        required_authority_action: &str,
+        authority: &AuthorityEnvelope,
+        entry_harness: &str,
+        unavailable_configuration_ids: &std::collections::HashSet<String>,
+    ) -> Result<serde_json::Value, TyrionError> {
+        Ok(serde_json::to_value(self.catalog.route(
+            routing::RouteRequest {
+                requirements,
+                resources,
+                required_authority_action,
+                authority,
+                entry_harness,
+            },
+            unavailable_configuration_ids,
+        ))?)
     }
 
     pub(crate) fn assignment_execution(
@@ -232,9 +621,122 @@ impl WorkerRuntime {
         &self,
         assignment: &AssignmentContext,
     ) -> Result<CandidateResult, TyrionError> {
-        match &assignment.execution {
-            ExecutionSpec::Deterministic => {
-                let output = if self.incorrect_first_result {
+        let control = self.control(&assignment.attempt_id)?;
+        let result = (|| {
+            let configuration: routing::WorkerConfiguration =
+                serde_json::from_value(assignment.selected_configuration.clone())?;
+            if self.hold_for_control
+                && matches!(&assignment.execution, ExecutionSpec::Deterministic)
+            {
+                let mut clarifications = control.clarifications.lock().map_err(|_| {
+                    TyrionError::InvalidRequest(
+                        "Worker clarification channel is unavailable".into(),
+                    )
+                })?;
+                while !control.interrupted.load(Ordering::SeqCst) {
+                    let (next, _) = control
+                        .changed
+                        .wait_timeout(clarifications, Duration::from_millis(50))
+                        .map_err(|_| {
+                            TyrionError::InvalidRequest(
+                                "Worker control channel is unavailable".into(),
+                            )
+                        })?;
+                    clarifications = next;
+                }
+            }
+            if control.interrupted.load(Ordering::SeqCst) {
+                return Err(TyrionError::WorkerInterrupted);
+            }
+            match (configuration.adapter.kind, &assignment.execution) {
+                (
+                    routing::WorkerAdapterKind::CodexAppServer
+                    | routing::WorkerAdapterKind::ClaudeAgentSdk,
+                    ExecutionSpec::Deterministic,
+                ) => {
+                    let runtime = self.contained_codex.as_ref().ok_or_else(|| {
+                        TyrionError::InvalidRequest(
+                            "structured Worker execution requires --codex-worker-config for containment"
+                                .into(),
+                        )
+                    })?;
+                    let report = structured_process::execute(
+                        runtime,
+                        &configuration,
+                        assignment,
+                        &control,
+                        None,
+                    )?;
+                    let output = report.result_summary;
+                    Ok(CandidateResult {
+                        artifact_revision: ArtifactRevision::for_content(&output),
+                        output,
+                        base_revision: None,
+                        candidate_commits: Vec::new(),
+                        changed_paths: Vec::new(),
+                        artifacts: Vec::new(),
+                        known_effects: Vec::new(),
+                        native_session_id: Some(report.native_session_id),
+                        usage: serde_json::json!({
+                            "input_tokens": report.input_tokens,
+                            "output_tokens": report.output_tokens,
+                        }),
+                        latest_meaningful_activity: report.latest_meaningful_activity,
+                        state: CandidateState::Deterministic,
+                    })
+                }
+                (
+                    routing::WorkerAdapterKind::CodexAppServer
+                    | routing::WorkerAdapterKind::ClaudeAgentSdk,
+                    ExecutionSpec::CodexGit {
+                        repository,
+                        base_revision,
+                    },
+                ) => {
+                    let runtime = self.contained_codex.as_ref().ok_or_else(|| {
+                        TyrionError::InvalidRequest(
+                            "structured codex_git execution requires --codex-worker-config for Git artifact containment and verification"
+                                .into(),
+                        )
+                    })?;
+                    let prepared = runtime.prepare_structured_git_attempt(
+                        assignment,
+                        Path::new(repository),
+                        base_revision,
+                    )?;
+                    let report = structured_process::execute(
+                        runtime,
+                        &configuration,
+                        assignment,
+                        &control,
+                        Some(&prepared),
+                    )?;
+                    let candidate = runtime.accept_structured_git_candidate(
+                        assignment,
+                        prepared,
+                        report.result_summary,
+                    )?;
+                    Ok(CandidateResult {
+                        output: candidate.output.clone(),
+                        artifact_revision: ArtifactRevision::from_claim(
+                            candidate.candidate_revision.clone(),
+                        ),
+                        base_revision: Some(base_revision.clone()),
+                        candidate_commits: candidate.candidate_commits.clone(),
+                        changed_paths: candidate.changed_paths.clone(),
+                        artifacts: candidate.artifacts.clone(),
+                        known_effects: candidate.known_effects.clone(),
+                        native_session_id: Some(report.native_session_id),
+                        usage: serde_json::json!({
+                            "input_tokens": report.input_tokens,
+                            "output_tokens": report.output_tokens,
+                        }),
+                        latest_meaningful_activity: report.latest_meaningful_activity,
+                        state: CandidateState::CodexGit(candidate.state),
+                    })
+                }
+                (routing::WorkerAdapterKind::DeterministicLocal, ExecutionSpec::Deterministic) => {
+                    let output = if self.incorrect_first_result {
                     let mut commissions =
                         self.incorrect_result_commissions.lock().map_err(|_| {
                             TyrionError::InvalidRequest(
@@ -260,15 +762,21 @@ impl WorkerRuntime {
                     base_revision: None,
                     candidate_commits: Vec::new(),
                     changed_paths: Vec::new(),
-                    artifacts: Vec::new(),
-                    known_effects: Vec::new(),
-                    state: CandidateState::Deterministic,
-                })
-            }
-            ExecutionSpec::CodexGit {
-                repository,
-                base_revision,
-            } => {
+                        artifacts: Vec::new(),
+                        known_effects: Vec::new(),
+                        native_session_id: None,
+                        usage: serde_json::json!({}),
+                        latest_meaningful_activity: "Deterministic Result submitted".into(),
+                        state: CandidateState::Deterministic,
+                    })
+                }
+                (
+                    routing::WorkerAdapterKind::ContainedCodex,
+                    ExecutionSpec::CodexGit {
+                        repository,
+                        base_revision,
+                    },
+                ) => {
                 let runtime = self.contained_codex.as_ref().ok_or_else(|| {
                     TyrionError::InvalidRequest(
                         "codex_git execution requires --codex-worker-config".into(),
@@ -284,11 +792,25 @@ impl WorkerRuntime {
                     base_revision: Some(base_revision.clone()),
                     candidate_commits: candidate.candidate_commits.clone(),
                     changed_paths: candidate.changed_paths.clone(),
-                    artifacts: candidate.artifacts.clone(),
-                    known_effects: candidate.known_effects.clone(),
-                    state: CandidateState::CodexGit(candidate.state),
-                })
+                        artifacts: candidate.artifacts.clone(),
+                        known_effects: candidate.known_effects.clone(),
+                        native_session_id: None,
+                        usage: serde_json::json!({}),
+                        latest_meaningful_activity: "Contained Codex Result submitted".into(),
+                        state: CandidateState::CodexGit(candidate.state),
+                    })
+                }
+                _ => Err(TyrionError::InvalidRequest(format!(
+                    "selected Worker Configuration {} adapter is incompatible with the Assignment execution",
+                    configuration.id
+                ))),
             }
+        })();
+        let interrupted = control.interrupted.load(Ordering::SeqCst);
+        if interrupted {
+            Err(TyrionError::WorkerInterrupted)
+        } else {
+            result
         }
     }
 
@@ -373,6 +895,15 @@ impl WorkerRuntime {
                 .rollback_integration(state),
         }
     }
+}
+
+fn current_time_millis() -> Result<i64, TyrionError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TyrionError::InvalidRequest("system clock is before Unix epoch".into()))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| TyrionError::InvalidRequest("system clock does not fit in SQLite".into()))
 }
 
 fn verify_deterministic(

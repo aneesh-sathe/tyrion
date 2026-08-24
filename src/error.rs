@@ -59,6 +59,13 @@ pub enum TyrionError {
     ControlDenied(String),
     #[error("Worker Lease expired {operation}")]
     WorkerLeaseExpired { operation: &'static str },
+    #[error("Worker was interrupted by the Principal")]
+    WorkerInterrupted,
+    #[error("Worker Configuration {configuration_id} is unavailable: {message}")]
+    WorkerConfigurationUnavailable {
+        configuration_id: String,
+        message: String,
+    },
     #[error(
         "max_storage_bytes exceeded: Git artifacts require at least {required_bytes} bytes; start a new Commission with max_storage_bytes of {required_bytes} or more (current ceiling: {ceiling_bytes})."
     )]
@@ -91,6 +98,8 @@ impl TyrionError {
             Self::AttachmentRejected(_) => ErrorCode::AttachmentRejected,
             Self::ControlDenied(_) => ErrorCode::ControlDenied,
             Self::WorkerLeaseExpired { .. }
+            | Self::WorkerInterrupted
+            | Self::WorkerConfigurationUnavailable { .. }
             | Self::StorageCeilingExceeded { .. }
             | Self::IntegrationFailure { .. } => ErrorCode::InvalidRequest,
             Self::Io(_) | Self::Database(_) | Self::Serialization(_) => ErrorCode::Internal,

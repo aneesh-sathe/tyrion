@@ -43,6 +43,7 @@ pub(crate) enum AssignmentStatus {
     VerificationPending,
     VerificationFailed,
     ResourceBlocked,
+    AttentionRequired,
 }
 
 impl AssignmentStatus {
@@ -55,6 +56,7 @@ impl AssignmentStatus {
             Self::VerificationPending => "verification_pending",
             Self::VerificationFailed => "verification_failed",
             Self::ResourceBlocked => "resource_blocked",
+            Self::AttentionRequired => "attention_required",
         }
     }
 }
@@ -64,6 +66,7 @@ pub(crate) enum AttemptStatus {
     Running,
     Succeeded,
     Failed,
+    Interrupted,
 }
 
 impl AttemptStatus {
@@ -72,6 +75,7 @@ impl AttemptStatus {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -138,6 +142,9 @@ pub(crate) enum EventKind {
     AssignmentBlocked,
     AttachmentJoined,
     ActiveAttachmentChanged,
+    WorkerSteered,
+    WorkerInterrupted,
+    WorkerActivity,
 }
 
 impl EventKind {
@@ -160,6 +167,9 @@ impl EventKind {
             Self::AssignmentBlocked => "assignment_blocked",
             Self::AttachmentJoined => "attachment_joined",
             Self::ActiveAttachmentChanged => "active_attachment_changed",
+            Self::WorkerSteered => "worker_steered",
+            Self::WorkerInterrupted => "worker_interrupted",
+            Self::WorkerActivity => "worker_activity",
         }
     }
 }

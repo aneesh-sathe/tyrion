@@ -26,6 +26,8 @@ const SOURCE_PATCH_SHA256: &str =
     "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402";
 const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e";
 const POLICY_SHA256: &str = "76715da36c5e5f8603cd4732690707bca8b7f11ee153ae36521028db75bc4453";
+const CLAUDE_POLICY_SHA256: &str =
+    "89ec4d87f6a6b4bd8c581ec878ff82cb2e2acf96a5a581e94e3f0b10d84feccf";
 const CODEX_VERSION: &str = "codex-cli 0.147.0";
 
 #[derive(Debug, Deserialize)]
@@ -50,11 +52,24 @@ struct RuntimeConfig {
     codex_sha256: String,
     model: String,
     openshell_provider: String,
+    #[serde(default)]
+    claude: Option<ClaudeRuntimeConfig>,
     lease_ttl_seconds: u64,
     vcpus: u32,
     memory_mib: u64,
     overlay_disk_mib: u64,
     max_processes: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeRuntimeConfig {
+    policy_path: PathBuf,
+    policy_sha256: String,
+    openshell_provider: String,
+    binary: PathBuf,
+    version: String,
+    sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,7 +81,7 @@ struct PinnedArtifact {
 pub(super) struct ContainedCodexRuntime {
     config: RuntimeConfig,
     data_dir: PathBuf,
-    configuration: String,
+    fingerprint: String,
 }
 
 pub(super) struct GitCandidate {
@@ -88,6 +103,134 @@ pub(super) struct GitCandidateState {
     read_only: bool,
 }
 
+pub(super) struct StructuredGitAttempt {
+    artifact_dir: PathBuf,
+    base_bundle: PathBuf,
+    candidate_bundle: PathBuf,
+    base_revision: String,
+}
+
+pub(super) struct StructuredAdapterSandbox<'a> {
+    sandbox: Option<Sandbox<'a>>,
+}
+
+struct StructuredRuntimeProfile<'a> {
+    policy_path: &'a Path,
+    provider: &'a str,
+    binary: &'a Path,
+    remote_binary: &'static str,
+    binary_environment: &'static str,
+    version: &'a str,
+}
+
+impl StructuredGitAttempt {
+    pub(super) fn launch_payload(&self) -> Value {
+        serde_json::json!({
+            "base_bundle": "/sandbox/base.bundle",
+            "candidate_bundle": "/sandbox/candidate.bundle",
+            "base_revision": self.base_revision,
+            "candidate_reference": "refs/heads/tyrion-result",
+        })
+    }
+}
+
+impl StructuredAdapterSandbox<'_> {
+    pub(super) fn command(
+        &self,
+        configuration: &super::routing::WorkerConfiguration,
+        assignment: &AssignmentContext,
+        git_attempt: Option<&StructuredGitAttempt>,
+        configuration_fingerprint: &str,
+    ) -> Result<Command, TyrionError> {
+        let sandbox = self.sandbox.as_ref().ok_or_else(|| {
+            TyrionError::InvalidRequest("structured adapter sandbox is no longer active".into())
+        })?;
+        let mut command = Command::new(&sandbox.runtime.config.openshell_binary);
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "-n",
+                &sandbox.name,
+                "--workdir",
+                "/sandbox",
+                "--no-tty",
+                "--",
+                "env",
+                "PATH=/usr/local/bin:/usr/bin:/bin",
+            ])
+            .arg(format!("TYRION_COMMISSION_ID={}", assignment.commission_id))
+            .arg(format!("TYRION_ASSIGNMENT_ID={}", assignment.assignment_id))
+            .arg(format!("TYRION_ATTEMPT_ID={}", assignment.attempt_id))
+            .arg(format!(
+                "TYRION_MANDATE_REVISION={}",
+                assignment.mandate_revision
+            ))
+            .arg(format!("TYRION_PLAN_REVISION={}", assignment.plan_revision))
+            .arg(format!(
+                "TYRION_CONFIGURATION_FINGERPRINT={configuration_fingerprint}"
+            ))
+            .arg("TYRION_WORKSPACE_ROOT=/sandbox")
+            .arg(match configuration.adapter.kind {
+                super::routing::WorkerAdapterKind::CodexAppServer => {
+                    "TYRION_CODEX_BINARY=/sandbox/codex"
+                }
+                super::routing::WorkerAdapterKind::ClaudeAgentSdk => {
+                    "TYRION_CLAUDE_BINARY=/sandbox/claude"
+                }
+                _ => unreachable!("structured sandbox command uses a structured adapter"),
+            })
+            .args(git_attempt.into_iter().flat_map(|attempt| {
+                [
+                    "TYRION_BASE_BUNDLE=/sandbox/base.bundle".to_owned(),
+                    "TYRION_CANDIDATE_BUNDLE=/sandbox/candidate.bundle".to_owned(),
+                    format!("TYRION_BASE_REVISION={}", attempt.base_revision),
+                ]
+            }))
+            .arg("/sandbox/worker-adapter")
+            .args(configuration.adapter.command.iter().skip(1))
+            .env_clear()
+            .env(
+                "XDG_CONFIG_HOME",
+                &sandbox.runtime.config.openshell_config_home,
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    }
+
+    pub(super) fn finish(
+        &mut self,
+        git_attempt: Option<&StructuredGitAttempt>,
+        deadline: i64,
+    ) -> Result<(), TyrionError> {
+        let Some(sandbox) = self.sandbox.take() else {
+            return Ok(());
+        };
+        if let Some(git_attempt) = git_attempt {
+            sandbox.download(
+                "/sandbox/candidate.bundle",
+                &git_attempt.candidate_bundle,
+                deadline,
+            )?;
+        }
+        sandbox.delete()
+    }
+
+    pub(super) fn terminate(&mut self) {
+        if let Some(sandbox) = self.sandbox.take() {
+            let _ = sandbox.delete();
+        }
+    }
+}
+
+impl Drop for StructuredAdapterSandbox<'_> {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 pub(super) struct GitIntegrated {
     pub integrated_revision: String,
     pub artifacts: Vec<ArtifactRecord>,
@@ -107,22 +250,57 @@ impl ContainedCodexRuntime {
         let config: RuntimeConfig = serde_json::from_slice(&encoded)?;
         validate_config(&config)?;
         let fingerprint = format!("{:x}", Sha256::digest(&encoded));
-        let configuration = format!(
-            "{} + {} + openshell-source:{} + microvm-profile:{}",
-            config.codex_version,
-            config.openshell_version,
-            config.source_revision,
-            &fingerprint[..16]
-        );
         Ok(Self {
             config,
             data_dir: data_dir.to_owned(),
-            configuration,
+            fingerprint,
         })
     }
 
-    pub(super) fn configuration(&self) -> String {
-        self.configuration.clone()
+    pub(super) fn routing_descriptor(&self) -> super::routing::ContainedCodexDescriptor {
+        let mut settings = std::collections::BTreeMap::new();
+        settings.insert(
+            "openshell_version".into(),
+            serde_json::json!(self.config.openshell_version),
+        );
+        settings.insert(
+            "source_revision".into(),
+            serde_json::json!(self.config.source_revision),
+        );
+        settings.insert(
+            "base_image".into(),
+            serde_json::json!(self.config.base_image),
+        );
+        settings.insert("vcpus".into(), serde_json::json!(self.config.vcpus));
+        settings.insert(
+            "memory_mib".into(),
+            serde_json::json!(self.config.memory_mib),
+        );
+        settings.insert(
+            "overlay_disk_mib".into(),
+            serde_json::json!(self.config.overlay_disk_mib),
+        );
+        settings.insert(
+            "max_processes".into(),
+            serde_json::json!(self.config.max_processes),
+        );
+        settings.insert(
+            "runtime_configuration_sha256".into(),
+            serde_json::json!(self.fingerprint),
+        );
+        super::routing::ContainedCodexDescriptor {
+            id: format!("contained-codex-{}", &self.fingerprint[..16]),
+            version: self.config.codex_version.clone(),
+            model: self.config.model.clone(),
+            settings,
+            max_storage_bytes: self
+                .config
+                .overlay_disk_mib
+                .saturating_mul(1024)
+                .saturating_mul(1024),
+            containment_profile: format!("openshell-repaired-v0.0.104-{}", &self.fingerprint[..16]),
+            supports_claude: self.config.claude.is_some(),
+        }
     }
 
     pub(super) fn lease_ttl_seconds(&self) -> u64 {
@@ -134,6 +312,195 @@ impl ContainedCodexRuntime {
             .join("integrations")
             .join(commission_id)
             .join("repository")
+    }
+
+    pub(super) fn prepare_structured_adapter_sandbox(
+        &self,
+        configuration: &super::routing::WorkerConfiguration,
+        assignment: &AssignmentContext,
+        git_attempt: Option<&StructuredGitAttempt>,
+    ) -> Result<StructuredAdapterSandbox<'_>, TyrionError> {
+        let sandbox_name = sandbox_name("adapter", &assignment.attempt_id);
+        let profile = self.structured_runtime_profile(configuration.adapter.kind)?;
+        let sandbox = Sandbox::create(
+            self,
+            &sandbox_name,
+            profile.policy_path,
+            profile.provider,
+            assignment.lease_expires_at,
+        )?;
+        let host_scope = match &assignment.execution {
+            crate::protocol::ExecutionSpec::CodexGit { repository, .. } => Path::new(repository),
+            crate::protocol::ExecutionSpec::Deterministic => &self.data_dir,
+        };
+        sandbox.preflight(host_scope, &self.data_dir, assignment.lease_expires_at)?;
+        sandbox.upload(
+            Path::new(&configuration.adapter.command[0]),
+            "/sandbox/worker-adapter",
+            assignment.lease_expires_at,
+        )?;
+        sandbox.upload(
+            profile.binary,
+            profile.remote_binary,
+            assignment.lease_expires_at,
+        )?;
+        sandbox.exec_checked(
+            &[
+                "chmod",
+                "700",
+                "/sandbox/worker-adapter",
+                profile.remote_binary,
+            ],
+            None,
+            assignment.lease_expires_at,
+        )?;
+        let version = sandbox.exec_checked(
+            &[profile.remote_binary, "--version"],
+            None,
+            assignment.lease_expires_at,
+        )?;
+        if String::from_utf8_lossy(&version.stdout).trim() != profile.version {
+            return Err(TyrionError::InvalidRequest(format!(
+                "{} binary version does not match its runtime pin",
+                profile.binary_environment
+            )));
+        }
+        if let Some(git_attempt) = git_attempt {
+            sandbox.upload(
+                &git_attempt.base_bundle,
+                "/sandbox/base.bundle",
+                assignment.lease_expires_at,
+            )?;
+        }
+        Ok(StructuredAdapterSandbox {
+            sandbox: Some(sandbox),
+        })
+    }
+
+    fn structured_runtime_profile(
+        &self,
+        kind: super::routing::WorkerAdapterKind,
+    ) -> Result<StructuredRuntimeProfile<'_>, TyrionError> {
+        match kind {
+            super::routing::WorkerAdapterKind::CodexAppServer => Ok(StructuredRuntimeProfile {
+                policy_path: &self.config.policy_path,
+                provider: &self.config.openshell_provider,
+                binary: &self.config.codex_binary,
+                remote_binary: "/sandbox/codex",
+                binary_environment: "Codex",
+                version: &self.config.codex_version,
+            }),
+            super::routing::WorkerAdapterKind::ClaudeAgentSdk => {
+                let claude = self.config.claude.as_ref().ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "Claude Worker execution requires a pinned Claude OpenShell profile".into(),
+                    )
+                })?;
+                Ok(StructuredRuntimeProfile {
+                    policy_path: &claude.policy_path,
+                    provider: &claude.openshell_provider,
+                    binary: &claude.binary,
+                    remote_binary: "/sandbox/claude",
+                    binary_environment: "Claude",
+                    version: &claude.version,
+                })
+            }
+            _ => Err(TyrionError::InvalidRequest(
+                "structured runtime profile requested for an unsupported adapter".into(),
+            )),
+        }
+    }
+
+    pub(super) fn cleanup_stranded_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
+        for prefix in ["adapter", "attempt"] {
+            let name = sandbox_name(prefix, attempt_id);
+            let output = Command::new(&self.config.openshell_binary)
+                .args(["sandbox", "delete", &name])
+                .env_clear()
+                .env("XDG_CONFIG_HOME", &self.config.openshell_config_home)
+                .output()?;
+            require_success("stranded OpenShell sandbox cleanup", output)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_structured_git_attempt(
+        &self,
+        assignment: &AssignmentContext,
+        repository: &Path,
+        base_revision: &str,
+    ) -> Result<StructuredGitAttempt, TyrionError> {
+        ensure_lease_active(assignment.lease_expires_at)?;
+        let repository = repository.canonicalize()?;
+        let artifact_dir = self
+            .data_dir
+            .join("artifacts")
+            .join(&assignment.commission_id)
+            .join(&assignment.attempt_id);
+        create_private_dir(&artifact_dir)?;
+        let base_bundle = artifact_dir.join("base.bundle");
+        let candidate_bundle = artifact_dir.join("candidate.bundle");
+        create_base_bundle(&repository, base_revision, &base_bundle)?;
+        let mut input_bundles = vec![base_bundle.as_path()];
+        input_bundles.extend(
+            assignment
+                .comparison_candidates
+                .iter()
+                .map(|candidate| candidate.bundle_path.as_path()),
+        );
+        enforce_storage_ceiling(&input_bundles, assignment.max_storage_bytes)?;
+        Ok(StructuredGitAttempt {
+            artifact_dir,
+            base_bundle,
+            candidate_bundle,
+            base_revision: base_revision.to_owned(),
+        })
+    }
+
+    pub(super) fn accept_structured_git_candidate(
+        &self,
+        assignment: &AssignmentContext,
+        prepared: StructuredGitAttempt,
+        output: String,
+    ) -> Result<GitCandidate, TyrionError> {
+        ensure_lease_active(assignment.lease_expires_at)?;
+        let base_artifact = artifact("base_git_bundle", &prepared.base_bundle)?;
+        let candidate_artifact = artifact("candidate_git_bundle", &prepared.candidate_bundle)?;
+        let mut stored_bundles = vec![
+            prepared.base_bundle.as_path(),
+            prepared.candidate_bundle.as_path(),
+        ];
+        stored_bundles.extend(
+            assignment
+                .comparison_candidates
+                .iter()
+                .map(|candidate| candidate.bundle_path.as_path()),
+        );
+        enforce_storage_ceiling(&stored_bundles, assignment.max_storage_bytes)?;
+        let validated = validate_candidate_bundle(
+            &prepared.artifact_dir,
+            &prepared.base_bundle,
+            &prepared.candidate_bundle,
+            &prepared.base_revision,
+            &assignment.authorized_paths,
+            assignment.declared_write_scopes.is_empty(),
+        )?;
+        Ok(GitCandidate {
+            output,
+            candidate_revision: validated.candidate_revision.clone(),
+            candidate_commits: validated.commits.clone(),
+            changed_paths: validated.changed_paths,
+            artifacts: vec![base_artifact, candidate_artifact],
+            known_effects: Vec::new(),
+            state: GitCandidateState {
+                base_bundle: prepared.base_bundle,
+                candidate_bundle: prepared.candidate_bundle,
+                base_revision: prepared.base_revision,
+                candidate_revision: validated.candidate_revision,
+                candidate_commits: validated.commits,
+                read_only: assignment.declared_write_scopes.is_empty(),
+            },
+        })
     }
 
     pub(super) fn execute(
@@ -163,7 +530,13 @@ impl ContainedCodexRuntime {
         enforce_storage_ceiling(&input_bundles, assignment.max_storage_bytes)?;
 
         let sandbox_name = sandbox_name("attempt", &assignment.attempt_id);
-        let sandbox = Sandbox::create(self, &sandbox_name, assignment.lease_expires_at)?;
+        let sandbox = Sandbox::create(
+            self,
+            &sandbox_name,
+            &self.config.policy_path,
+            &self.config.openshell_provider,
+            assignment.lease_expires_at,
+        )?;
         sandbox.preflight(&repository, &self.data_dir, assignment.lease_expires_at)?;
         sandbox.upload(
             &base_bundle,
@@ -538,7 +911,13 @@ impl ContainedCodexRuntime {
             let run_attempt_id =
                 format!("{}-verification-{}", assignment.attempt_id, run_index + 1);
             let sandbox_name = sandbox_name(scope.as_str(), &run_attempt_id);
-            let sandbox = Sandbox::create(self, &sandbox_name, assignment.lease_expires_at)?;
+            let sandbox = Sandbox::create(
+                self,
+                &sandbox_name,
+                &self.config.policy_path,
+                &self.config.openshell_provider,
+                assignment.lease_expires_at,
+            )?;
             sandbox.preflight(
                 Path::new(repository),
                 &self.data_dir,
@@ -595,6 +974,8 @@ impl<'a> Sandbox<'a> {
     fn create(
         runtime: &'a ContainedCodexRuntime,
         name: &str,
+        policy_path: &Path,
+        provider: &str,
         deadline: i64,
     ) -> Result<Self, TyrionError> {
         let mut arguments = vec![
@@ -605,9 +986,9 @@ impl<'a> Sandbox<'a> {
             "--from",
             &runtime.config.base_image,
             "--policy",
-            path_text(&runtime.config.policy_path)?,
+            path_text(policy_path)?,
         ];
-        arguments.extend(["--provider", &runtime.config.openshell_provider]);
+        arguments.extend(["--provider", provider]);
         arguments.extend([
             "--no-auto-providers",
             "--cpu",
@@ -683,7 +1064,7 @@ impl<'a> Sandbox<'a> {
         let host_repository_parent = shell_quote(path_text(host_repository_parent)?);
         let host_state = shell_quote(path_text(data_dir)?);
         let probe = format!(
-            "set -eu; printf tyrion-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; memory_kib=$(awk '/MemTotal/ {{print $2}}' /proc/meminfo); test \"$memory_kib\" -ge 1900000; test \"$memory_kib\" -le 2097152; storage_kib=$(df -Pk /sandbox | awk 'NR==2 {{print $2}}'); test \"$storage_kib\" -le 4194304; test ! -e {host_repository}; test ! -e {host_repository_parent}; test ! -e {host_state}; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test ! -e /home/sandbox/.codex; test -z \"${{OPENAI_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; test ! -r /opt/openshell/auth/sandbox.jwt; test ! -r /opt/openshell/tls/tls.key; if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; printf allowed >/sandbox/tyrion-probe; command -v curl >/dev/null; if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; sleep 600 >/dev/null 2>&1 & descendant=$!; kill -0 \"$descendant\"; printf descendant-live"
+            "set -eu; printf tyrion-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; memory_kib=$(awk '/MemTotal/ {{print $2}}' /proc/meminfo); test \"$memory_kib\" -ge 1900000; test \"$memory_kib\" -le 2097152; storage_kib=$(df -Pk /sandbox | awk 'NR==2 {{print $2}}'); test \"$storage_kib\" -le 4194304; test ! -e {host_repository}; test ! -e {host_repository_parent}; test ! -e {host_state}; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test ! -e /home/sandbox/.codex; test ! -e /home/sandbox/.claude; test -z \"${{OPENAI_API_KEY:-}}${{ANTHROPIC_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; test ! -r /opt/openshell/auth/sandbox.jwt; test ! -r /opt/openshell/tls/tls.key; if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; printf allowed >/sandbox/tyrion-probe; command -v curl >/dev/null; if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; sleep 600 >/dev/null 2>&1 & descendant=$!; kill -0 \"$descendant\"; printf descendant-live"
         );
         self.exec_checked(&["sh", "-c", &probe], None, deadline)?;
         let logs = self
@@ -858,6 +1239,18 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
     verify_hash(&config.kernel_config_path, &config.kernel_config_sha256)?;
     verify_hash(&config.source_patch_path, &config.source_patch_sha256)?;
     verify_hash(&config.codex_binary, &config.codex_sha256)?;
+    if let Some(claude) = &config.claude {
+        if claude.policy_sha256 != CLAUDE_POLICY_SHA256
+            || claude.openshell_provider.trim().is_empty()
+            || claude.version.trim().is_empty()
+        {
+            return Err(TyrionError::InvalidRequest(
+                "Claude runtime does not match the pinned OpenShell profile".into(),
+            ));
+        }
+        verify_hash(&claude.policy_path, &claude.policy_sha256)?;
+        verify_hash(&claude.binary, &claude.sha256)?;
+    }
     for artifact in &config.runtime_artifacts {
         verify_hash(&artifact.path, &artifact.sha256)?;
     }

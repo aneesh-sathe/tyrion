@@ -1,6 +1,6 @@
 # Tyrion
 
-Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), and useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
+Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6), and inspectable cross-harness Worker routing and control from [issue #7](https://github.com/aneesh-sathe/tyrion/issues/7). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
 
 ## What exists
 
@@ -34,6 +34,11 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Serialized dependency-aware Git Integration from immutable current artifact revisions
 - Explicit reconciliation for unexpected scope, conflict, stale base, and assembled regressions
 - Activity Journal timing Evidence for verified useful concurrency
+- Complete Worker Configuration routing across Codex and Claude without Entry Session affinity
+- Hard capability, authority, tool, Skill, context, Assignment, and resource eligibility gates
+- Stable Commission-local Worker Handles with inspection, steering, and interruption
+- Structured Codex app-server and Claude Agent SDK lifecycle contract validation
+- Approximately equal replacement or a durable Attention Condition when a preferred configuration is unavailable
 - A criterion-linked Verified Completion briefing
 - Assignment-scoped resource Blockers that preserve Control Plane availability
 - Public ordered lifecycle events, including Assignment readiness before dispatch
@@ -86,6 +91,10 @@ An optional `plan` on a `codex_git` proposal enables multiple Assignments. Every
 
 The Control Plane validates the whole dependency graph, criterion ownership, cumulative spend, and any comparison-attempt allowance before proposal creation. Competition members must share one dependency frontier and cannot depend on each other, and their worst-case comparison working set must fit the storage ceiling. Acceptance records the entry-model plan, exposes only a safe and fully reservable frontier, and commits every dispatch reservation atomically with its Attempt. Current Evidence and comparison or rework Assignments create later plan revisions through the same safe-frontier selector. Accepted Results integrate one at a time. Competing candidates remain unintegrated until a comparison Assignment receives every contender bundle and its Evidence, applies the declared rule, and produces a fresh verified Result. Generic reconciliation reserves the Commission storage ceiling plus the source Assignment's compute and spend budgets before inspecting its candidate. A failed assembled-state check retains its Evidence, rolls the integration worktree back, and records dispatchable rework. Verified Completion requires every ordinary planned Assignment to be accepted or explicitly superseded by reconciliation and every criterion to pass on the final artifact revision. The Activity Journal uses the union of accepted and explicitly planned contender execution intervals to retain serial execution time, the parallel execution window, measured reduction, and final end-to-end elapsed time.
 
+Start `tyriond` with `--worker-catalog <json>` to route each ready Assignment as one complete Worker Configuration. Proposal-level `worker_requirements` apply to a legacy single Assignment; each explicit planned Assignment may override them with its own required capabilities, tools, Skills, minimum context, Assignment constraints, and required, excluded, or preferred configuration IDs. Eligibility is fail-closed. Eligible configurations are ordered lexicographically by expected verified correctness, explicit and measured preference adherence, first-pass acceptance, elapsed-time contribution, cost, continuity, and finally stable configuration ID. The Entry Session harness is retained only in the visible rationale and never changes that order. See [Cross-harness Worker routing and control](docs/cross-harness-workers.md).
+
+Available Codex app-server and Claude Agent SDK configurations name an absolute, SHA-256-pinned adapter executable. Tyrion launches each with its own pinned native CLI, brokered provider, and endpoint-restricted OpenShell policy, plus a structured revision-bound Assignment and spend envelope. It validates the exact native model, tool and Skill activation state, lifecycle, usage, and typed Result; forwards journal-first controls; and persists native session telemetry for inspection. Launch-time unavailability reuses the approximately-equal routing rule, while durable cleanup survives repeated Control Plane crashes. Git-backed adapters receive only Tyrion-created bundle bindings; Tyrion commits ordinary uncommitted harness edits before independently validating and integrating the candidate. Production reference adapters are in `adapters/`.
+
 ## Run locally
 
 Build the binaries:
@@ -94,12 +103,14 @@ Build the binaries:
 cargo build
 ```
 
-Start the Control Plane:
+Start the Control Plane, optionally with a complete Worker catalog:
 
 ```sh
 target/debug/tyriond \
   --data-dir .scratch/tyrion-data \
-  --socket .scratch/tyrion-data/tyrion.sock
+  --socket .scratch/tyrion-data/tyrion.sock \
+  --codex-worker-config runtime.json \
+  --worker-catalog worker-catalog.json
 ```
 
 Create `proposal.json`:
@@ -107,6 +118,14 @@ Create `proposal.json`:
 ```json
 {
   "goal": "return a deterministic greeting",
+  "worker_requirements": {
+    "capabilities": ["structured_lifecycle", "semantic_interrupt"],
+    "tools": [],
+    "skills": [],
+    "min_context_tokens": 0,
+    "context_strategy": "fresh",
+    "assignment_constraints": []
+  },
   "criteria": [
     {
       "id": "greeting",
@@ -152,7 +171,7 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --idempotency-key issue-codex-token
 ```
 
-Copy the returned token into the attachment handshake. A Full Entry Session currently advertises all seven supported capabilities:
+Copy the returned token into the attachment handshake. A Full Entry Session currently advertises all nine supported capabilities:
 
 ```sh
 target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
@@ -169,6 +188,8 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --capability control_takeover \
   --capability material_notifications \
   --capability persistent_mode_display \
+  --capability worker_steering \
+  --capability worker_interruption \
   --idempotency-key connect-codex-session
 ```
 
@@ -207,7 +228,27 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --capability control_takeover \
   --capability material_notifications \
   --capability persistent_mode_display \
+  --capability worker_steering \
+  --capability worker_interruption \
   --last-event-sequence LAST_EVENT_SEQUENCE
+```
+
+Inspection returns every Worker Handle, exact configuration, routing rationale, Assignment, elapsed time, latest meaningful activity, usage, and currently available controls. The Active Attachment can clarify or stop a running Worker without changing the Commission mandate revision:
+
+```sh
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  worker steer COMMISSION_ID Arya \
+  --clarification "Keep the accepted API contract unchanged." \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key steer-arya-1
+
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  worker interrupt COMMISSION_ID Arya \
+  --reason "Stop this Attempt." \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key interrupt-arya-1
 ```
 
 Model and Principal criteria remain visibly `uncertain` after Integration until the Active Attachment records matching structured Evidence. Each `evidence.json` record names its criterion, current Result, Evidence type, verdict, exact verifier configuration, procedure, environment, inspectable output, and any diagnosed defect. The daemon creates the Verification Attempt identity and binds the verifier identity to the authenticated Attachment, so caller-supplied identity claims are rejected. Failed or uncertain Evidence must classify the defect as `result`, `verifier`, `environment`, or `criterion`.

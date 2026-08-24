@@ -15,7 +15,7 @@ pub(super) fn inspect_commission(
     let commission = connection
         .query_row(
             "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at,
-                    artifact_revision, execution_json, plan_json
+                    artifact_revision, execution_json, plan_json, worker_requirements_json
              FROM commissions WHERE id = ?1",
             [commission_id],
             |row| {
@@ -38,6 +38,7 @@ pub(super) fn inspect_commission(
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         ))?,
+                    "worker_requirements": json_column(row, 10)?,
                 }))
             },
         )
@@ -240,9 +241,12 @@ pub(super) fn inspect_commission(
                 assignment_metadata.competition_group,
                 assignment_metadata.competition_uncertainty,
                 assignment_metadata.competition_rule,
-                assignment_metadata.position
+                assignment_metadata.position,
+                assignment_routes.status, assignment_routes.selected_configuration_json,
+                assignment_routes.rationale_json, assignment_routes.decided_at
          FROM assignments
          JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+         LEFT JOIN assignment_routes ON assignment_routes.assignment_id = assignments.id
          WHERE assignments.commission_id = ?1
          ORDER BY assignment_metadata.position, assignments.id",
         commission_id,
@@ -257,6 +261,30 @@ pub(super) fn inspect_commission(
                     "comparison_rule": comparison_rule,
                 })),
                 _ => None,
+            };
+            let route_status = row.get::<_, Option<String>>(16)?;
+            let route = match route_status {
+                Some(status) => {
+                    let selected_configuration = row
+                        .get::<_, Option<String>>(17)?
+                        .map(|encoded| serde_json::from_str::<Value>(&encoded))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                17,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    let rationale = json_column(row, 18)?;
+                    Some(json!({
+                        "status": status,
+                        "selected_configuration": selected_configuration,
+                        "rationale": rationale,
+                        "decided_at": row.get::<_, i64>(19)?,
+                    }))
+                }
+                None => None,
             };
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
@@ -275,6 +303,7 @@ pub(super) fn inspect_commission(
                 },
                 "competition": competition,
                 "position": row.get::<_, i64>(15)?,
+                "route": route,
             }))
         },
     )?;
@@ -326,6 +355,78 @@ pub(super) fn inspect_commission(
                     "paid_service_spend_cents": row.get::<_, Option<u64>>(17)?,
                     "status": row.get::<_, Option<String>>(18)?,
                 },
+            }))
+        },
+    )?;
+    let now_ms = current_time_millis()?;
+    let workers = query_values(
+        connection,
+        "SELECT workers.id, workers.handle, workers.status,
+                workers.configuration_json, workers.routing_rationale_json,
+                workers.native_session_id, workers.latest_activity,
+                workers.activity_at_ms, workers.usage_json,
+                attempts.started_at_ms, attempts.execution_completed_at_ms,
+                assignments.id, assignment_metadata.logical_id, assignment_metadata.goal,
+                attempts.id
+         FROM workers
+         JOIN attempts ON attempts.id = workers.attempt_id
+         JOIN assignments ON assignments.id = workers.assignment_id
+         JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+         WHERE workers.commission_id = ?1
+         ORDER BY attempts.started_at_ms, workers.id",
+        commission_id,
+        |row| {
+            let status = row.get::<_, String>(2)?;
+            let started_at_ms = row.get::<_, i64>(9)?;
+            let execution_completed_at_ms = row.get::<_, Option<i64>>(10)?;
+            let elapsed_time_ms = execution_completed_at_ms
+                .unwrap_or(now_ms)
+                .saturating_sub(started_at_ms)
+                .max(0);
+            let available_controls = json!(["inspect"]);
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "handle": row.get::<_, String>(1)?,
+                "status": status,
+                "configuration": json_column(row, 3)?,
+                "routing_rationale": json_column(row, 4)?,
+                "native_session_id": row.get::<_, Option<String>>(5)?,
+                "latest_meaningful_activity": row.get::<_, String>(6)?,
+                "activity_at_ms": row.get::<_, i64>(7)?,
+                "usage": json_column(row, 8)?,
+                "started_at_ms": started_at_ms,
+                "elapsed_time_ms": elapsed_time_ms,
+                "assignment": {
+                    "id": row.get::<_, String>(11)?,
+                    "logical_id": row.get::<_, String>(12)?,
+                    "goal": row.get::<_, String>(13)?,
+                },
+                "attempt_id": row.get::<_, String>(14)?,
+                "available_controls": available_controls,
+            }))
+        },
+    )?;
+    let worker_commands = query_values(
+        connection,
+        "SELECT worker_commands.id, workers.handle, worker_commands.kind,
+                worker_commands.payload_json, worker_commands.mandate_revision,
+                worker_commands.status, worker_commands.created_at,
+                worker_commands.attachment_id
+         FROM worker_commands
+         JOIN workers ON workers.id = worker_commands.worker_id
+         WHERE worker_commands.commission_id = ?1
+         ORDER BY worker_commands.created_at, worker_commands.rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "worker_handle": row.get::<_, String>(1)?,
+                "kind": row.get::<_, String>(2)?,
+                "payload": json_column(row, 3)?,
+                "mandate_revision": row.get::<_, i64>(4)?,
+                "status": row.get::<_, String>(5)?,
+                "created_at": row.get::<_, i64>(6)?,
+                "attachment_id": row.get::<_, String>(7)?,
             }))
         },
     )?;
@@ -418,6 +519,25 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let attention_conditions = query_values(
+        connection,
+        "SELECT id, assignment_id, code, requirement, status, created_at, resolved_at
+         FROM attention_conditions
+         WHERE commission_id = ?1
+         ORDER BY created_at, id",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "assignment_id": row.get::<_, String>(1)?,
+                "code": row.get::<_, String>(2)?,
+                "requirement": row.get::<_, String>(3)?,
+                "status": row.get::<_, String>(4)?,
+                "created_at": row.get::<_, i64>(5)?,
+                "resolved_at": row.get::<_, Option<i64>>(6)?,
+            }))
+        },
+    )?;
     let attachments = query_values(
         connection,
         "SELECT attachments.id, attachments.harness, attachments.adapter_identity,
@@ -500,6 +620,7 @@ pub(super) fn inspect_commission(
     let candidates = assignments
         .iter()
         .filter(|assignment| assignment["status"] == "ready")
+        .filter(|assignment| assignment["route"]["status"] != "attention_required")
         .map(|assignment| {
             let resources = &assignment["resources"];
             Work {
@@ -678,11 +799,14 @@ pub(super) fn inspect_commission(
         "frontier_holds": frontier_holds,
         "assignments": assignments,
         "attempts": attempts,
+        "workers": workers,
+        "worker_commands": worker_commands,
         "results": results,
         "evidence": evidence,
         "briefing": briefing,
         "events": events,
         "blockers": blockers,
+        "attention_conditions": attention_conditions,
         "attachments": attachments,
         "activity_journal": activity_journal,
         "verification": verification,
@@ -716,6 +840,15 @@ fn json_competition(value: &Value) -> Option<Competition> {
         uncertainty: value["uncertainty"].as_str()?.to_owned(),
         rule: value["comparison_rule"].as_str()?.to_owned(),
     })
+}
+
+fn current_time_millis() -> Result<i64, TyrionError> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| TyrionError::InvalidRequest("system clock is before Unix epoch".into()))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| TyrionError::InvalidRequest("system clock does not fit in SQLite".into()))
 }
 
 pub(super) fn event_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {

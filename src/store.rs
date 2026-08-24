@@ -14,10 +14,10 @@ use crate::domain::{
 };
 use crate::protocol::{
     AcceptanceCriterion, AdapterIdentity, AssignmentPurpose, AssignmentResources,
-    AttachmentHandshake, CommissionPlan, CommissionProposal, CommissionReplayCursor, ExecutionSpec,
-    PlannedAssignment, Request, ResourceCeilings, VerificationAmendment, VerificationDefect,
-    VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict, Verifier, VerifierType,
-    PROTOCOL_VERSION,
+    AttachmentHandshake, AuthorityEnvelope, CommissionPlan, CommissionProposal,
+    CommissionReplayCursor, ExecutionSpec, PlannedAssignment, Request, ResourceCeilings,
+    VerificationAmendment, VerificationDefect, VerificationDepth, VerificationEvidenceSubmission,
+    VerificationVerdict, Verifier, VerifierType, WorkerRequirements, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
@@ -144,6 +144,42 @@ impl VerificationRecoveryStatus {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WorkerControlAction {
+    Steer,
+    Interrupt,
+}
+
+impl WorkerControlAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Interrupt => "interrupt",
+        }
+    }
+
+    const fn capability(self) -> &'static str {
+        match self {
+            Self::Steer => attachment::WORKER_STEERING,
+            Self::Interrupt => attachment::WORKER_INTERRUPTION,
+        }
+    }
+
+    const fn event_kind(self) -> EventKind {
+        match self {
+            Self::Steer => EventKind::WorkerSteered,
+            Self::Interrupt => EventKind::WorkerInterrupted,
+        }
+    }
+
+    const fn message_field(self) -> &'static str {
+        match self {
+            Self::Steer => "clarification",
+            Self::Interrupt => "reason",
+        }
+    }
+}
+
 impl Store {
     pub fn open(database_path: &Path) -> Result<Self, TyrionError> {
         let connection = Connection::open(database_path)?;
@@ -188,14 +224,16 @@ impl Store {
         let commission_id = Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO commissions (
-                id, goal, status, revision, created_at, execution_json, plan_json
-             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                id, goal, status, revision, created_at, execution_json,
+                worker_requirements_json, plan_json
+             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
             params![
                 commission_id,
                 proposal.goal,
                 CommissionStatus::Proposed.as_str(),
                 unix_timestamp()?,
                 serde_json::to_string(&proposal.execution)?,
+                serde_json::to_string(&proposal.worker_requirements)?,
                 proposal
                     .plan
                     .as_ref()
@@ -368,6 +406,157 @@ impl Store {
             "active_attachment_id": attachment_id,
             "attachments": projected["attachments"],
         });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn steer_worker(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        worker_handle: &str,
+        clarification: &str,
+        worker: &worker::WorkerRuntime,
+    ) -> Result<Value, TyrionError> {
+        control_worker(
+            &mut self.connection,
+            request,
+            commission_id,
+            worker_handle,
+            clarification,
+            WorkerControlAction::Steer,
+            worker,
+        )
+    }
+
+    pub fn interrupt_worker(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        worker_handle: &str,
+        reason: &str,
+        worker: &worker::WorkerRuntime,
+    ) -> Result<Value, TyrionError> {
+        control_worker(
+            &mut self.connection,
+            request,
+            commission_id,
+            worker_handle,
+            reason,
+            WorkerControlAction::Interrupt,
+            worker,
+        )
+    }
+
+    pub fn retry_worker(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        worker_handle: &str,
+    ) -> Result<Value, TyrionError> {
+        if worker_handle.trim().is_empty() {
+            return Err(TyrionError::InvalidRequest(
+                "Worker Handle must not be empty".into(),
+            ));
+        }
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Worker retry requires an expected Commission revision".into(),
+            )
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::WORKER_INTERRUPTION,
+        )?;
+        let (status, revision) = transaction
+            .query_row(
+                "SELECT status, revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            });
+        }
+        if status != CommissionStatus::Active.as_str() {
+            return Err(TyrionError::ControlDenied(format!(
+                "Commission {commission_id} is {status}"
+            )));
+        }
+        let (assignment_id, worker_status, assignment_status) = transaction
+            .query_row(
+                "SELECT workers.assignment_id, workers.status, assignments.status
+                 FROM workers
+                 JOIN assignments ON assignments.id = workers.assignment_id
+                 WHERE workers.commission_id = ?1 AND workers.handle = ?2",
+                params![commission_id, worker_handle],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                TyrionError::ControlDenied(format!(
+                    "Worker Handle {worker_handle} is not part of Commission {commission_id}"
+                ))
+            })?;
+        if worker_status != AttemptStatus::Interrupted.as_str()
+            || assignment_status != AssignmentStatus::AttentionRequired.as_str()
+        {
+            return Err(TyrionError::ControlDenied(format!(
+                "Worker {worker_handle} is not awaiting an explicit interruption recovery"
+            )));
+        }
+        let retry_available = worker_retry_available(&transaction, commission_id, &assignment_id)?;
+        if !retry_available {
+            return Err(TyrionError::ControlDenied(
+                "Worker retry requires an open interruption recovery and remaining max_attempts"
+                    .into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE assignments SET status = 'ready' WHERE id = ?1",
+            [&assignment_id],
+        )?;
+        transaction.execute(
+            "UPDATE attention_conditions
+             SET status = 'resolved', resolved_at = ?2
+             WHERE assignment_id = ?1 AND code = 'worker_interrupted' AND status = 'open'",
+            params![assignment_id, unix_timestamp()?],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::AssignmentReady,
+            revision,
+            &serde_json::json!({
+                "assignment_id": assignment_id,
+                "reason": "principal_retried_interrupted_worker",
+                "prior_worker_handle": worker_handle,
+                "attachment_id": attachment_id,
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
         transaction.commit()?;
         Ok(result)
@@ -688,6 +877,7 @@ impl Store {
         &self,
         request: &Request,
         commission_id: &str,
+        runtime: &worker::WorkerRuntime,
     ) -> Result<Value, TyrionError> {
         let attachment_id = authenticated_attachment_id(&self.connection, request)?;
         ensure_commission_attachment(
@@ -696,7 +886,15 @@ impl Store {
             commission_id,
             attachment::COMMISSION_INSPECTION,
         )?;
-        project_commission(&self.connection, commission_id)
+        let mut projection = project_commission(&self.connection, commission_id)?;
+        apply_attachment_worker_controls(
+            &self.connection,
+            &attachment_id,
+            commission_id,
+            &mut projection,
+            runtime,
+        )?;
+        Ok(projection)
     }
 
     pub fn replay_events(
@@ -727,10 +925,138 @@ impl Store {
 
     pub fn ready_commission_ids(&self) -> Result<Vec<String>, TyrionError> {
         let mut statement = self.connection.prepare(
-            "SELECT DISTINCT commission_id FROM assignments WHERE status = ?1 ORDER BY commission_id",
+            "SELECT DISTINCT commission_id FROM assignments
+             WHERE status IN (?1, ?2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM attempts
+                   JOIN sandbox_cleanups ON sandbox_cleanups.attempt_id = attempts.id
+                   WHERE attempts.assignment_id = assignments.id
+               )
+             ORDER BY commission_id",
         )?;
-        let rows = statement.query_map([AssignmentStatus::Ready.as_str()], |row| row.get(0))?;
+        let rows = statement.query_map(
+            params![
+                AssignmentStatus::Ready.as_str(),
+                AssignmentStatus::AttentionRequired.as_str()
+            ],
+            |row| row.get(0),
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn recover_stranded_attempts(&mut self) -> Result<Vec<String>, TyrionError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stranded = {
+            let mut statement = transaction.prepare(
+                "SELECT attempts.id, attempts.assignment_id, assignments.commission_id,
+                        commissions.revision
+                 FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 JOIN commissions ON commissions.id = assignments.commission_id
+                 WHERE attempts.status = 'running'
+                 ORDER BY attempts.started_at, attempts.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let now = unix_timestamp()?;
+        let now_ms = unix_timestamp_millis()?;
+        for (attempt_id, assignment_id, commission_id, revision) in &stranded {
+            transaction.execute(
+                "INSERT OR IGNORE INTO sandbox_cleanups (attempt_id, created_at)
+                 VALUES (?1, ?2)",
+                params![attempt_id, now],
+            )?;
+            transaction.execute(
+                "UPDATE attempts
+                 SET status = 'failed', completed_at = ?2,
+                     execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?3),
+                     completed_at_ms = ?3
+                 WHERE id = ?1 AND status = 'running'",
+                params![attempt_id, now, now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE worker_leases
+                 SET status = 'expired', released_at = ?2
+                 WHERE attempt_id = ?1 AND status = 'active'",
+                params![attempt_id, now],
+            )?;
+            transaction.execute(
+                "UPDATE resource_reservations
+                 SET status = 'revoked', released_at = ?2
+                 WHERE attempt_id = ?1 AND status = 'active'",
+                params![attempt_id, now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE workers
+                 SET status = 'failed', latest_activity = ?2, activity_at_ms = ?3
+                 WHERE attempt_id = ?1 AND status = 'running'",
+                params![
+                    attempt_id,
+                    "Worker lost during Control Plane restart",
+                    now_ms
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE worker_commands
+                 SET status = 'failed'
+                 WHERE worker_id IN (
+                     SELECT id FROM workers WHERE attempt_id = ?1
+                 ) AND status = 'pending'",
+                [attempt_id],
+            )?;
+            transaction.execute(
+                "UPDATE assignments SET status = 'ready' WHERE id = ?1 AND status = 'running'",
+                [assignment_id],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::WorkerActivity,
+                *revision,
+                &serde_json::json!({
+                    "assignment_id": assignment_id,
+                    "attempt_id": attempt_id,
+                    "activity": "Worker lost during Control Plane restart",
+                    "terminal_state": "failed",
+                }),
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::AssignmentReady,
+                *revision,
+                &serde_json::json!({
+                    "assignment_id": assignment_id,
+                    "reason": "stranded_attempt_recovered",
+                }),
+            )?;
+        }
+        let pending_cleanups = {
+            let mut statement = transaction
+                .prepare("SELECT attempt_id FROM sandbox_cleanups ORDER BY created_at")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok(pending_cleanups)
+    }
+
+    pub fn complete_sandbox_cleanup(&mut self, attempt_id: &str) -> Result<(), TyrionError> {
+        self.connection.execute(
+            "DELETE FROM sandbox_cleanups WHERE attempt_id = ?1",
+            [attempt_id],
+        )?;
+        Ok(())
     }
 
     pub fn dispatch_snapshot(&self, commission_id: &str) -> Result<(u32, u32, u32), TyrionError> {
@@ -739,14 +1065,18 @@ impl Store {
                 "SELECT resource_ceilings.max_worker_concurrency,
                     (SELECT COUNT(*) FROM assignments
                      WHERE assignments.commission_id = commissions.id
-                       AND assignments.status = ?2),
+                       AND assignments.status IN (?2, ?3)),
                     (SELECT COUNT(*) FROM attempts
                      JOIN assignments ON assignments.id = attempts.assignment_id
                      WHERE assignments.commission_id = commissions.id)
              FROM commissions
              JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
              WHERE commissions.id = ?1",
-                params![commission_id, AssignmentStatus::Ready.as_str()],
+                params![
+                    commission_id,
+                    AssignmentStatus::Ready.as_str(),
+                    AssignmentStatus::AttentionRequired.as_str()
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(Into::into)
@@ -756,6 +1086,7 @@ impl Store {
         &mut self,
         request: &Request,
         commission_id: &str,
+        worker: &worker::WorkerRuntime,
     ) -> Result<Value, TyrionError> {
         let idempotency_key = mutation_key(request)?;
         let request_hash = request_hash(request)?;
@@ -871,6 +1202,7 @@ impl Store {
             legacy,
             accepted_at,
         )?;
+        route_ready_assignments(&transaction, commission_id, worker)?;
 
         let result = project_commission(&transaction, commission_id)?;
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
@@ -1263,6 +1595,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        route_ready_assignments(&transaction, commission_id, worker)?;
         let ready_candidates = {
             let mut statement = transaction.prepare(
                 "SELECT assignments.id, assignment_metadata.logical_id,
@@ -1292,6 +1625,11 @@ impl Store {
                  WHERE assignments.commission_id = ?1
                    AND assignments.status = ?2
                    AND commissions.status = ?3
+                   AND EXISTS (
+                       SELECT 1 FROM assignment_routes
+                       WHERE assignment_routes.assignment_id = assignments.id
+                         AND assignment_routes.status = 'selected'
+                   )
                  ORDER BY assignment_metadata.position, assignments.id",
             )?;
             let rows = statement.query_map(
@@ -1332,6 +1670,7 @@ impl Store {
             rows.collect::<Result<Vec<_>, _>>()?
         };
         if ready_candidates.is_empty() {
+            transaction.commit()?;
             return Ok(());
         }
 
@@ -1432,7 +1771,11 @@ impl Store {
         let attempt_count = transaction.query_row(
             "SELECT COUNT(*) FROM attempts
              JOIN assignments ON assignments.id = attempts.assignment_id
-             WHERE assignments.commission_id = ?1",
+             WHERE assignments.commission_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM worker_configuration_failures
+                   WHERE worker_configuration_failures.attempt_id = attempts.id
+               )",
             [commission_id],
             |row| row.get::<_, u32>(0),
         )?;
@@ -1477,7 +1820,8 @@ impl Store {
         } else {
             load_criteria(&transaction, commission_id)?
         };
-        let authorized_paths = load_authorized_paths(&transaction, commission_id)?;
+        let authority = load_authority(&transaction, commission_id)?;
+        let authorized_paths = authority.paths.clone();
         let comparison_candidates = if ready.purpose == "reconciliation" {
             load_comparison_candidates(
                 &transaction,
@@ -1487,7 +1831,30 @@ impl Store {
         } else {
             Vec::new()
         };
-        let configuration = worker.configuration(&execution)?;
+        let (configuration_json, routing_rationale_json) = transaction
+            .query_row(
+                "SELECT selected_configuration_json, rationale_json
+                 FROM assignment_routes
+                 WHERE assignment_id = ?1 AND status = 'selected'",
+                [&ready.assignment_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(format!(
+                    "Assignment {} has no selected Worker Configuration",
+                    ready.assignment_id
+                ))
+            })?;
+        let configuration_value: Value = serde_json::from_str(&configuration_json)?;
+        let configuration = configuration_value["id"]
+            .as_str()
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "selected Worker Configuration is missing its id".into(),
+                )
+            })?
+            .to_owned();
         let lease_ttl_seconds = worker.lease_ttl_seconds(&execution)?;
         let commission_deadline = ready
             .accepted_at
@@ -1507,6 +1874,8 @@ impl Store {
         }
         let attempt_id = Uuid::new_v4().to_string();
         let lease_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let worker_handle = next_worker_handle(&transaction, commission_id)?;
         let started_at_ms = unix_timestamp_millis()?;
         transaction.execute(
             "INSERT INTO attempts (
@@ -1518,6 +1887,24 @@ impl Store {
                 configuration,
                 AttemptStatus::Running.as_str(),
                 now,
+                started_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO workers (
+                id, commission_id, assignment_id, attempt_id, handle,
+                configuration_json, routing_rationale_json, status,
+                latest_activity, activity_at_ms, usage_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running',
+                       'Worker launched', ?8, '{}')",
+            params![
+                worker_id,
+                commission_id,
+                ready.assignment_id,
+                attempt_id,
+                worker_handle,
+                configuration_json,
+                routing_rationale_json,
                 started_at_ms,
             ],
         )?;
@@ -1573,6 +1960,21 @@ impl Store {
                 "logical_id": ready.logical_id,
                 "plan_revision": ready.plan_revision,
                 "started_at_ms": started_at_ms,
+                "worker_id": worker_id,
+                "worker_handle": worker_handle,
+                "worker_configuration": configuration_value,
+            }),
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::WorkerActivity,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "worker_id": worker_id,
+                "worker_handle": worker_handle,
+                "assignment_id": ready.assignment_id,
+                "activity": "Worker launched",
             }),
         )?;
         record_event_with_payload(
@@ -1590,7 +1992,11 @@ impl Store {
                 "reserved_atomically": true,
             }),
         )?;
-        transaction.commit()?;
+        worker.begin_attempt(&attempt_id, ready.mandate_revision)?;
+        if let Err(error) = transaction.commit() {
+            worker.end_attempt(&attempt_id)?;
+            return Err(error.into());
+        }
 
         let assignment = worker::AssignmentContext {
             commission_id: commission_id.to_owned(),
@@ -1600,14 +2006,29 @@ impl Store {
             plan_revision: ready.plan_revision,
             goal: ready.goal.clone(),
             execution,
+            selected_configuration: configuration_value.clone(),
             criteria,
+            authority,
             authorized_paths,
             declared_write_scopes: ready.write_scopes.clone(),
             comparison_candidates,
             max_storage_bytes: ready.reserved_storage_bytes,
+            max_model_spend_cents: ready.reserved_model_spend_cents,
+            max_paid_service_spend_cents: ready.reserved_paid_service_spend_cents,
             lease_expires_at,
         };
-        let candidate = match worker.execute(&assignment) {
+        let execution_result = worker.execute(&assignment);
+        let execution_completed_at_ms = unix_timestamp_millis()?;
+        self.connection.execute(
+            "UPDATE attempts SET execution_completed_at_ms = ?2 WHERE id = ?1",
+            params![attempt_id, execution_completed_at_ms],
+        )?;
+        let terminal_telemetry = worker.live_telemetry(&attempt_id);
+        worker.end_attempt(&attempt_id)?;
+        if let Some(telemetry) = terminal_telemetry.as_ref() {
+            self.persist_worker_telemetry(&attempt_id, telemetry)?;
+        }
+        let candidate = match execution_result {
             Ok(candidate) => candidate,
             Err(error) => {
                 self.fail_attempt(
@@ -1621,11 +2042,19 @@ impl Store {
                 return Ok(());
             }
         };
-        let execution_completed_at_ms = unix_timestamp_millis()?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "UPDATE attempts SET execution_completed_at_ms = ?2 WHERE id = ?1",
-            params![attempt_id, execution_completed_at_ms],
+            "UPDATE workers
+             SET status = 'succeeded', native_session_id = ?2, usage_json = ?3,
+                 latest_activity = ?4, activity_at_ms = ?5
+             WHERE attempt_id = ?1",
+            params![
+                attempt_id,
+                candidate.native_session_id,
+                serde_json::to_string(&candidate.usage)?,
+                candidate.latest_meaningful_activity,
+                execution_completed_at_ms,
+            ],
         )?;
         let current_revision = transaction.query_row(
             "SELECT revision FROM commissions WHERE id = ?1 AND status = ?2",
@@ -1671,6 +2100,19 @@ impl Store {
             commission_id,
             EventKind::ResultSubmitted,
             ready.mandate_revision,
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::WorkerActivity,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "attempt_id": attempt_id,
+                "assignment_id": ready.assignment_id,
+                "activity": candidate.latest_meaningful_activity,
+                "native_session_id": candidate.native_session_id,
+                "usage": candidate.usage,
+            }),
         )?;
         transaction.commit()?;
 
@@ -2545,6 +2987,33 @@ impl Store {
         Ok(())
     }
 
+    fn persist_worker_telemetry(
+        &self,
+        attempt_id: &str,
+        telemetry: &Value,
+    ) -> Result<(), TyrionError> {
+        let native_session_id = telemetry["native_session_id"].as_str();
+        let usage = &telemetry["usage"];
+        let latest_activity = telemetry["latest_meaningful_activity"].as_str();
+        let activity_at_ms = telemetry["activity_at_ms"].as_i64();
+        self.connection.execute(
+            "UPDATE workers
+             SET native_session_id = COALESCE(?2, native_session_id),
+                 usage_json = CASE WHEN ?3 = '{}' THEN usage_json ELSE ?3 END,
+                 latest_activity = COALESCE(?4, latest_activity),
+                 activity_at_ms = COALESCE(?5, activity_at_ms)
+             WHERE attempt_id = ?1",
+            params![
+                attempt_id,
+                native_session_id,
+                serde_json::to_string(usage)?,
+                latest_activity,
+                activity_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn fail_attempt(
         &mut self,
         commission_id: &str,
@@ -2557,18 +3026,31 @@ impl Store {
         let transaction = self.connection.transaction()?;
         let now = unix_timestamp()?;
         let now_ms = unix_timestamp_millis()?;
+        let interrupted = matches!(error, TyrionError::WorkerInterrupted);
         transaction.execute(
             "UPDATE attempts
-             SET status = ?2, completed_at = ?3, completed_at_ms = ?4
+             SET status = ?2, completed_at = ?3,
+                 execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?4),
+                 completed_at_ms = ?4
              WHERE id = ?1",
-            params![attempt_id, AttemptStatus::Failed.as_str(), now, now_ms],
+            params![
+                attempt_id,
+                if interrupted {
+                    AttemptStatus::Interrupted.as_str()
+                } else {
+                    AttemptStatus::Failed.as_str()
+                },
+                now,
+                now_ms
+            ],
         )?;
-        let (lease_status, assignment_status, blocker_code, requirement) = match error {
+        let (lease_status, assignment_status, blocker_code, requirement, unavailable) = match error {
             TyrionError::WorkerLeaseExpired { .. } => (
                 WorkerLeaseStatus::Expired,
                 AssignmentStatus::VerificationFailed,
                 "worker_execution_failed".to_owned(),
                 error.to_string(),
+                false,
             ),
             TyrionError::StorageCeilingExceeded {
                 required_bytes,
@@ -2580,12 +3062,29 @@ impl Store {
                 format!(
                     "Git artifacts require at least {required_bytes} bytes; start a new Commission with max_storage_bytes of {required_bytes} or more (current ceiling: {ceiling_bytes})."
                 ),
+                false,
+            ),
+            TyrionError::WorkerInterrupted => (
+                WorkerLeaseStatus::Revoked,
+                AssignmentStatus::AttentionRequired,
+                "worker_interrupted".to_owned(),
+                "Review the interrupted Assignment and explicitly retry, reroute, revise, or cancel it."
+                    .to_owned(),
+                false,
+            ),
+            TyrionError::WorkerConfigurationUnavailable { .. } => (
+                WorkerLeaseStatus::Revoked,
+                AssignmentStatus::Ready,
+                "worker_configuration_unavailable".to_owned(),
+                error.to_string(),
+                true,
             ),
             _ => (
                 WorkerLeaseStatus::Revoked,
                 AssignmentStatus::VerificationFailed,
                 "worker_execution_failed".to_owned(),
                 error.to_string(),
+                false,
             ),
         };
         transaction.execute(
@@ -2597,31 +3096,306 @@ impl Store {
              SET status = 'revoked', released_at = ?2 WHERE attempt_id = ?1",
             params![attempt_id, now_ms],
         )?;
+        if unavailable {
+            transaction.execute(
+                "UPDATE resource_reservations
+                 SET model_spend_cents = 0, paid_service_spend_cents = 0
+                 WHERE attempt_id = ?1",
+                [attempt_id],
+            )?;
+        }
         transaction.execute(
             "UPDATE assignments SET status = ?2 WHERE id = ?1",
             params![assignment_id, assignment_status.as_str()],
         )?;
         transaction.execute(
-            "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "UPDATE workers
+             SET status = ?2, latest_activity = ?3, activity_at_ms = ?4
+             WHERE attempt_id = ?1",
             params![
-                Uuid::new_v4().to_string(),
-                commission_id,
-                assignment_id,
-                blocker_code,
-                requirement,
-                now,
+                attempt_id,
+                if interrupted {
+                    AttemptStatus::Interrupted.as_str()
+                } else {
+                    AttemptStatus::Failed.as_str()
+                },
+                if interrupted {
+                    "Worker interrupted"
+                } else {
+                    "Worker failed"
+                },
+                now_ms,
             ],
         )?;
-        record_event(
-            &transaction,
-            commission_id,
-            EventKind::AssignmentBlocked,
-            mandate_revision,
-        )?;
+        if let TyrionError::WorkerConfigurationUnavailable {
+            configuration_id, ..
+        } = error
+        {
+            transaction.execute(
+                "INSERT OR REPLACE INTO worker_configuration_failures (
+                    attempt_id, assignment_id, configuration_id, reason, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    attempt_id,
+                    assignment_id,
+                    configuration_id,
+                    requirement,
+                    now,
+                ],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::AssignmentReady,
+                mandate_revision,
+                &serde_json::json!({
+                    "assignment_id": assignment_id,
+                    "reason": "worker_configuration_unavailable",
+                    "configuration_id": configuration_id,
+                }),
+            )?;
+        } else if interrupted {
+            transaction.execute(
+                "INSERT INTO attention_conditions (
+                    id, commission_id, assignment_id, code, requirement, status, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    commission_id,
+                    assignment_id,
+                    blocker_code,
+                    requirement,
+                    now,
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    commission_id,
+                    assignment_id,
+                    blocker_code,
+                    requirement,
+                    now,
+                ],
+            )?;
+            record_event(
+                &transaction,
+                commission_id,
+                EventKind::AssignmentBlocked,
+                mandate_revision,
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn control_worker(
+    connection: &mut Connection,
+    request: &Request,
+    commission_id: &str,
+    worker_handle: &str,
+    message: &str,
+    action: WorkerControlAction,
+    runtime: &worker::WorkerRuntime,
+) -> Result<Value, TyrionError> {
+    if worker_handle.trim().is_empty() {
+        return Err(TyrionError::InvalidRequest(
+            "Worker Handle must not be empty".into(),
+        ));
+    }
+    if message.trim().is_empty() || message.len() > 4096 || message.contains('\0') {
+        return Err(TyrionError::InvalidRequest(format!(
+            "Worker {} text must contain between 1 and 4096 safe bytes",
+            action.as_str()
+        )));
+    }
+    let idempotency_key = mutation_key(request)?;
+    let request_hash = request_hash(request)?;
+    let expected_revision = request.expected_revision.ok_or_else(|| {
+        TyrionError::InvalidRequest(format!(
+            "Worker {} requires an expected Commission revision",
+            action.as_str()
+        ))
+    })?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+        return Ok(prior);
+    }
+    let attachment_id = authenticated_attachment_id(&transaction, request)?;
+    ensure_active_attachment(
+        &transaction,
+        &attachment_id,
+        commission_id,
+        action.capability(),
+    )?;
+    let prior_command = transaction
+        .query_row(
+            "SELECT worker_commands.id, worker_commands.request_hash,
+                    worker_commands.status, workers.handle
+             FROM worker_commands
+             JOIN workers ON workers.id = worker_commands.worker_id
+             WHERE worker_commands.idempotency_key = ?1",
+            [idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((_, prior_hash, status, prior_handle)) = &prior_command {
+        if prior_hash != &request_hash || prior_handle != worker_handle {
+            return Err(TyrionError::IdempotencyConflict);
+        }
+        if status == "delivered" {
+            let result = project_commission(&transaction, commission_id)?;
+            save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        if status == "failed" {
+            return Err(TyrionError::ControlDenied(format!(
+                "the prior Worker {} delivery failed",
+                action.as_str()
+            )));
+        }
+    }
+    let (status, revision) = transaction
+        .query_row(
+            "SELECT status, revision FROM commissions WHERE id = ?1",
+            [commission_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+    if revision != expected_revision {
+        return Err(TyrionError::StaleRevision {
+            expected: expected_revision,
+            actual: revision,
+        });
+    }
+    if status != CommissionStatus::Active.as_str() {
+        return Err(TyrionError::ControlDenied(format!(
+            "Commission {commission_id} is {status}"
+        )));
+    }
+    let (worker_id, attempt_id, worker_status, configuration) = transaction
+        .query_row(
+            "SELECT id, attempt_id, status, configuration_json
+             FROM workers WHERE commission_id = ?1 AND handle = ?2",
+            params![commission_id, worker_handle],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    serde_json::from_str::<Value>(&row.get::<_, String>(3)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(format!(
+                "Worker Handle {worker_handle} is not part of Commission {commission_id}"
+            ))
+        })?;
+    if worker_status != AttemptStatus::Running.as_str() {
+        return Err(TyrionError::ControlDenied(format!(
+            "Worker {worker_handle} is {worker_status}"
+        )));
+    }
+    if !worker_configuration_supports_control(&configuration, action) {
+        return Err(TyrionError::ControlDenied(format!(
+            "Worker {worker_handle} configuration does not support {}",
+            action.as_str()
+        )));
+    }
+    let now = unix_timestamp()?;
+    let command_id = prior_command
+        .as_ref()
+        .map(|(id, _, _, _)| id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if prior_command.is_none() {
+        transaction.execute(
+            "INSERT INTO worker_commands (
+                id, commission_id, worker_id, attachment_id, kind, payload_json,
+                mandate_revision, status, idempotency_key, request_hash, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10)",
+            params![
+                command_id,
+                commission_id,
+                worker_id,
+                attachment_id,
+                action.as_str(),
+                serde_json::to_string(&serde_json::json!({
+                    (action.message_field()): message,
+                }))?,
+                revision,
+                idempotency_key,
+                request_hash,
+                now,
+            ],
+        )?;
+    }
+    transaction.commit()?;
+
+    let delivery = match action {
+        WorkerControlAction::Steer => runtime.steer(&attempt_id, &command_id, message),
+        WorkerControlAction::Interrupt => runtime.interrupt(&attempt_id, &command_id, message),
+    };
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Err(error) = delivery {
+        transaction.execute(
+            "UPDATE worker_commands SET status = 'failed' WHERE id = ?1 AND status = 'pending'",
+            [&command_id],
+        )?;
+        transaction.commit()?;
+        return Err(error);
+    }
+    let now_ms = unix_timestamp_millis()?;
+    let activity = match action {
+        WorkerControlAction::Steer => format!("Clarification delivered: {message}"),
+        WorkerControlAction::Interrupt => format!("Interruption delivered: {message}"),
+    };
+    transaction.execute(
+        "UPDATE worker_commands SET status = 'delivered' WHERE id = ?1 AND status = 'pending'",
+        [&command_id],
+    )?;
+    transaction.execute(
+        "UPDATE workers SET latest_activity = ?2, activity_at_ms = ?3 WHERE id = ?1",
+        params![worker_id, activity, now_ms],
+    )?;
+    record_event_with_payload(
+        &transaction,
+        commission_id,
+        action.event_kind(),
+        revision,
+        &serde_json::json!({
+            "worker_id": worker_id,
+            "worker_handle": worker_handle,
+            "attempt_id": attempt_id,
+            (action.message_field()): message,
+            "mandate_revision": revision,
+            "mandate_changed": false,
+        }),
+    )?;
+    let result = project_commission(&transaction, commission_id)?;
+    save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+    transaction.commit()?;
+    Ok(result)
 }
 
 fn proposal_plan_or_legacy(
@@ -2632,24 +3406,31 @@ fn proposal_plan_or_legacy(
     if let Some(plan) = plan {
         return Ok(plan);
     }
-    let (goal, max_storage_bytes, max_model_spend_cents, max_paid_service_spend_cents) =
-        transaction.query_row(
-            "SELECT commissions.goal, resource_ceilings.max_storage_bytes,
+    let (
+        goal,
+        max_storage_bytes,
+        max_model_spend_cents,
+        max_paid_service_spend_cents,
+        worker_requirements_json,
+    ) = transaction.query_row(
+        "SELECT commissions.goal, resource_ceilings.max_storage_bytes,
                     resource_ceilings.max_model_spend_cents,
-                    resource_ceilings.max_paid_service_spend_cents
+                    resource_ceilings.max_paid_service_spend_cents,
+                    commissions.worker_requirements_json
              FROM commissions
              JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
              WHERE commissions.id = ?1",
-            [commission_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            },
-        )?;
+        [commission_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        },
+    )?;
     let criterion_ids = {
         let mut statement = transaction.prepare(
             "SELECT criterion_id FROM criteria WHERE commission_id = ?1 ORDER BY position",
@@ -2672,9 +3453,178 @@ fn proposal_plan_or_legacy(
                 max_model_spend_cents,
                 max_paid_service_spend_cents,
             },
+            worker_requirements: serde_json::from_str(&worker_requirements_json)?,
             competition: None,
         }],
     })
+}
+
+fn route_ready_assignments(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    worker: &worker::WorkerRuntime,
+) -> Result<(), TyrionError> {
+    let (execution_json, entry_harness) = transaction.query_row(
+        "SELECT commissions.execution_json, attachments.harness
+         FROM commissions
+         JOIN commission_attachments
+           ON commission_attachments.commission_id = commissions.id
+          AND commission_attachments.role = 'active'
+         JOIN attachments ON attachments.id = commission_attachments.attachment_id
+         WHERE commissions.id = ?1",
+        [commission_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let execution: ExecutionSpec = serde_json::from_str(&execution_json)?;
+    let required_authority_action = match execution {
+        ExecutionSpec::Deterministic => worker::DETERMINISTIC_ACTION,
+        ExecutionSpec::CodexGit { .. } => worker::CODEX_GIT_ACTION,
+    };
+    let authority = load_authority(transaction, commission_id)?;
+    let assignments = {
+        let mut statement = transaction.prepare(
+            "SELECT assignments.id, assignments.status,
+                    planned_assignments.worker_requirements_json,
+                    assignment_metadata.concurrency_slots,
+                    assignment_metadata.max_storage_bytes,
+                    assignment_metadata.max_model_spend_cents,
+                    assignment_metadata.max_paid_service_spend_cents
+             FROM assignments
+             JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+             JOIN planned_assignments
+               ON planned_assignments.commission_id = assignments.commission_id
+              AND planned_assignments.logical_id = assignment_metadata.logical_id
+             WHERE assignments.commission_id = ?1
+               AND assignments.status IN (?2, ?3)
+             ORDER BY assignment_metadata.position, assignments.id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                commission_id,
+                AssignmentStatus::Ready.as_str(),
+                AssignmentStatus::AttentionRequired.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    AssignmentResources {
+                        concurrency_slots: row.get(3)?,
+                        max_storage_bytes: row.get(4)?,
+                        max_model_spend_cents: row.get(5)?,
+                        max_paid_service_spend_cents: row.get(6)?,
+                    },
+                ))
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (assignment_id, prior_status, requirements_json, resources) in assignments {
+        let requirements: WorkerRequirements = serde_json::from_str(&requirements_json)?;
+        let unavailable_configuration_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT configuration_id FROM worker_configuration_failures
+                 WHERE assignment_id = ?1 ORDER BY configuration_id",
+            )?;
+            let rows = statement.query_map([&assignment_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<std::collections::HashSet<_>, _>>()?
+        };
+        let route = worker.route(
+            &requirements,
+            &resources,
+            required_authority_action,
+            &authority,
+            &entry_harness,
+            &unavailable_configuration_ids,
+        )?;
+        let status = route["status"].as_str().ok_or_else(|| {
+            TyrionError::InvalidRequest("Worker route decision is missing its status".into())
+        })?;
+        let selected_configuration_json = (!route["selected_configuration"].is_null())
+            .then(|| serde_json::to_string(&route["selected_configuration"]))
+            .transpose()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO assignment_routes (
+                assignment_id, status, selected_configuration_json, rationale_json, decided_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                assignment_id,
+                status,
+                selected_configuration_json,
+                serde_json::to_string(&route["rationale"])?,
+                unix_timestamp()?,
+            ],
+        )?;
+        let has_non_routing_attention = prior_status
+            == AssignmentStatus::AttentionRequired.as_str()
+            && transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM attention_conditions
+                    WHERE assignment_id = ?1 AND status = 'open'
+                      AND code NOT IN (
+                          'worker_configuration_ineligible',
+                          'worker_configuration_unavailable'
+                      )
+                 )",
+                [&assignment_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if has_non_routing_attention {
+            continue;
+        }
+        if status == "selected" && prior_status == AssignmentStatus::AttentionRequired.as_str() {
+            transaction.execute(
+                "UPDATE assignments SET status = ?2 WHERE id = ?1",
+                params![assignment_id, AssignmentStatus::Ready.as_str()],
+            )?;
+            transaction.execute(
+                "UPDATE attention_conditions
+                 SET status = 'resolved', resolved_at = ?2
+                 WHERE assignment_id = ?1 AND status = 'open'",
+                params![assignment_id, unix_timestamp()?],
+            )?;
+        } else if status == "attention_required" {
+            let requirement = route["rationale"]["attention_requirement"]
+                .as_str()
+                .ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "attention-required Worker route is missing its requirement".into(),
+                    )
+                })?;
+            let code = if route["rationale"]["preferred_unavailable_configuration"].is_null() {
+                "worker_configuration_ineligible"
+            } else {
+                "worker_configuration_unavailable"
+            };
+            transaction.execute(
+                "UPDATE assignments SET status = ?2 WHERE id = ?1",
+                params![assignment_id, AssignmentStatus::AttentionRequired.as_str()],
+            )?;
+            let updated = transaction.execute(
+                "UPDATE attention_conditions
+                 SET code = ?2, requirement = ?3
+                 WHERE assignment_id = ?1 AND status = 'open'",
+                params![assignment_id, code, requirement],
+            )?;
+            if updated == 0 {
+                transaction.execute(
+                    "INSERT INTO attention_conditions (
+                    id, commission_id, assignment_id, code, requirement, status, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        commission_id,
+                        assignment_id,
+                        code,
+                        requirement,
+                        unix_timestamp()?,
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn initialize_commission_plan(
@@ -2722,10 +3672,10 @@ fn initialize_commission_plan(
                 commission_id, logical_id, position, goal, purpose,
                 read_scopes_json, write_scopes_json, concurrency_slots,
                 max_storage_bytes, max_model_spend_cents,
-                max_paid_service_spend_cents, competition_group,
+                max_paid_service_spend_cents, worker_requirements_json, competition_group,
                 competition_uncertainty, competition_rule, created_plan_revision
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
              )",
             params![
                 commission_id,
@@ -2739,6 +3689,7 @@ fn initialize_commission_plan(
                 assignment.resources.max_storage_bytes,
                 assignment.resources.max_model_spend_cents,
                 assignment.resources.max_paid_service_spend_cents,
+                serde_json::to_string(&assignment.worker_requirements)?,
                 competition.map(|item| item.group.as_str()),
                 competition.map(|item| item.uncertainty.as_str()),
                 competition.map(|item| item.comparison_rule.as_str()),
@@ -2942,14 +3893,42 @@ fn load_authorized_paths(
     transaction: &Transaction<'_>,
     commission_id: &str,
 ) -> Result<Vec<String>, TyrionError> {
+    load_authority_scope(transaction, commission_id, AuthorityScopeType::Path)
+}
+
+fn load_authority(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<AuthorityEnvelope, TyrionError> {
+    Ok(AuthorityEnvelope {
+        repositories: load_authority_scope(
+            transaction,
+            commission_id,
+            AuthorityScopeType::Repository,
+        )?,
+        paths: load_authority_scope(transaction, commission_id, AuthorityScopeType::Path)?,
+        actions: load_authority_scope(transaction, commission_id, AuthorityScopeType::Action)?,
+        destinations: load_authority_scope(
+            transaction,
+            commission_id,
+            AuthorityScopeType::Destination,
+        )?,
+        effects: load_authority_scope(transaction, commission_id, AuthorityScopeType::Effect)?,
+    })
+}
+
+fn load_authority_scope(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    scope_type: AuthorityScopeType,
+) -> Result<Vec<String>, TyrionError> {
     let mut statement = transaction.prepare(
         "SELECT value FROM authority_scopes
          WHERE commission_id = ?1 AND scope_type = ?2 ORDER BY position",
     )?;
-    let rows = statement.query_map(
-        params![commission_id, AuthorityScopeType::Path.as_str()],
-        |row| row.get(0),
-    )?;
+    let rows = statement.query_map(params![commission_id, scope_type.as_str()], |row| {
+        row.get(0)
+    })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -3894,7 +4873,11 @@ fn route_result_rework(
     let (assignment_id, assignment_status, attempt_count, max_attempts) = transaction.query_row(
         "SELECT assignments.id, assignments.status,
                 (SELECT COUNT(*) FROM attempts AS counted
-                 WHERE counted.assignment_id = assignments.id),
+                 WHERE counted.assignment_id = assignments.id
+                   AND NOT EXISTS (
+                       SELECT 1 FROM worker_configuration_failures
+                       WHERE worker_configuration_failures.attempt_id = counted.id
+                   )),
                 resource_ceilings.max_attempts
          FROM results
          JOIN attempts ON attempts.id = results.attempt_id
@@ -4105,6 +5088,12 @@ fn release_successful_attempt(
          SET status = ?2, released_at = ?3 WHERE attempt_id = ?1",
         params![release.attempt_id, "released", now_ms],
     )?;
+    transaction.execute(
+        "UPDATE workers
+         SET status = 'succeeded', latest_activity = 'Result accepted', activity_at_ms = ?2
+         WHERE attempt_id = ?1",
+        params![release.attempt_id, now_ms],
+    )?;
     Ok(())
 }
 
@@ -4258,6 +5247,157 @@ fn ensure_active_attachment(
     Ok(())
 }
 
+fn apply_attachment_worker_controls(
+    connection: &Connection,
+    attachment_id: &str,
+    commission_id: &str,
+    projection: &mut Value,
+    runtime: &worker::WorkerRuntime,
+) -> Result<(), TyrionError> {
+    let (role, capabilities_json) = connection.query_row(
+        "SELECT commission_attachments.role, attachments.capabilities_json
+         FROM commission_attachments
+         JOIN attachments ON attachments.id = commission_attachments.attachment_id
+         WHERE commission_attachments.commission_id = ?1
+           AND commission_attachments.attachment_id = ?2",
+        params![commission_id, attachment_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json)?;
+    let active = role == "active";
+    for worker in projection["workers"].as_array_mut().into_iter().flatten() {
+        let mut controls = vec![Value::String("inspect".into())];
+        let attempt_is_live = worker["attempt_id"]
+            .as_str()
+            .is_some_and(|attempt_id| runtime.is_attempt_active(attempt_id));
+        let attempt_accepts_control = worker["attempt_id"]
+            .as_str()
+            .is_some_and(|attempt_id| runtime.accepts_live_control(attempt_id));
+        if attempt_is_live {
+            if let Some(telemetry) = worker["attempt_id"]
+                .as_str()
+                .and_then(|attempt_id| runtime.live_telemetry(attempt_id))
+            {
+                let telemetry_is_newer = telemetry["activity_at_ms"]
+                    .as_i64()
+                    .zip(worker["activity_at_ms"].as_i64())
+                    .is_some_and(|(live, durable)| live > durable);
+                if telemetry_is_newer {
+                    for field in ["latest_meaningful_activity", "activity_at_ms"] {
+                        if !telemetry[field].is_null() {
+                            worker[field] = telemetry[field].clone();
+                        }
+                    }
+                }
+                if !telemetry["native_session_id"].is_null() {
+                    worker["native_session_id"] = telemetry["native_session_id"].clone();
+                }
+                if telemetry["usage"]
+                    .as_object()
+                    .is_some_and(|usage| !usage.is_empty())
+                {
+                    worker["usage"] = telemetry["usage"].clone();
+                }
+            }
+        }
+        if active && worker["status"] == "running" && attempt_accepts_control {
+            if capabilities
+                .iter()
+                .any(|capability| capability == attachment::WORKER_STEERING)
+                && worker_configuration_supports_control(
+                    &worker["configuration"],
+                    WorkerControlAction::Steer,
+                )
+            {
+                controls.push(Value::String("steer".into()));
+            }
+            if capabilities
+                .iter()
+                .any(|capability| capability == attachment::WORKER_INTERRUPTION)
+                && worker_configuration_supports_control(
+                    &worker["configuration"],
+                    WorkerControlAction::Interrupt,
+                )
+            {
+                controls.push(Value::String("interrupt".into()));
+            }
+        }
+        let retry_available = if active
+            && worker["status"] == "interrupted"
+            && capabilities
+                .iter()
+                .any(|capability| capability == attachment::WORKER_INTERRUPTION)
+        {
+            worker["assignment"]["id"]
+                .as_str()
+                .map(|assignment_id| {
+                    worker_retry_available(connection, commission_id, assignment_id)
+                })
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if retry_available {
+            controls.push(Value::String("retry".into()));
+        }
+        worker["available_controls"] = Value::Array(controls);
+    }
+    Ok(())
+}
+
+fn worker_configuration_supports_control(
+    configuration: &Value,
+    action: WorkerControlAction,
+) -> bool {
+    let structured_adapter = matches!(
+        configuration["adapter"]["kind"].as_str(),
+        Some("codex_app_server" | "claude_agent_sdk")
+    );
+    if !structured_adapter {
+        return false;
+    }
+    match action {
+        WorkerControlAction::Steer => true,
+        WorkerControlAction::Interrupt => {
+            configuration["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == "semantic_interrupt")
+                })
+        }
+    }
+}
+
+fn worker_retry_available(
+    connection: &Connection,
+    commission_id: &str,
+    assignment_id: &str,
+) -> Result<bool, TyrionError> {
+    Ok(connection.query_row(
+        "SELECT
+            EXISTS (
+                SELECT 1 FROM attention_conditions
+                WHERE commission_id = ?1 AND assignment_id = ?2
+                  AND code = 'worker_interrupted' AND status = 'open'
+            )
+            AND (
+                SELECT COUNT(*) FROM attempts
+                JOIN assignments ON assignments.id = attempts.assignment_id
+                WHERE assignments.commission_id = ?1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM worker_configuration_failures
+                      WHERE worker_configuration_failures.attempt_id = attempts.id
+                  )
+            ) < resource_ceilings.max_attempts
+         FROM resource_ceilings WHERE commission_id = ?1",
+        params![commission_id, assignment_id],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
 fn replay_events(
     connection: &Connection,
     attachment_id: &str,
@@ -4332,6 +5472,7 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     if proposal.goal.trim().is_empty() {
         return Err(TyrionError::InvalidRequest("goal must not be empty".into()));
     }
+    validate_worker_requirements(&proposal.worker_requirements)?;
     validate_acceptance_criteria(&proposal.execution, &proposal.criteria)?;
     if proposal.resource_ceilings.max_attempts == 0
         || proposal.resource_ceilings.max_elapsed_seconds == 0
@@ -4433,11 +5574,6 @@ fn validate_commission_plan(
     proposal: &CommissionProposal,
     plan: &CommissionPlan,
 ) -> Result<(), TyrionError> {
-    if !matches!(proposal.execution, ExecutionSpec::CodexGit { .. }) {
-        return Err(TyrionError::InvalidRequest(
-            "explicit multi-Assignment plans currently require codex_git execution".into(),
-        ));
-    }
     if plan.assignments.len() < 2 {
         return Err(TyrionError::InvalidRequest(
             "an explicit Commission Plan must contain at least two Assignments".into(),
@@ -4454,7 +5590,7 @@ fn validate_commission_plan(
         .any(|criterion| criterion.verifier_type != VerifierType::Deterministic)
     {
         return Err(TyrionError::InvalidRequest(
-            "multi-Assignment Git plans currently require deterministic criterion Evidence".into(),
+            "multi-Assignment plans currently require deterministic criterion Evidence".into(),
         ));
     }
 
@@ -4487,6 +5623,7 @@ fn validate_commission_plan(
                 assignment.id
             )));
         }
+        validate_worker_requirements(&assignment.worker_requirements)?;
         for criterion_id in &assignment.criterion_ids {
             if !criterion_ids.contains(criterion_id.as_str()) {
                 return Err(TyrionError::InvalidRequest(format!(
@@ -4692,6 +5829,60 @@ fn validate_commission_plan(
         }
     }
     ensure_acyclic_plan(plan)?;
+    Ok(())
+}
+
+fn validate_worker_requirements(requirements: &WorkerRequirements) -> Result<(), TyrionError> {
+    let named_sets = [
+        ("capability", &requirements.capabilities),
+        ("tool", &requirements.tools),
+        ("Skill", &requirements.skills),
+        (
+            "Assignment constraint",
+            &requirements.assignment_constraints,
+        ),
+        (
+            "required Worker Configuration",
+            &requirements.require_configurations,
+        ),
+        (
+            "excluded Worker Configuration",
+            &requirements.exclude_configurations,
+        ),
+    ];
+    for (name, values) in named_sets {
+        let mut unique = HashSet::new();
+        for value in values {
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Worker requirement {name} names must not be empty"
+                )));
+            }
+            if !unique.insert(value) {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Worker requirement {name} {value} is duplicated"
+                )));
+            }
+        }
+    }
+    if requirements
+        .context_strategy
+        .as_deref()
+        .is_some_and(|strategy| strategy.trim().is_empty() || strategy.contains('\0'))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "Worker requirement context strategy must not be empty".into(),
+        ));
+    }
+    if requirements
+        .require_configurations
+        .iter()
+        .any(|required| requirements.exclude_configurations.contains(required))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "a Worker Configuration cannot be both required and excluded".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -5119,6 +6310,41 @@ fn unix_timestamp() -> Result<i64, TyrionError> {
             TyrionError::InvalidRequest(format!("system clock is invalid: {error}"))
         })?;
     Ok(duration.as_secs() as i64)
+}
+
+fn next_worker_handle(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<String, TyrionError> {
+    const HANDLES: [&str; 16] = [
+        "Arya",
+        "Brienne",
+        "Davos",
+        "Gendry",
+        "Grey Worm",
+        "Jaime",
+        "Jon",
+        "Meera",
+        "Missandei",
+        "Podrick",
+        "Samwell",
+        "Sansa",
+        "Theon",
+        "Tormund",
+        "Tyrion",
+        "Yara",
+    ];
+    let count = transaction.query_row(
+        "SELECT COUNT(*) FROM workers WHERE commission_id = ?1",
+        [commission_id],
+        |row| row.get::<_, usize>(0),
+    )?;
+    let base = HANDLES[count % HANDLES.len()];
+    Ok(if count < HANDLES.len() {
+        base.to_owned()
+    } else {
+        format!("{base} {}", count / HANDLES.len() + 1)
+    })
 }
 
 fn unix_timestamp_millis() -> Result<i64, TyrionError> {

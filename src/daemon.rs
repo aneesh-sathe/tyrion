@@ -27,6 +27,9 @@ pub struct DaemonOptions {
     pub corrupt_worker_artifact_revision: bool,
     pub incorrect_first_worker_result: bool,
     pub codex_worker_config: Option<PathBuf>,
+    pub worker_catalog: Option<PathBuf>,
+    pub hold_worker_for_control: bool,
+    pub skip_sandbox_cleanup: bool,
 }
 
 pub fn run_daemon_with_options(
@@ -45,9 +48,22 @@ pub fn run_daemon_with_options(
     let worker = Arc::new(WorkerRuntime::load(
         data_dir,
         options.codex_worker_config.as_deref(),
+        options.worker_catalog.as_deref(),
         options.corrupt_worker_artifact_revision,
         options.incorrect_first_worker_result,
+        options.hold_worker_for_control,
     )?);
+    let pending_cleanups = store.recover_stranded_attempts()?;
+    if !options.skip_sandbox_cleanup {
+        for attempt_id in pending_cleanups {
+            match worker.cleanup_stranded_attempt(&attempt_id) {
+                Ok(()) => store.complete_sandbox_cleanup(&attempt_id)?,
+                Err(error) => {
+                    eprintln!("sandbox cleanup for Attempt {attempt_id} remains pending: {error}")
+                }
+            }
+        }
+    }
     if !options.defer_ready_dispatch {
         resume_ready_assignments(&mut store, &database_path, &worker)?;
     }
@@ -176,7 +192,7 @@ fn serve_connection(
     database_path: &Path,
     worker: &Arc<WorkerRuntime>,
 ) {
-    let outcome = read_request(&stream).and_then(|request| dispatch(store, &request));
+    let outcome = read_request(&stream).and_then(|request| dispatch(store, worker, &request));
     let (response, follow_up) = match outcome {
         Ok(outcome) => (Response::success(outcome.data), outcome.follow_up),
         Err(error) => (Response::failure(&error), None),
@@ -222,7 +238,11 @@ fn read_request(stream: &UnixStream) -> Result<Request, TyrionError> {
     })
 }
 
-fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, TyrionError> {
+fn dispatch(
+    store: &mut Store,
+    worker: &WorkerRuntime,
+    request: &Request,
+) -> Result<DispatchOutcome, TyrionError> {
     if request.protocol_version != PROTOCOL_VERSION {
         return Err(TyrionError::UnsupportedVersion {
             actual: request.protocol_version,
@@ -245,10 +265,10 @@ fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, Tyr
             store.create_proposal(request, proposal)?,
         )),
         Command::InspectCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
-            store.inspect_commission(request, commission_id)?,
+            store.inspect_commission(request, commission_id, worker)?,
         )),
         Command::AcceptCommission { commission_id } => Ok(DispatchOutcome {
-            data: store.accept_commission(request, commission_id)?,
+            data: store.accept_commission(request, commission_id, worker)?,
             follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
         }),
         Command::RecordVerificationEvidence {
@@ -292,6 +312,35 @@ fn dispatch(store: &mut Store, request: &Request) -> Result<DispatchOutcome, Tyr
             commission_id,
             *after_sequence,
         )?)),
+        Command::SteerWorker {
+            commission_id,
+            worker_handle,
+            clarification,
+        } => Ok(DispatchOutcome::without_follow_up(store.steer_worker(
+            request,
+            commission_id,
+            worker_handle,
+            clarification,
+            worker,
+        )?)),
+        Command::InterruptWorker {
+            commission_id,
+            worker_handle,
+            reason,
+        } => Ok(DispatchOutcome::without_follow_up(store.interrupt_worker(
+            request,
+            commission_id,
+            worker_handle,
+            reason,
+            worker,
+        )?)),
+        Command::RetryWorker {
+            commission_id,
+            worker_handle,
+        } => Ok(DispatchOutcome {
+            data: store.retry_worker(request, commission_id, worker_handle)?,
+            follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
+        }),
     }
 }
 
