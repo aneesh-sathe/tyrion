@@ -525,6 +525,64 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let credential_grants = query_values(
+        connection,
+        "SELECT id, assignment_id, attempt_id, worker_lease_id, mandate_revision,
+                plan_revision, capability, destination, exposure,
+                credential_expires_at, revocation, status, created_at, consumed_at, revoked_at
+         FROM credential_grants WHERE commission_id = ?1
+         ORDER BY created_at, rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "assignment_id": row.get::<_, String>(1)?,
+                "attempt_id": row.get::<_, String>(2)?,
+                "worker_lease_id": row.get::<_, String>(3)?,
+                "mandate_revision": row.get::<_, i64>(4)?,
+                "plan_revision": row.get::<_, i64>(5)?,
+                "capability": row.get::<_, String>(6)?,
+                "destination": row.get::<_, String>(7)?,
+                "exposure": row.get::<_, String>(8)?,
+                "credential_expires_at": row.get::<_, i64>(9)?,
+                "revocation": row.get::<_, String>(10)?,
+                "status": row.get::<_, String>(11)?,
+                "created_at": row.get::<_, i64>(12)?,
+                "consumed_at": row.get::<_, Option<i64>>(13)?,
+                "revoked_at": row.get::<_, Option<i64>>(14)?,
+                "credential_reference": "redacted",
+            }))
+        },
+    )?;
+    let credential_exposure_grants = query_values(
+        connection,
+        "SELECT credential_exposure_grants.id,
+                credential_exposure_grants.credential_grant_id,
+                credential_exposure_grants.operation_request_id,
+                credential_exposure_grants.operation_digest,
+                credential_exposure_grants.status,
+                credential_exposure_grants.authorized_at,
+                credential_exposure_grants.consumed_at,
+                credential_exposure_grants.revoked_at
+         FROM credential_exposure_grants
+         JOIN credential_grants
+           ON credential_grants.id = credential_exposure_grants.credential_grant_id
+         WHERE credential_grants.commission_id = ?1
+         ORDER BY credential_exposure_grants.authorized_at, credential_exposure_grants.rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "credential_grant_id": row.get::<_, String>(1)?,
+                "operation_request_id": row.get::<_, String>(2)?,
+                "operation_digest": row.get::<_, String>(3)?,
+                "status": row.get::<_, String>(4)?,
+                "authorized_at": row.get::<_, i64>(5)?,
+                "consumed_at": row.get::<_, Option<i64>>(6)?,
+                "revoked_at": row.get::<_, Option<i64>>(7)?,
+            }))
+        },
+    )?;
     let commission_amendments = query_values(
         connection,
         "SELECT id, base_revision, authority_json, resource_ceilings_json, reason,
@@ -1002,6 +1060,9 @@ pub(super) fn inspect_commission(
     let running_attempt = attempts
         .iter()
         .any(|attempt| attempt["status"] == "running");
+    let effect_cleanup_blocked = operation_requests.iter().any(|operation| {
+        operation["status"] == "uncertain" && operation["receipt"]["containment_confirmed"] == false
+    });
     let exact_next_requirement = blockers
         .last()
         .and_then(|blocker| blocker["requirement"].as_str())
@@ -1019,6 +1080,16 @@ pub(super) fn inspect_commission(
                 .find(|recovery| recovery["cleanup_confirmed"] == false)
                 .and_then(|recovery| recovery["requirement"].as_str())
         })
+        .or_else(|| {
+            operation_requests
+                .iter()
+                .rev()
+                .find(|operation| {
+                    operation["status"] == "uncertain"
+                        && operation["receipt"]["containment_confirmed"] == false
+                })
+                .and_then(|operation| operation["receipt"]["requirement"].as_str())
+        })
         .unwrap_or_else(|| {
             verification["reason"]
                 .as_str()
@@ -1027,6 +1098,7 @@ pub(super) fn inspect_commission(
     let no_useful_frontier = execution_frontier.is_empty() && !running_attempt;
     let recovery_state = match commission["status"].as_str() {
         Some("verified_complete") => "recovered",
+        Some("paused") if effect_cleanup_blocked => "blocked",
         Some("paused") => "paused",
         Some("cancelled") => "cancelled",
         _ if unresolved_criteria > 0 && no_useful_frontier => "blocked",
@@ -1124,6 +1196,8 @@ pub(super) fn inspect_commission(
         "worker_commands": worker_commands,
         "operation_requests": operation_requests,
         "approval_gates": approval_gates,
+        "credential_grants": credential_grants,
+        "credential_exposure_grants": credential_exposure_grants,
         "commission_amendments": commission_amendments,
         "results": results,
         "evidence": evidence,

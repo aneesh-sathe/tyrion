@@ -171,6 +171,9 @@ pub(crate) enum EventKind {
     OperationUncertain,
     CommissionAmendmentProposed,
     ResourceCeilingApproaching,
+    CredentialGrantIssued,
+    CredentialGrantConsumed,
+    CredentialExposureAuthorized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,6 +284,9 @@ impl EventKind {
             Self::OperationUncertain => "operation_uncertain",
             Self::CommissionAmendmentProposed => "commission_amendment_proposed",
             Self::ResourceCeilingApproaching => "resource_ceiling_approaching",
+            Self::CredentialGrantIssued => "credential_grant_issued",
+            Self::CredentialGrantConsumed => "credential_grant_consumed",
+            Self::CredentialExposureAuthorized => "credential_exposure_authorized",
         }
     }
 }

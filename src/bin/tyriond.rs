@@ -14,6 +14,8 @@ struct Arguments {
     #[arg(long)]
     worker_catalog: Option<PathBuf>,
     #[arg(long)]
+    credential_runtime: Option<PathBuf>,
+    #[arg(long)]
     principal_control_bootstrap_fd: Option<i32>,
     #[arg(long, hide = true)]
     fault_defer_ready_dispatch: bool,
@@ -35,6 +37,8 @@ struct Arguments {
     fault_leave_effect_started: bool,
     #[arg(long, hide = true)]
     fault_leave_effect_started_after_rename: bool,
+    #[arg(long, hide = true)]
+    fault_leave_one_shot_effect_started_before_cleanup: bool,
     #[arg(long, default_value_t = 0, hide = true)]
     fault_hold_effect_before_commit_milliseconds: u64,
     #[arg(long, default_value_t = 30_000, hide = true)]
@@ -49,6 +53,7 @@ fn main() {
         incorrect_first_worker_result: arguments.fault_incorrect_first_worker_result,
         codex_worker_config: arguments.codex_worker_config,
         worker_catalog: arguments.worker_catalog,
+        credential_runtime: arguments.credential_runtime,
         principal_control_bootstrap_fd: arguments.principal_control_bootstrap_fd,
         hold_worker_for_control: arguments.fault_hold_worker_for_control,
         hold_worker_before_integration: arguments.fault_hold_worker_before_integration,
@@ -58,6 +63,8 @@ fn main() {
         skip_sandbox_cleanup: arguments.fault_skip_sandbox_cleanup,
         leave_effect_started: arguments.fault_leave_effect_started,
         leave_effect_started_after_rename: arguments.fault_leave_effect_started_after_rename,
+        leave_one_shot_effect_started_before_cleanup: arguments
+            .fault_leave_one_shot_effect_started_before_cleanup,
         hold_effect_before_commit_milliseconds: arguments
             .fault_hold_effect_before_commit_milliseconds,
         watchdog_stall_milliseconds: arguments.watchdog_stall_milliseconds,

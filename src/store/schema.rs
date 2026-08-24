@@ -456,7 +456,10 @@ CREATE TABLE IF NOT EXISTS operation_requests (
     authorized_at INTEGER,
     started_at INTEGER,
     completed_at INTEGER,
-    receipt_json TEXT
+    receipt_json TEXT,
+    credential_process_id INTEGER,
+    credential_process_marker TEXT,
+    credential_process_status TEXT CHECK (credential_process_status IN ('active', 'contained'))
 );
 
 CREATE TABLE IF NOT EXISTS approval_gates (
@@ -477,6 +480,37 @@ CREATE TABLE IF NOT EXISTS operation_execution_identities (
     operation_request_id TEXT PRIMARY KEY REFERENCES operation_requests(id),
     idempotency_key TEXT NOT NULL UNIQUE,
     request_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS credential_grants (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    worker_lease_id TEXT NOT NULL REFERENCES worker_leases(id),
+    mandate_revision INTEGER NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    credential_reference TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    exposure TEXT NOT NULL CHECK (exposure IN ('brokered_only', 'one_shot')),
+    credential_expires_at INTEGER NOT NULL,
+    revocation TEXT NOT NULL CHECK (revocation IN ('delete_from_keychain')),
+    status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'revoked', 'expired')),
+    created_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    revoked_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS credential_exposure_grants (
+    id TEXT PRIMARY KEY,
+    credential_grant_id TEXT NOT NULL REFERENCES credential_grants(id),
+    operation_request_id TEXT NOT NULL UNIQUE REFERENCES operation_requests(id),
+    operation_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('authorized', 'consumed', 'revoked')),
+    authorized_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    revoked_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS commission_amendments (
@@ -547,7 +581,8 @@ CREATE TABLE IF NOT EXISTS events (
         'operation_classified', 'operation_notification', 'approval_gate_opened',
         'approval_gate_authorized', 'operation_started', 'operation_confirmed',
         'operation_failed', 'operation_uncertain', 'commission_amendment_proposed',
-        'resource_ceiling_approaching'
+        'resource_ceiling_approaching', 'credential_grant_issued',
+        'credential_grant_consumed', 'credential_exposure_authorized'
     )),
     commission_revision INTEGER NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -662,6 +697,32 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             [],
         )?;
     }
+    if !column_exists(connection, "operation_requests", "credential_process_id")? {
+        connection.execute(
+            "ALTER TABLE operation_requests ADD COLUMN credential_process_id INTEGER",
+            [],
+        )?;
+    }
+    if !column_exists(
+        connection,
+        "operation_requests",
+        "credential_process_marker",
+    )? {
+        connection.execute(
+            "ALTER TABLE operation_requests ADD COLUMN credential_process_marker TEXT",
+            [],
+        )?;
+    }
+    if !column_exists(
+        connection,
+        "operation_requests",
+        "credential_process_status",
+    )? {
+        connection.execute(
+            "ALTER TABLE operation_requests ADD COLUMN credential_process_status TEXT CHECK (credential_process_status IN ('active', 'contained'))",
+            [],
+        )?;
+    }
     add_result_columns(connection)?;
     upgrade_results(connection)?;
     let events_schema = connection
@@ -685,6 +746,9 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             || !schema.contains("operation_confirmed")
             || !schema.contains("commission_amendment_proposed")
             || !schema.contains("resource_ceiling_approaching")
+            || !schema.contains("credential_grant_issued")
+            || !schema.contains("credential_grant_consumed")
+            || !schema.contains("credential_exposure_authorized")
     });
     if needs_event_upgrade {
         let payload_projection = if events_schema
@@ -716,7 +780,8 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
                     'operation_classified', 'operation_notification', 'approval_gate_opened',
                     'approval_gate_authorized', 'operation_started', 'operation_confirmed',
                     'operation_failed', 'operation_uncertain', 'commission_amendment_proposed',
-                    'resource_ceiling_approaching'
+                    'resource_ceiling_approaching', 'credential_grant_issued',
+                    'credential_grant_consumed', 'credential_exposure_authorized'
                 )),
                 commission_revision INTEGER NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{{}}',
@@ -735,7 +800,40 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     backfill_planned_assignments(connection)?;
     backfill_assignment_metadata(connection)?;
     upgrade_worker_commands(connection)?;
-    connection.pragma_update(None, "user_version", 12)?;
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS credential_grants (
+            id TEXT PRIMARY KEY,
+            commission_id TEXT NOT NULL REFERENCES commissions(id),
+            assignment_id TEXT NOT NULL REFERENCES assignments(id),
+            attempt_id TEXT NOT NULL REFERENCES attempts(id),
+            worker_lease_id TEXT NOT NULL REFERENCES worker_leases(id),
+            mandate_revision INTEGER NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            credential_reference TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            exposure TEXT NOT NULL CHECK (exposure IN ('brokered_only', 'one_shot')),
+            credential_expires_at INTEGER NOT NULL,
+            revocation TEXT NOT NULL CHECK (revocation IN ('delete_from_keychain')),
+            status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'revoked', 'expired')),
+            created_at INTEGER NOT NULL,
+            consumed_at INTEGER,
+            revoked_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS credential_exposure_grants (
+            id TEXT PRIMARY KEY,
+            credential_grant_id TEXT NOT NULL REFERENCES credential_grants(id),
+            operation_request_id TEXT NOT NULL UNIQUE REFERENCES operation_requests(id),
+            operation_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('authorized', 'consumed', 'revoked')),
+            authorized_at INTEGER NOT NULL,
+            consumed_at INTEGER,
+            revoked_at INTEGER
+        );
+        "#,
+    )?;
+    connection.pragma_update(None, "user_version", 13)?;
     Ok(())
 }
 
@@ -753,7 +851,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 12
+    Ok(user_version < 13
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -774,6 +872,19 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
         || !table_exists(connection, "approval_gates")?
         || !table_exists(connection, "operation_execution_identities")?
         || !table_exists(connection, "commission_amendments")?
+        || !table_exists(connection, "credential_grants")?
+        || !table_exists(connection, "credential_exposure_grants")?
+        || !column_exists(connection, "operation_requests", "credential_process_id")?
+        || !column_exists(
+            connection,
+            "operation_requests",
+            "credential_process_marker",
+        )?
+        || !column_exists(
+            connection,
+            "operation_requests",
+            "credential_process_status",
+        )?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
@@ -837,6 +948,9 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
                 || !schema.contains("operation_confirmed")
                 || !schema.contains("commission_amendment_proposed")
                 || !schema.contains("resource_ceiling_approaching")
+                || !schema.contains("credential_grant_issued")
+                || !schema.contains("credential_grant_consumed")
+                || !schema.contains("credential_exposure_authorized")
         }))
 }
 
@@ -844,7 +958,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v12", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v13", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -871,7 +985,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 12
+    if user_version != 13
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -889,6 +1003,19 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !table_exists(connection, "approval_gates")?
         || !table_exists(connection, "operation_execution_identities")?
         || !table_exists(connection, "commission_amendments")?
+        || !table_exists(connection, "credential_grants")?
+        || !table_exists(connection, "credential_exposure_grants")?
+        || !column_exists(connection, "operation_requests", "credential_process_id")?
+        || !column_exists(
+            connection,
+            "operation_requests",
+            "credential_process_marker",
+        )?
+        || !column_exists(
+            connection,
+            "operation_requests",
+            "credential_process_status",
+        )?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
@@ -947,6 +1074,9 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !events_schema.contains("operation_confirmed")
         || !events_schema.contains("commission_amendment_proposed")
         || !events_schema.contains("resource_ceiling_approaching")
+        || !events_schema.contains("credential_grant_issued")
+        || !events_schema.contains("credential_grant_consumed")
+        || !events_schema.contains("credential_exposure_authorized")
     {
         return Err(TyrionError::InvalidRequest(
             "events schema migration verification failed".into(),

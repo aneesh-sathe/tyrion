@@ -144,6 +144,7 @@ case "$operation" in
         fi
         exec env \
             TYRION_WORKSPACE_ROOT="$root" \
+            TYRION_FAKE_STATE="$state" \
             CODEX_AUTH_ACCESS_TOKEN=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN \
             CODEX_AUTH_REFRESH_TOKEN=openshell:resolve:env:CODEX_AUTH_REFRESH_TOKEN \
             CODEX_AUTH_ACCOUNT_ID=openshell:resolve:env:CODEX_AUTH_ACCOUNT_ID \

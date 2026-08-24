@@ -1,6 +1,6 @@
 # Tyrion
 
-Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6), inspectable cross-harness Worker routing and control from [issue #7](https://github.com/aneesh-sathe/tyrion/issues/7), and exact consequential-effect authorization from [issue #9](https://github.com/aneesh-sathe/tyrion/issues/9). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
+Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6), inspectable cross-harness Worker routing and control from [issue #7](https://github.com/aneesh-sathe/tyrion/issues/7), exact consequential-effect authorization from [issue #9](https://github.com/aneesh-sathe/tyrion/issues/9), and credentialed broker and one-shot effects from [issue #10](https://github.com/aneesh-sathe/tyrion/issues/10). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
 
 ## What exists
 
@@ -43,6 +43,7 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Fail-closed restart reconciliation with explicit identity, acknowledgement, lease, authority, and containment proofs
 - Durable pause, resume, and Principal cancellation with lease and reservation revocation
 - Exact operation classification, independent Principal Approval Gates, and single-use effect authorization
+- macOS Keychain-backed credential grants with brokered stdin delivery or a fresh one-shot Effect Sandbox
 - Revision-bound Commission Amendments with exact diffs and affected-work revalidation
 - Actionable resumable Blockers containing criteria, Evidence, artifacts, failed approaches, resource use, and the exact next requirement
 - Structured Codex app-server and Claude Agent SDK lifecycle contract validation
@@ -103,6 +104,8 @@ Start `tyriond` with `--worker-catalog <json>` to route each ready Assignment as
 
 Available Codex app-server and Claude Agent SDK configurations name an absolute, SHA-256-pinned adapter executable. Tyrion launches each with its own pinned native CLI, brokered provider, and endpoint-restricted OpenShell policy, plus a structured revision-bound Assignment and spend envelope. It validates the exact native model, tool and Skill activation state, lifecycle, usage, and typed Result; forwards journal-first controls; and persists native session telemetry for inspection. Launch-time unavailability reuses the approximately-equal routing rule, while durable cleanup survives repeated Control Plane crashes. Git-backed adapters receive only Tyrion-created bundle bindings; Tyrion commits ordinary uncommitted harness edits before independently validating and integrating the candidate. Production reference adapters are in `adapters/`.
 
+Credentialed effects keep secret values in macOS Keychain and outside SQLite, Worker environments, Entry Sessions, command arguments, logs, Evidence, and durable receipts. The daemon binds a Credential Grant and Principal Approval Gate to the exact current authority, Assignment, Attempt, Worker Lease, revisions, destination, parameters, consequences, and resource limits. Typed HTTP effects use the broker directly. Exceptional exposure creates a fresh non-agentic repaired OpenShell sandbox, delivers the secret once over standard input, terminates descendants, destroys the sandbox, revokes the Keychain item, and records only a redacted receipt. See [Credentialed effects](docs/credentialed-effects.md).
+
 ## Run locally
 
 Build the binaries:
@@ -118,7 +121,8 @@ target/debug/tyriond \
   --data-dir .scratch/tyrion-data \
   --socket .scratch/tyrion-data/tyrion.sock \
   --codex-worker-config runtime.json \
-  --worker-catalog worker-catalog.json
+  --worker-catalog worker-catalog.json \
+  --credential-runtime credential-runtime.json
 ```
 
 Create `proposal.json`:

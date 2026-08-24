@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tyrion::protocol::{
     AdapterIdentity, AttachmentHandshake, Command, CommissionAmendment, CommissionProposal,
-    CommissionReplayCursor, OperationReconciliationOutcome, OperationRequest, Request,
-    VerificationAmendment, VerificationEvidenceSubmission, PROTOCOL_VERSION,
+    CommissionReplayCursor, CredentialGrantRequest, OperationReconciliationOutcome,
+    OperationRequest, Request, VerificationAmendment, VerificationEvidenceSubmission,
+    PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -248,6 +249,15 @@ enum OperationCommand {
 
 #[derive(Debug, Subcommand)]
 enum PrincipalCommand {
+    GrantCredential {
+        commission_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
     InspectGate {
         approval_gate_id: String,
     },
@@ -702,6 +712,26 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                         commission_id: commission_id.clone(),
                         approval_gate_id: approval_gate_id.clone(),
                         operation: Box::new(operation),
+                    },
+                    Some(idempotency_key.clone()),
+                    Some(*expected_revision),
+                    None,
+                )
+            }
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::GrantCredential {
+                        commission_id,
+                        file,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => {
+                let grant: CredentialGrantRequest = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::GrantCredential {
+                        commission_id: commission_id.clone(),
+                        grant: Box::new(grant),
                     },
                     Some(idempotency_key.clone()),
                     Some(*expected_revision),

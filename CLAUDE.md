@@ -74,6 +74,7 @@
 - Schema v10 adds the pending Worker command outbox, durable sandbox cleanup, and per-Assignment Worker Configuration availability failures.
 - Schema v11 adds recovery decisions, restart proof records, Watchdog findings, pause and cancellation states, and revision dispositions for Attempts and Results.
 - Schema v12 adds revision-bound operation requests, single-use Approval Gates, Commission Amendments, and Worker Lease mandate revisions.
+- Schema v13 adds revision-bound Credential Grants and single-use Credential Exposure Grants for credentialed effects.
 - `--principal-control-bootstrap-fd` accepts only a dedicated inherited FIFO descriptor numbered 3 or greater. The daemon emits the ephemeral Principal credential once, closes the descriptor, retains only its hash, and never persists, projects, or writes the secret to standard output. Principal commands receive it through stdin; Attachments and Workers never receive it.
 - Classify every authorized operation as silent and journaled, non-blocking notification, Approval Gate, or prohibited. An approved operation must match its canonical digest and current Assignment, Attempt, Worker Lease, mandate, plan, authority, consequences, and limits at execution.
 - Commission Amendments replace the complete Authority Envelope and resource ceilings, present an exact diff, advance the mandate revision only after independent Principal acceptance, invalidate pending effect grants, and revalidate active Worker Leases.
@@ -89,5 +90,13 @@
 - When recovery supersedes a logical Assignment, retarget its downstream dependency edges to the replacement before advancing the safe Execution Frontier.
 - Inspection derives a resumable Blocker only when unresolved criteria have no running Attempt or safe Execution Frontier, and includes the exact next requirement plus retained Evidence, artifacts, failed approaches, and resource use.
 - Run `cargo test --test commission_effects` for operation classification, exact approval, amendment, ceiling, cancellation, and adversarial authority coverage.
+- Start credentialed effects with `tyriond --credential-runtime <json>`. The runtime pins macOS Keychain, curl, destination aliases, and the repaired OpenShell boundary used by exceptional one-shot exposure.
+- Credential values stay outside SQLite and reach only pinned effect executors over standard input. Execution revokes the Keychain item, destroys any fresh Effect Sandbox and descendants, scans for leaks, and persists a redacted receipt.
+- Credentialed lost-ack recovery pauses the Commission and permits only exact read-only reconciliation or an actionable blocker. It never automatically retries the write.
+- Derive one-shot Effect Sandbox names from the durable operation ID. Startup and reconciliation must delete that exact sandbox and revoke its Credential Grant before read-only observation; any post-delivery timeout is uncertain, never failed.
+- Register brokered effect process groups durably before credential delivery. Use a host-local operation marker that is never transmitted to the destination. Restart and reconciliation scan the marker, reject PID reuse, terminate the exact group, and independently verify Keychain revocation before observation.
+- Credentialed requests must approve both confirmed and not-applied reconciliation digests before their Approval Gate can open.
+- Run `cargo test --test credentialed_effects` for brokered delivery, one-shot isolation and cleanup, leak absence, and no-replay reconciliation coverage on macOS.
 - Run `cargo test --test cross_harness_routing` for hard gates, ranking visibility, Entry Session neutrality, cross-harness Assignment routing, approximately equal fallback, Attention Conditions, stable Handles, steering, and interruption.
+- Synchronize structured-control failure tests on an explicit fixture signal after stdin closes. Fixed sleeps can let the adapter finish and reject the command before the durable outbox record exists.
 - After verified issue-backed work is committed and pushed, close the completed issue and confirm its final state.

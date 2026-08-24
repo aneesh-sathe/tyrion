@@ -41,6 +41,7 @@ esac
 case "$launch" in
   *'break structured control pipe'*)
     exec 0<&-
+    : >"${TYRION_FAKE_STATE:?}/control-pipe-closed"
     sleep 1
     ;;
 esac

@@ -292,8 +292,70 @@ pub struct OperationRequest {
     pub parameters: BTreeMap<String, String>,
     pub destination: Option<String>,
     pub effect: Option<String>,
+    #[serde(default)]
+    pub credential: Option<CredentialUse>,
     pub consequences: Vec<String>,
     pub limits: OperationLimits,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialUse {
+    pub grant_id: String,
+    pub mode: CredentialUseMode,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialUseMode {
+    Brokered,
+    OneShotExposure,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialGrantRequest {
+    pub assignment_id: String,
+    pub attempt_id: String,
+    pub worker_lease_id: String,
+    pub mandate_revision: i64,
+    pub plan_revision: i64,
+    pub credential_reference: String,
+    pub capability: String,
+    pub destination: String,
+    pub exposure: CredentialExposure,
+    pub credential_expires_at: i64,
+    pub revocation: CredentialRevocation,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialExposure {
+    BrokeredOnly,
+    OneShot,
+}
+
+impl CredentialExposure {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BrokeredOnly => "brokered_only",
+            Self::OneShot => "one_shot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRevocation {
+    DeleteFromKeychain,
+}
+
+impl CredentialRevocation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteFromKeychain => "delete_from_keychain",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -301,6 +363,12 @@ pub struct OperationRequest {
 pub struct OperationLimits {
     pub max_output_bytes: u64,
     pub max_duration_seconds: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_paid_service_spend_cents: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -383,6 +451,10 @@ pub enum Command {
     ProposeOperation {
         commission_id: String,
         operation: Box<OperationRequest>,
+    },
+    GrantCredential {
+        commission_id: String,
+        grant: Box<CredentialGrantRequest>,
     },
     InspectApprovalGate {
         approval_gate_id: String,

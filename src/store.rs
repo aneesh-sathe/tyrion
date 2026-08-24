@@ -15,6 +15,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::credential::{
+    CredentialEffectBinding, CredentialEffectError, CredentialExecutionDeadline, CredentialRuntime,
+};
 use crate::domain::{
     ApprovalGateStatus, AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus,
     CriterionStatus, EventKind, OperationClassification, OperationStatus, ResultStatus,
@@ -23,10 +26,11 @@ use crate::domain::{
 use crate::protocol::{
     AcceptanceCriterion, AdapterIdentity, AssignmentPurpose, AssignmentResources,
     AttachmentHandshake, AuthorityEnvelope, CommissionAmendment, CommissionPlan,
-    CommissionProposal, CommissionReplayCursor, ExecutionSpec, OperationReconciliationOutcome,
-    OperationRequest, PlannedAssignment, Request, ResourceCeilings, VerificationAmendment,
-    VerificationDefect, VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict,
-    Verifier, VerifierType, WorkerRequirements, PROTOCOL_VERSION,
+    CommissionProposal, CommissionReplayCursor, CredentialExposure, CredentialGrantRequest,
+    CredentialUseMode, ExecutionSpec, OperationReconciliationOutcome, OperationRequest,
+    PlannedAssignment, Request, ResourceCeilings, VerificationAmendment, VerificationDefect,
+    VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict, Verifier, VerifierType,
+    WorkerRequirements, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
@@ -46,7 +50,20 @@ pub struct Store {
 pub(crate) struct EffectExecutionOptions {
     pub(crate) leave_started_before_effect: bool,
     pub(crate) leave_started_after_effect: bool,
+    pub(crate) leave_one_shot_started_before_cleanup: bool,
     pub(crate) hold_before_commit_milliseconds: u64,
+}
+
+pub(crate) struct EffectExecutionContext<'a> {
+    pub(crate) worker: &'a worker::WorkerRuntime,
+    pub(crate) credential: Option<&'a CredentialRuntime>,
+    pub(crate) options: EffectExecutionOptions,
+}
+
+pub(crate) struct EffectReconciliationContext<'a> {
+    pub(crate) worker: &'a worker::WorkerRuntime,
+    pub(crate) principal_token_hash: &'a str,
+    pub(crate) credential: Option<&'a CredentialRuntime>,
 }
 
 pub(crate) struct PendingCleanup {
@@ -147,6 +164,31 @@ struct FileEffectBinding {
     target_device: u64,
     target_inode: u64,
     before_sha256: String,
+}
+
+struct StoredCredentialGrant {
+    id: String,
+    credential_reference: String,
+    capability: String,
+    destination: String,
+    exposure: String,
+    expires_at: i64,
+    status: String,
+}
+
+struct StrandedOperationRecovery {
+    operation_request_id: String,
+    commission_id: String,
+    operation_digest: String,
+    revision: i64,
+    idempotency_key: Option<String>,
+    request_hash: Option<String>,
+    cleanup: Result<Option<Value>, String>,
+}
+
+enum BoundEffectBinding {
+    File(FileEffectBinding),
+    Credential(CredentialEffectBinding),
 }
 
 #[derive(Clone, Copy)]
@@ -927,6 +969,18 @@ impl Store {
             params![commission_id, OperationStatus::Revoked.as_str(), now],
         )?;
         transaction.execute(
+            "UPDATE credential_grants SET status = 'revoked', revoked_at = ?2
+             WHERE commission_id = ?1 AND status = 'active'",
+            params![commission_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE credential_exposure_grants SET status = 'revoked', revoked_at = ?2
+             WHERE credential_grant_id IN (
+                 SELECT id FROM credential_grants WHERE commission_id = ?1
+             ) AND status = 'authorized'",
+            params![commission_id, now],
+        )?;
+        transaction.execute(
             "UPDATE operation_requests SET status = 'uncertain', completed_at = ?2,
                     receipt_json = ?3
              WHERE commission_id = ?1 AND status = 'started'",
@@ -992,11 +1046,136 @@ impl Store {
         Ok(result)
     }
 
+    pub fn grant_credential(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        grant: &CredentialGrantRequest,
+        principal_token_hash: &str,
+        runtime: Option<&CredentialRuntime>,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let runtime = runtime.ok_or_else(|| {
+            TyrionError::ControlDenied("credential brokering is not configured".into())
+        })?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Credential Grant issuance requires an expected Commission revision".into(),
+            )
+        })?;
+        validate_credential_grant_shape(grant)?;
+        {
+            let transaction = self.connection.transaction()?;
+            if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+                return Ok(prior);
+            }
+            transaction.commit()?;
+        }
+        runtime.supports_grant(
+            &grant.credential_reference,
+            &grant.capability,
+            &grant.destination,
+        )?;
+        if grant.exposure == CredentialExposure::OneShot {
+            runtime.supports_exposure(&grant.destination)?;
+        }
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        ensure_current_credential_grant_context(
+            &transaction,
+            commission_id,
+            grant,
+            expected_revision,
+        )?;
+        let authority = load_authority(&transaction, commission_id)?;
+        let required_action = match grant.exposure {
+            CredentialExposure::BrokeredOnly => "credential.http.request",
+            CredentialExposure::OneShot => "credential.command.request",
+        };
+        if !authority
+            .destinations
+            .iter()
+            .any(|destination| destination == &grant.destination)
+            || !authority
+                .actions
+                .iter()
+                .any(|action| action == required_action)
+            || !authority
+                .effects
+                .iter()
+                .any(|effect| effect == "external.write")
+        {
+            return Err(TyrionError::ControlDenied(
+                "the Credential Grant is outside the current Authority Envelope".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        if grant.credential_expires_at <= now
+            || grant.credential_expires_at > now.saturating_add(900)
+        {
+            return Err(TyrionError::ControlDenied(
+                "a credential must be current and expire within fifteen minutes".into(),
+            ));
+        }
+        let grant_id = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT INTO credential_grants (
+                id, commission_id, assignment_id, attempt_id, worker_lease_id,
+                mandate_revision, plan_revision, credential_reference, capability,
+                destination, exposure, credential_expires_at, revocation, status, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active', ?14)",
+            params![
+                grant_id,
+                commission_id,
+                grant.assignment_id,
+                grant.attempt_id,
+                grant.worker_lease_id,
+                grant.mandate_revision,
+                grant.plan_revision,
+                grant.credential_reference,
+                grant.capability,
+                grant.destination,
+                grant.exposure.as_str(),
+                grant.credential_expires_at,
+                grant.revocation.as_str(),
+                now,
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::CredentialGrantIssued,
+            expected_revision,
+            &serde_json::json!({
+                "credential_grant_id": grant_id,
+                "assignment_id": grant.assignment_id,
+                "attempt_id": grant.attempt_id,
+                "worker_lease_id": grant.worker_lease_id,
+                "mandate_revision": grant.mandate_revision,
+                "plan_revision": grant.plan_revision,
+                "capability": grant.capability,
+                "destination": grant.destination,
+                "exposure": grant.exposure.as_str(),
+                "credential_expires_at": grant.credential_expires_at,
+                "credential_reference": "redacted",
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub fn propose_operation(
         &mut self,
         request: &Request,
         commission_id: &str,
         operation: &OperationRequest,
+        credential_runtime: Option<&CredentialRuntime>,
     ) -> Result<Value, TyrionError> {
         let idempotency_key = mutation_key(request)?;
         let request_hash = request_hash(request)?;
@@ -1045,17 +1224,41 @@ impl Store {
             );
         }
         let storage_ceiling = ceilings.max_storage_bytes;
+        if operation.credential.is_some() {
+            let runtime = credential_runtime.ok_or_else(|| {
+                TyrionError::ControlDenied("credential brokering is not configured".into())
+            })?;
+            runtime.validate_operation(operation)?;
+            let grant = load_current_credential_grant(&transaction, commission_id, operation)?;
+            validate_credential_operation_grant(operation, &grant)?;
+        }
         let projected_storage = (classification == OperationClassification::ApprovalGate
-            && operation.operation == "filesystem.write")
-            .then(|| {
-                operation
-                    .parameters
-                    .get("content")
-                    .map(|content| content.len() as u64)
-            })
-            .flatten();
+            && matches!(
+                operation.operation.as_str(),
+                "filesystem.write" | "credential.http.request" | "credential.command.request"
+            ))
+        .then(|| {
+            operation
+                .parameters
+                .get(if operation.operation == "filesystem.write" {
+                    "content"
+                } else {
+                    "body"
+                })
+                .map(|content| {
+                    let content = content.len() as u64;
+                    if operation.credential.is_some() {
+                        content.saturating_add(operation.limits.max_output_bytes)
+                    } else {
+                        content
+                    }
+                })
+        })
+        .flatten();
         if let Some(projected_storage) = projected_storage {
-            if projected_storage > operation.limits.max_output_bytes {
+            if operation.operation == "filesystem.write"
+                && projected_storage > operation.limits.max_output_bytes
+            {
                 classification = OperationClassification::Prohibited;
                 classification_reason = format!(
                     "filesystem.write requires {projected_storage} bytes but the exact approved max_output_bytes limit is {}",
@@ -1064,8 +1267,31 @@ impl Store {
             } else if projected_storage > storage_ceiling {
                 classification = OperationClassification::Prohibited;
                 classification_reason = format!(
-                    "filesystem.write requires {projected_storage} bytes but max_storage_bytes is {storage_ceiling}; accept a Commission Amendment before retrying"
+                    "the exact operation requires {projected_storage} bytes but max_storage_bytes is {storage_ceiling}; accept a Commission Amendment before retrying"
                 );
+            }
+        }
+        if operation.limits.max_paid_service_spend_cents > ceilings.max_paid_service_spend_cents {
+            classification = OperationClassification::Prohibited;
+            classification_reason = format!(
+                "the exact operation permits {} paid-service cents but the Commission ceiling is {}",
+                operation.limits.max_paid_service_spend_cents,
+                ceilings.max_paid_service_spend_cents
+            );
+        }
+        if operation.credential.is_some() {
+            let (reserved_storage, reserved_paid_service) = transaction.query_row(
+                "SELECT storage_bytes, paid_service_spend_cents
+                 FROM resource_reservations WHERE attempt_id = ?1 AND status = 'active'",
+                [&operation.attempt_id],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )?;
+            if projected_storage.is_some_and(|required| required > reserved_storage)
+                || operation.limits.max_paid_service_spend_cents > reserved_paid_service
+            {
+                classification = OperationClassification::Prohibited;
+                classification_reason =
+                    "the credentialed effect exceeds its Assignment resource grant".into();
             }
         }
         let status = match classification {
@@ -1076,7 +1302,7 @@ impl Store {
         };
         let (canonical_operation_value, _) =
             if classification == OperationClassification::ApprovalGate {
-                canonical_operation(operation)?
+                canonical_operation(operation, credential_runtime)?
             } else {
                 (serde_json::to_value(operation)?, None)
             };
@@ -1268,9 +1494,9 @@ impl Store {
         if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
             return Ok(prior);
         }
-        let (gate_status, operation_status, stored_digest, operation_json) = transaction
+        let (operation_request_id, gate_status, operation_status, stored_digest, operation_json) = transaction
             .query_row(
-                "SELECT approval_gates.status, operation_requests.status,
+                "SELECT operation_requests.id, approval_gates.status, operation_requests.status,
                         approval_gates.operation_digest,
                         operation_requests.canonical_operation_json
                  FROM approval_gates
@@ -1284,6 +1510,7 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -1315,6 +1542,10 @@ impl Store {
             &operation,
             expected_revision,
         )?;
+        if operation.credential.is_some() {
+            let grant = load_current_credential_grant(&transaction, commission_id, &operation)?;
+            validate_credential_operation_grant(&operation, &grant)?;
+        }
         let authority = load_authority(&transaction, commission_id)?;
         if classify_operation(&operation, &authority).0 != OperationClassification::ApprovalGate {
             return Err(TyrionError::ControlDenied(
@@ -1327,6 +1558,41 @@ impl Store {
              WHERE id = ?1 AND status = 'open'",
             params![approval_gate_id, now],
         )?;
+        if let Some(credential) = operation
+            .credential
+            .as_ref()
+            .filter(|credential| credential.mode == CredentialUseMode::OneShotExposure)
+        {
+            let credential_grant_id = credential.grant_id.as_str();
+            let exposure_grant_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT INTO credential_exposure_grants (
+                    id, credential_grant_id, operation_request_id, operation_digest,
+                    status, authorized_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'authorized', ?5)",
+                params![
+                    exposure_grant_id,
+                    credential_grant_id,
+                    operation_request_id,
+                    stored_digest,
+                    now,
+                ],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::CredentialExposureAuthorized,
+                expected_revision,
+                &serde_json::json!({
+                    "credential_exposure_grant_id": exposure_grant_id,
+                    "credential_grant_id": credential_grant_id,
+                    "operation_request_id": operation_request_id,
+                    "operation_digest": stored_digest,
+                    "single_use": true,
+                    "credential_reference": "redacted",
+                }),
+            )?;
+        }
         transaction.execute(
             "UPDATE operation_requests SET status = 'authorized', authorized_at = ?2
              WHERE id = (SELECT operation_request_id FROM approval_gates WHERE id = ?1)
@@ -1356,9 +1622,13 @@ impl Store {
         commission_id: &str,
         approval_gate_id: &str,
         operation: &OperationRequest,
-        runtime: &worker::WorkerRuntime,
-        options: EffectExecutionOptions,
+        context: EffectExecutionContext<'_>,
     ) -> Result<Value, TyrionError> {
+        let EffectExecutionContext {
+            worker: runtime,
+            credential: credential_runtime,
+            options,
+        } = context;
         let execution_started = Instant::now();
         let idempotency_key = mutation_key(request)?.to_owned();
         let request_hash = request_hash(request)?;
@@ -1414,15 +1684,23 @@ impl Store {
             ));
         }
         let stored_value: Value = serde_json::from_str(&operation_json)?;
-        let effect_binding: FileEffectBinding =
-            serde_json::from_value(stored_value.get("target_revision").cloned().ok_or_else(
-                || {
-                    TyrionError::ControlDenied(
-                        "the approved operation has no bound target revision".into(),
-                    )
-                },
-            )?)?;
-        let supplied_value = canonical_operation_with_binding(operation, &effect_binding)?;
+        let binding_value = stored_value
+            .get("target_revision")
+            .cloned()
+            .ok_or_else(|| {
+                TyrionError::ControlDenied(
+                    "the approved operation has no bound target revision".into(),
+                )
+            })?;
+        let effect_binding = if matches!(
+            operation.operation.as_str(),
+            "credential.http.request" | "credential.command.request"
+        ) {
+            BoundEffectBinding::Credential(serde_json::from_value(binding_value.clone())?)
+        } else {
+            BoundEffectBinding::File(serde_json::from_value(binding_value.clone())?)
+        };
+        let supplied_value = canonical_operation_with_binding(operation, &binding_value)?;
         let supplied_json = serde_json::to_string(&supplied_value)?;
         let supplied_digest = format!("{:x}", Sha256::digest(supplied_json.as_bytes()));
         if supplied_digest != stored_digest || supplied_json != operation_json {
@@ -1430,7 +1708,14 @@ impl Store {
                 "execution does not match the exact approved canonical operation".into(),
             ));
         }
-        ensure_file_effect_binding(operation, &effect_binding)?;
+        match &effect_binding {
+            BoundEffectBinding::File(binding) => ensure_file_effect_binding(operation, binding)?,
+            BoundEffectBinding::Credential(binding) => credential_runtime
+                .ok_or_else(|| {
+                    TyrionError::ControlDenied("credential brokering is not configured".into())
+                })?
+                .ensure_binding(operation, binding)?,
+        }
         ensure_current_operation_context(
             &transaction,
             commission_id,
@@ -1443,6 +1728,16 @@ impl Store {
                 "the approved operation is no longer within current authority".into(),
             ));
         }
+        let credential_grant = if operation.credential.is_some() {
+            let grant = load_current_credential_grant(&transaction, commission_id, operation)?;
+            validate_credential_operation_grant(operation, &grant)?;
+            credential_runtime.ok_or_else(|| {
+                TyrionError::ControlDenied("credential brokering is not configured".into())
+            })?;
+            Some(grant)
+        } else {
+            None
+        };
         let now = unix_timestamp()?;
         let consumed = transaction.execute(
             "UPDATE approval_gates SET status = ?2, consumed_at = ?3
@@ -1469,6 +1764,49 @@ impl Store {
                 OperationStatus::Authorized.as_str(),
             ],
         )?;
+        if let Some(grant) = &credential_grant {
+            let consumed = transaction.execute(
+                "UPDATE credential_grants SET status = 'consumed', consumed_at = ?2
+                 WHERE id = ?1 AND status = 'active'",
+                params![grant.id, now],
+            )?;
+            if consumed != 1 {
+                return Err(TyrionError::ControlDenied(
+                    "the Credential Grant was already consumed".into(),
+                ));
+            }
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::CredentialGrantConsumed,
+                expected_revision,
+                &serde_json::json!({
+                    "credential_grant_id": grant.id,
+                    "operation_request_id": operation_request_id,
+                    "operation_digest": stored_digest,
+                    "credential_reference": "redacted",
+                }),
+            )?;
+            if operation
+                .credential
+                .as_ref()
+                .is_some_and(|credential| credential.mode == CredentialUseMode::OneShotExposure)
+            {
+                let consumed = transaction.execute(
+                    "UPDATE credential_exposure_grants
+                     SET status = 'consumed', consumed_at = ?3
+                     WHERE operation_request_id = ?1 AND operation_digest = ?2
+                       AND credential_grant_id = ?4 AND status = 'authorized'",
+                    params![operation_request_id, stored_digest, now, grant.id],
+                )?;
+                if consumed != 1 {
+                    return Err(TyrionError::ControlDenied(
+                        "the single-use Credential Exposure Grant is missing, changed, or consumed"
+                            .into(),
+                    ));
+                }
+            }
+        }
         transaction.execute(
             "INSERT INTO operation_execution_identities (
                 operation_request_id, idempotency_key, request_hash
@@ -1508,13 +1846,25 @@ impl Store {
                     "the approved operation left current authority before execution".into(),
                 ));
             }
-            let (storage, elapsed, accepted_at, lease_expires_at) = transaction.query_row(
+            let (
+                storage,
+                elapsed,
+                accepted_at,
+                lease_expires_at,
+                assignment_storage,
+                commission_paid_service,
+                assignment_paid_service,
+            ) = transaction.query_row(
                 "SELECT resource_ceilings.max_storage_bytes,
                         resource_ceilings.max_elapsed_seconds, commissions.accepted_at,
-                        worker_leases.expires_at
+                        worker_leases.expires_at, resource_reservations.storage_bytes,
+                        resource_ceilings.max_paid_service_spend_cents,
+                        resource_reservations.paid_service_spend_cents
                  FROM resource_ceilings
                  JOIN commissions ON commissions.id = resource_ceilings.commission_id
                  JOIN worker_leases ON worker_leases.id = ?2
+                 JOIN resource_reservations
+                   ON resource_reservations.attempt_id = worker_leases.attempt_id
                  WHERE resource_ceilings.commission_id = ?1",
                 params![commission_id, operation.worker_lease_id],
                 |row| {
@@ -1523,16 +1873,45 @@ impl Store {
                         row.get::<_, u64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, u64>(6)?,
                     ))
                 },
             )?;
             let now = unix_timestamp()?;
             let elapsed_seconds = now.saturating_sub(accepted_at) as u64;
+            if credential_grant
+                .as_ref()
+                .is_some_and(|grant| grant.expires_at <= now)
+            {
+                return Err(TyrionError::ControlDenied(
+                    "the consumed Credential Grant expired before effect execution".into(),
+                ));
+            }
             if elapsed_seconds.saturating_add(operation.limits.max_duration_seconds) > elapsed {
                 return Err(TyrionError::ControlDenied(
                     "the approved operation no longer fits the Commission elapsed-time ceiling"
                         .into(),
                 ));
+            }
+            if operation.credential.is_some() {
+                let required_storage = operation
+                    .parameters
+                    .get("body")
+                    .map(|body| body.len() as u64)
+                    .unwrap_or(0)
+                    .saturating_add(operation.limits.max_output_bytes);
+                if required_storage > storage
+                    || required_storage > assignment_storage
+                    || operation.limits.max_paid_service_spend_cents > commission_paid_service
+                    || operation.limits.max_paid_service_spend_cents > assignment_paid_service
+                {
+                    return Err(TyrionError::ControlDenied(
+                        "the credentialed effect no longer fits its exact Commission and Assignment resource grants"
+                            .into(),
+                    ));
+                }
             }
             transaction.commit()?;
             Ok((
@@ -1541,18 +1920,114 @@ impl Store {
             ))
         })();
         let execution = match current_limits {
-            Ok((commission_storage_ceiling, effect_deadline)) => execute_file_replacement(
-                operation,
-                commission_storage_ceiling,
-                &effect_binding,
-                effect_deadline,
-                execution_started,
-                options.leave_started_after_effect,
-                options.hold_before_commit_milliseconds,
-            ),
-            Err(error) => Err(FileEffectError::Failed(error)),
+            Ok((commission_storage_ceiling, effect_deadline)) => match &effect_binding {
+                BoundEffectBinding::File(binding) => execute_file_replacement(
+                    operation,
+                    commission_storage_ceiling,
+                    binding,
+                    effect_deadline,
+                    execution_started,
+                    options.leave_started_after_effect,
+                    options.hold_before_commit_milliseconds,
+                ),
+                BoundEffectBinding::Credential(binding) => {
+                    let grant = credential_grant.as_ref().ok_or_else(|| {
+                        EffectExecutionError::Failed(TyrionError::ControlDenied(
+                            "credentialed execution has no current Credential Grant".into(),
+                        ))
+                    });
+                    match (credential_runtime, grant) {
+                        (Some(runtime), Ok(grant)) => {
+                            let deadline = CredentialExecutionDeadline::new(
+                                execution_started,
+                                operation.limits.max_duration_seconds,
+                                effect_deadline,
+                                grant.expires_at,
+                            );
+                            match operation
+                                .credential
+                                .as_ref()
+                                .map(|credential| credential.mode)
+                            {
+                                Some(CredentialUseMode::Brokered) => runtime
+                                    .execute_brokered(
+                                        operation,
+                                        binding,
+                                        &grant.credential_reference,
+                                        &operation_request_id,
+                                        deadline,
+                                        &mut |process_id, marker| {
+                                            let transaction = self.connection.transaction_with_behavior(
+                                                TransactionBehavior::Immediate,
+                                            )?;
+                                            let recorded = transaction.execute(
+                                                "UPDATE operation_requests
+                                                 SET credential_process_id = ?2,
+                                                     credential_process_marker = ?3,
+                                                     credential_process_status = 'active'
+                                                 WHERE id = ?1 AND status = 'started'
+                                                   AND credential_process_id IS NULL",
+                                                params![operation_request_id, process_id, marker],
+                                            )?;
+                                            if recorded != 1 {
+                                                return Err(TyrionError::ControlDenied(
+                                                    "credential broker process identity could not be durably registered"
+                                                        .into(),
+                                                ));
+                                            }
+                                            transaction.commit()?;
+                                            Ok(())
+                                        },
+                                    )
+                                    .map_err(EffectExecutionError::from),
+                                Some(CredentialUseMode::OneShotExposure) => runtime
+                                    .execute_one_shot(
+                                        operation,
+                                        binding,
+                                        &grant.credential_reference,
+                                        &operation_request_id,
+                                        deadline,
+                                        options.leave_one_shot_started_before_cleanup,
+                                    )
+                                    .map_err(EffectExecutionError::from),
+                                None => {
+                                    Err(EffectExecutionError::Failed(TyrionError::ControlDenied(
+                                        "credentialed execution has no delivery mode".into(),
+                                    )))
+                                }
+                            }
+                        }
+                        (None, _) => Err(EffectExecutionError::Failed(TyrionError::ControlDenied(
+                            "credential brokering is not configured".into(),
+                        ))),
+                        (_, Err(error)) => Err(error),
+                    }
+                }
+            },
+            Err(error) => {
+                if let (Some(runtime), Some(grant)) = (credential_runtime, &credential_grant) {
+                    match runtime.revoke_consumed_credential(&grant.credential_reference) {
+                        Ok(()) => Err(EffectExecutionError::Failed(error)),
+                        Err(revocation_error) => Err(EffectExecutionError::Uncertain {
+                            error: revocation_error,
+                            receipt: serde_json::json!({
+                                "status": "uncertain",
+                                "effect_started": false,
+                                "credential_revocation": "unverified",
+                                "secret_material_retained": false,
+                                "requirement": "Revoke the exact credential before resuming.",
+                            }),
+                        }),
+                    }
+                } else {
+                    Err(EffectExecutionError::Failed(error))
+                }
+            }
         };
-        if matches!(execution, Err(FileEffectError::LeaveStartedAfterEffect)) {
+        if matches!(
+            execution,
+            Err(EffectExecutionError::LeaveStartedAfterEffect)
+        ) {
             return Err(TyrionError::InvalidRequest(
                 "fault injection left the committed effect durably started".into(),
             ));
@@ -1560,6 +2035,18 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if operation
+            .credential
+            .as_ref()
+            .is_some_and(|credential| credential.mode == CredentialUseMode::Brokered)
+            && credential_execution_contained(&execution)
+        {
+            transaction.execute(
+                "UPDATE operation_requests SET credential_process_status = 'contained'
+                 WHERE id = ?1 AND credential_process_status = 'active'",
+                [&operation_request_id],
+            )?;
+        }
         match execution {
             Ok(receipt) => {
                 let completed_at = unix_timestamp()?;
@@ -1590,7 +2077,7 @@ impl Store {
                 transaction.commit()?;
                 Ok(result)
             }
-            Err(FileEffectError::Failed(error)) => {
+            Err(EffectExecutionError::Failed(error)) => {
                 let completed_at = unix_timestamp()?;
                 let receipt = serde_json::json!({
                     "status": "failed",
@@ -1624,7 +2111,7 @@ impl Store {
                 transaction.commit()?;
                 Ok(result)
             }
-            Err(FileEffectError::Uncertain { error, receipt }) => {
+            Err(EffectExecutionError::Uncertain { error, receipt }) => {
                 let completed_at = unix_timestamp()?;
                 transaction.execute(
                     "UPDATE operation_requests
@@ -1673,7 +2160,7 @@ impl Store {
                 let _ = error;
                 Ok(result)
             }
-            Err(FileEffectError::LeaveStartedAfterEffect) => unreachable!(),
+            Err(EffectExecutionError::LeaveStartedAfterEffect) => unreachable!(),
         }
     }
 
@@ -1684,9 +2171,18 @@ impl Store {
         operation_request_id: &str,
         outcome: OperationReconciliationOutcome,
         observed_sha256: &str,
-        principal_token_hash: &str,
+        context: EffectReconciliationContext<'_>,
     ) -> Result<Value, TyrionError> {
+        let EffectReconciliationContext {
+            worker,
+            principal_token_hash,
+            credential: credential_runtime,
+        } = context;
         authenticate_principal(request, principal_token_hash)?;
+        let integration_lock = worker.commission_integration_lock(commission_id)?;
+        let _integration_guard = integration_lock.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Commission Integration lock is unavailable".into())
+        })?;
         validate_sha256(observed_sha256)?;
         let idempotency_key = mutation_key(request)?.to_owned();
         let request_hash = request_hash(request)?;
@@ -1695,7 +2191,15 @@ impl Store {
                 "operation reconciliation requires an expected Commission revision".into(),
             )
         })?;
-        let (canonical_json, binding, operation) = {
+        let (
+            canonical_json,
+            binding,
+            operation,
+            credential_reference,
+            credential_process_id,
+            credential_process_marker,
+            credential_process_status,
+        ) = {
             let transaction = self.connection.transaction()?;
             if let Some(prior) = prior_result(&transaction, &idempotency_key, &request_hash)? {
                 return Ok(prior);
@@ -1714,13 +2218,28 @@ impl Store {
                     actual: revision,
                 });
             }
-            let (status, canonical_json) = transaction
+            let (
+                status,
+                canonical_json,
+                credential_process_id,
+                credential_process_marker,
+                credential_process_status,
+            ) = transaction
                 .query_row(
-                    "SELECT status, canonical_operation_json
+                    "SELECT status, canonical_operation_json, credential_process_id,
+                            credential_process_marker, credential_process_status
                      FROM operation_requests
                      WHERE id = ?1 AND commission_id = ?2",
                     params![operation_request_id, commission_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<u32>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
                 )
                 .optional()?
                 .ok_or_else(|| TyrionError::NotFound(operation_request_id.to_owned()))?;
@@ -1730,13 +2249,9 @@ impl Store {
                 ));
             }
             let mut canonical: Value = serde_json::from_str(&canonical_json)?;
-            let binding: FileEffectBinding = serde_json::from_value(
-                canonical.get("target_revision").cloned().ok_or_else(|| {
-                    TyrionError::InvalidRequest(
-                        "uncertain effect has no exact target revision".into(),
-                    )
-                })?,
-            )?;
+            let binding_value = canonical.get("target_revision").cloned().ok_or_else(|| {
+                TyrionError::InvalidRequest("uncertain effect has no exact target revision".into())
+            })?;
             canonical
                 .as_object_mut()
                 .ok_or_else(|| {
@@ -1744,20 +2259,94 @@ impl Store {
                 })?
                 .remove("target_revision");
             let operation: OperationRequest = serde_json::from_value(canonical)?;
+            let binding = if operation.credential.is_some() {
+                BoundEffectBinding::Credential(serde_json::from_value(binding_value)?)
+            } else {
+                BoundEffectBinding::File(serde_json::from_value(binding_value)?)
+            };
+            let credential_reference = if let Some(credential) = &operation.credential {
+                Some(
+                    transaction
+                        .query_row(
+                            "SELECT credential_reference FROM credential_grants WHERE id = ?1",
+                            [&credential.grant_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| {
+                            TyrionError::ControlDenied(
+                                "uncertain effect has no durable Credential Grant".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             transaction.commit()?;
-            (canonical_json, binding, operation)
+            (
+                canonical_json,
+                binding,
+                operation,
+                credential_reference,
+                credential_process_id,
+                credential_process_marker,
+                credential_process_status,
+            )
         };
-        let actual_sha256 = observe_effect_target(&operation, &binding)?;
-        let expected_sha256 = match outcome {
-            OperationReconciliationOutcome::Confirmed => {
-                let content = operation.parameters.get("content").ok_or_else(|| {
-                    TyrionError::InvalidRequest(
-                        "filesystem.write reconciliation requires content".into(),
+        if let Some(credential_reference) = credential_reference.as_deref() {
+            let runtime = credential_runtime.ok_or_else(|| {
+                TyrionError::ControlDenied(
+                    "credentialed reconciliation requires its pinned cleanup runtime".into(),
+                )
+            })?;
+            runtime.recover_stranded_effect(
+                operation_request_id,
+                &operation,
+                credential_reference,
+                active_broker_process(
+                    credential_process_id,
+                    credential_process_marker.as_deref(),
+                    credential_process_status.as_deref(),
+                )?,
+            )?;
+        }
+        let (actual_sha256, expected_sha256, observer) = match &binding {
+            BoundEffectBinding::File(binding) => {
+                let actual = observe_effect_target(&operation, binding)?;
+                let expected = match outcome {
+                    OperationReconciliationOutcome::Confirmed => {
+                        let content = operation.parameters.get("content").ok_or_else(|| {
+                            TyrionError::InvalidRequest(
+                                "filesystem.write reconciliation requires content".into(),
+                            )
+                        })?;
+                        format!("{:x}", Sha256::digest(content.as_bytes()))
+                    }
+                    OperationReconciliationOutcome::NotApplied => binding.before_sha256.clone(),
+                };
+                (actual, expected, "daemon_filesystem_observer")
+            }
+            BoundEffectBinding::Credential(binding) => {
+                let runtime = credential_runtime.ok_or_else(|| {
+                    TyrionError::ControlDenied(
+                        "credentialed reconciliation requires its pinned broker runtime".into(),
                     )
                 })?;
-                format!("{:x}", Sha256::digest(content.as_bytes()))
+                let actual = runtime.observe_read_only(&operation, binding)?;
+                let field = match outcome {
+                    OperationReconciliationOutcome::Confirmed => "confirmed_reconciliation_sha256",
+                    OperationReconciliationOutcome::NotApplied => {
+                        "not_applied_reconciliation_sha256"
+                    }
+                };
+                let expected = operation.parameters.get(field).cloned().ok_or_else(|| {
+                    TyrionError::InvalidRequest(format!(
+                        "credentialed reconciliation requires {field}"
+                    ))
+                })?;
+                validate_sha256(&expected)?;
+                (actual, expected, "brokered_read_only_observer")
             }
-            OperationReconciliationOutcome::NotApplied => binding.before_sha256.clone(),
         };
         if observed_sha256 != actual_sha256 || observed_sha256 != expected_sha256 {
             return Err(TyrionError::ControlDenied(
@@ -1796,6 +2385,13 @@ impl Store {
                     .into(),
             ));
         }
+        if credential_reference.is_some() {
+            transaction.execute(
+                "UPDATE operation_requests SET credential_process_status = 'contained'
+                 WHERE id = ?1 AND credential_process_status = 'active'",
+                [operation_request_id],
+            )?;
+        }
         let (status, event, reconciliation) = match outcome {
             OperationReconciliationOutcome::Confirmed => (
                 OperationStatus::Confirmed,
@@ -1814,6 +2410,7 @@ impl Store {
             "reconciliation": reconciliation,
             "principal_observed_sha256": observed_sha256,
             "independently_observed_sha256": actual_sha256,
+            "reconciliation_observer": observer,
             "rollback_claimed": false,
             "secret_material_retained": false,
         });
@@ -2165,6 +2762,18 @@ impl Store {
         transaction.execute(
             "UPDATE operation_requests SET status = 'revoked', completed_at = ?2
              WHERE commission_id = ?1 AND status IN ('approval_required', 'authorized')",
+            params![commission_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE credential_grants SET status = 'revoked', revoked_at = ?2
+             WHERE commission_id = ?1 AND status = 'active'",
+            params![commission_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE credential_exposure_grants SET status = 'revoked', revoked_at = ?2
+             WHERE credential_grant_id IN (
+                 SELECT id FROM credential_grants WHERE commission_id = ?1
+             ) AND status = 'authorized'",
             params![commission_id, now],
         )?;
         let revalidation = serde_json::json!({
@@ -2584,16 +3193,20 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn recover_stranded_operations(&mut self) -> Result<(), TyrionError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    pub fn recover_stranded_operations(
+        &mut self,
+        credential_runtime: Option<&CredentialRuntime>,
+    ) -> Result<(), TyrionError> {
         let stranded = {
-            let mut statement = transaction.prepare(
+            let mut statement = self.connection.prepare(
                 "SELECT operation_requests.id, operation_requests.commission_id,
                         operation_requests.operation_digest, commissions.revision,
                         operation_execution_identities.idempotency_key,
-                        operation_execution_identities.request_hash
+                        operation_execution_identities.request_hash,
+                        operation_requests.canonical_operation_json,
+                        operation_requests.credential_process_id,
+                        operation_requests.credential_process_marker,
+                        operation_requests.credential_process_status
                  FROM operation_requests
                  JOIN commissions ON commissions.id = operation_requests.commission_id
                  LEFT JOIN operation_execution_identities
@@ -2609,12 +3222,15 @@ impl Store {
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<u32>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let recovered_at = unix_timestamp()?;
-        let mut replay_results = Vec::new();
+        let mut recovered = Vec::with_capacity(stranded.len());
         for (
             operation_request_id,
             commission_id,
@@ -2622,57 +3238,149 @@ impl Store {
             revision,
             idempotency_key,
             request_hash,
+            canonical_json,
+            credential_process_id,
+            credential_process_marker,
+            credential_process_status,
         ) in stranded
         {
+            let cleanup = (|| -> Result<Option<Value>, TyrionError> {
+                let mut canonical: Value = serde_json::from_str(&canonical_json)?;
+                canonical
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        TyrionError::InvalidRequest(
+                            "stranded canonical operation must be an object".into(),
+                        )
+                    })?
+                    .remove("target_revision");
+                let operation: OperationRequest = serde_json::from_value(canonical)?;
+                let Some(credential_use) = operation.credential.as_ref() else {
+                    return Ok(None);
+                };
+                let credential_reference = self
+                    .connection
+                    .query_row(
+                        "SELECT credential_reference FROM credential_grants WHERE id = ?1",
+                        [&credential_use.grant_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        TyrionError::ControlDenied(
+                            "stranded effect has no durable Credential Grant".into(),
+                        )
+                    })?;
+                let runtime = credential_runtime.ok_or_else(|| {
+                    TyrionError::ControlDenied(
+                        "stranded credential cleanup requires its pinned runtime".into(),
+                    )
+                })?;
+                runtime
+                    .recover_stranded_effect(
+                        &operation_request_id,
+                        &operation,
+                        &credential_reference,
+                        active_broker_process(
+                            credential_process_id,
+                            credential_process_marker.as_deref(),
+                            credential_process_status.as_deref(),
+                        )?,
+                    )
+                    .map(Some)
+            })()
+            .map_err(|error| error.to_string());
+            recovered.push(StrandedOperationRecovery {
+                operation_request_id,
+                commission_id,
+                operation_digest,
+                revision,
+                idempotency_key,
+                request_hash,
+                cleanup,
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recovered_at = unix_timestamp()?;
+        let mut replay_results = Vec::new();
+        for stranded in recovered {
+            let (cleanup_receipt, containment_confirmed, requirement) = match stranded.cleanup {
+                Ok(cleanup) => (
+                    cleanup,
+                    true,
+                    "Reconcile the exact target revision before any linked Commission retries it."
+                        .to_owned(),
+                ),
+                Err(error) => (
+                    None,
+                    false,
+                    format!(
+                        "Complete exact credential and Effect Sandbox cleanup before read-only reconciliation: {error}"
+                    ),
+                ),
+            };
             let receipt = serde_json::json!({
                 "status": "uncertain",
                 "effect_may_have_occurred": true,
                 "rollback_claimed": false,
-                "requirement": "Reconcile the exact target revision before any linked Commission retries it.",
+                "containment_confirmed": containment_confirmed,
+                "cleanup": cleanup_receipt,
+                "requirement": requirement,
                 "recovered_after_control_plane_restart": true,
             });
+            if containment_confirmed {
+                transaction.execute(
+                    "UPDATE operation_requests SET credential_process_status = 'contained'
+                     WHERE id = ?1 AND credential_process_status = 'active'",
+                    [&stranded.operation_request_id],
+                )?;
+            }
             transaction.execute(
                 "UPDATE operation_requests
                  SET status = 'uncertain', completed_at = ?2, receipt_json = ?3
                  WHERE id = ?1 AND status = 'started'",
                 params![
-                    operation_request_id,
+                    stranded.operation_request_id,
                     recovered_at,
                     serde_json::to_string(&receipt)?,
                 ],
             )?;
             record_event_with_payload(
                 &transaction,
-                &commission_id,
+                &stranded.commission_id,
                 EventKind::OperationUncertain,
-                revision,
+                stranded.revision,
                 &serde_json::json!({
-                    "operation_request_id": operation_request_id,
-                    "operation_digest": operation_digest,
+                    "operation_request_id": stranded.operation_request_id,
+                    "operation_digest": stranded.operation_digest,
                     "receipt": receipt,
                 }),
             )?;
             let paused = transaction.execute(
                 "UPDATE commissions SET status = 'paused'
                  WHERE id = ?1 AND status = 'active'",
-                [&commission_id],
+                [&stranded.commission_id],
             )?;
             if paused == 1 {
                 record_event_with_payload(
                     &transaction,
-                    &commission_id,
+                    &stranded.commission_id,
                     EventKind::CommissionPaused,
-                    revision,
+                    stranded.revision,
                     &serde_json::json!({
                         "cause": "uncertain_consequential_effect",
-                        "operation_request_id": operation_request_id,
+                        "operation_request_id": stranded.operation_request_id,
                         "dispatch_enabled": false,
-                        "resumable_after_principal_reconciliation": true,
+                        "resumable_after_principal_reconciliation": containment_confirmed,
                     }),
                 )?;
             }
-            if let (Some(idempotency_key), Some(request_hash)) = (idempotency_key, request_hash) {
-                replay_results.push((commission_id, idempotency_key, request_hash));
+            if let (Some(idempotency_key), Some(request_hash)) =
+                (stranded.idempotency_key, stranded.request_hash)
+            {
+                replay_results.push((stranded.commission_id, idempotency_key, request_hash));
             }
         }
         for (commission_id, idempotency_key, request_hash) in replay_results {
@@ -9798,6 +10506,11 @@ fn validate_operation_shape(operation: &OperationRequest) -> Result<(), TyrionEr
             "operation identity, consequences, and positive limits are required".into(),
         ));
     }
+    if operation.operation.starts_with("credential.") != operation.credential.is_some() {
+        return Err(TyrionError::InvalidRequest(
+            "credentialed operations require one explicit Credential Grant use".into(),
+        ));
+    }
     validate_relative_scope(&operation.target)?;
     if operation
         .parameters
@@ -9825,13 +10538,26 @@ fn validate_operation_shape(operation: &OperationRequest) -> Result<(), TyrionEr
 
 fn canonical_operation(
     operation: &OperationRequest,
-) -> Result<(Value, Option<FileEffectBinding>), TyrionError> {
+    credential_runtime: Option<&CredentialRuntime>,
+) -> Result<(Value, Option<Value>), TyrionError> {
     let mut canonical = serde_json::to_value(operation)?;
-    let binding = (operation.operation == "filesystem.write"
+    let binding = if operation.operation == "filesystem.write"
         && operation.effect.as_deref() == Some("filesystem.write")
-        && operation.destination.as_deref() == Some("local"))
-    .then(|| bind_file_effect(operation))
-    .transpose()?;
+        && operation.destination.as_deref() == Some("local")
+    {
+        Some(serde_json::to_value(bind_file_effect(operation)?)?)
+    } else if matches!(
+        operation.operation.as_str(),
+        "credential.http.request" | "credential.command.request"
+    ) && operation.effect.as_deref() == Some("external.write")
+    {
+        let runtime = credential_runtime.ok_or_else(|| {
+            TyrionError::ControlDenied("credential brokering is not configured".into())
+        })?;
+        Some(serde_json::to_value(runtime.bind(operation)?)?)
+    } else {
+        None
+    };
     if let Some(binding) = &binding {
         canonical
             .as_object_mut()
@@ -9845,13 +10571,13 @@ fn canonical_operation(
 
 fn canonical_operation_with_binding(
     operation: &OperationRequest,
-    binding: &FileEffectBinding,
+    binding: &Value,
 ) -> Result<Value, TyrionError> {
     let mut canonical = serde_json::to_value(operation)?;
     canonical
         .as_object_mut()
         .ok_or_else(|| TyrionError::InvalidRequest("canonical operation must be an object".into()))?
-        .insert("target_revision".into(), serde_json::to_value(binding)?);
+        .insert("target_revision".into(), binding.clone());
     Ok(canonical)
 }
 
@@ -10043,16 +10769,22 @@ fn classify_operation(
     operation: &OperationRequest,
     authority: &AuthorityEnvelope,
 ) -> (OperationClassification, &'static str) {
-    let repository_authorized = operation.repository.as_ref().is_some_and(|repository| {
-        authority
-            .repositories
+    let repository_scoped = matches!(
+        operation.operation.as_str(),
+        "repository.read" | "repository.edit" | "filesystem.write"
+    );
+    let repository_authorized = !repository_scoped
+        || operation.repository.as_ref().is_some_and(|repository| {
+            authority
+                .repositories
+                .iter()
+                .any(|authorized| authorized == repository)
+        });
+    let target_authorized = !repository_scoped
+        || authority
+            .paths
             .iter()
-            .any(|authorized| authorized == repository)
-    });
-    let target_authorized = authority
-        .paths
-        .iter()
-        .any(|authorized| path_is_within_scope(&operation.target, authorized));
+            .any(|authorized| path_is_within_scope(&operation.target, authorized));
     let action_authorized = authority
         .actions
         .iter()
@@ -10096,6 +10828,30 @@ fn classify_operation(
             (
                 OperationClassification::ApprovalGate,
                 "the requested file replacement is a consequential effect requiring exact Principal approval",
+            )
+        }
+        "credential.http.request"
+            if operation.repository.is_none()
+                && operation.destination.is_some()
+                && operation.effect.as_deref() == Some("external.write")
+                && operation.credential.is_some() =>
+        {
+            (
+                OperationClassification::ApprovalGate,
+                "the credentialed external request requires exact Principal approval",
+            )
+        }
+        "credential.command.request"
+            if operation.repository.is_none()
+                && operation.destination.is_some()
+                && operation.effect.as_deref() == Some("external.write")
+                && operation.credential.as_ref().is_some_and(|credential| {
+                    credential.mode == CredentialUseMode::OneShotExposure
+                }) =>
+        {
+            (
+                OperationClassification::ApprovalGate,
+                "the exceptional one-shot credential exposure requires exact Principal approval",
             )
         }
         _ => (
@@ -10177,6 +10933,169 @@ fn ensure_current_operation_context(
     Ok(())
 }
 
+fn validate_credential_grant_shape(grant: &CredentialGrantRequest) -> Result<(), TyrionError> {
+    if grant.assignment_id.trim().is_empty()
+        || grant.attempt_id.trim().is_empty()
+        || grant.worker_lease_id.trim().is_empty()
+        || grant.credential_reference.trim().is_empty()
+        || grant.capability.trim().is_empty()
+        || grant.destination.trim().is_empty()
+        || grant.credential_reference.contains('\0')
+        || grant.capability.contains('\0')
+        || grant.destination.contains('\0')
+    {
+        return Err(TyrionError::InvalidRequest(
+            "Credential Grant identity, capability, and destination are required".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_current_credential_grant_context(
+    connection: &Connection,
+    commission_id: &str,
+    grant: &CredentialGrantRequest,
+    expected_revision: i64,
+) -> Result<(), TyrionError> {
+    let context = connection
+        .query_row(
+            "SELECT commissions.status, commissions.revision, assignments.plan_revision,
+                    attempts.status, worker_leases.status, worker_leases.expires_at,
+                    worker_leases.mandate_revision
+             FROM commissions
+             JOIN assignments ON assignments.commission_id = commissions.id
+             JOIN attempts ON attempts.assignment_id = assignments.id
+             JOIN worker_leases ON worker_leases.attempt_id = attempts.id
+             WHERE commissions.id = ?1 AND assignments.id = ?2
+               AND attempts.id = ?3 AND worker_leases.id = ?4",
+            params![
+                commission_id,
+                grant.assignment_id,
+                grant.attempt_id,
+                grant.worker_lease_id,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(
+                "Credential Grant does not identify a current Assignment, Attempt, and Worker Lease"
+                    .into(),
+            )
+        })?;
+    if context.1 != expected_revision {
+        return Err(TyrionError::StaleRevision {
+            expected: expected_revision,
+            actual: context.1,
+        });
+    }
+    if context.0 != CommissionStatus::Active.as_str()
+        || grant.mandate_revision != context.1
+        || grant.plan_revision != context.2
+        || context.3 != AttemptStatus::Running.as_str()
+        || context.4 != WorkerLeaseStatus::Active.as_str()
+        || context.6 != context.1
+        || context.5 <= unix_timestamp()?
+    {
+        return Err(TyrionError::ControlDenied(
+            "Credential Grant authority is stale or no longer active".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_current_credential_grant(
+    connection: &Connection,
+    commission_id: &str,
+    operation: &OperationRequest,
+) -> Result<StoredCredentialGrant, TyrionError> {
+    let credential_use = operation.credential.as_ref().ok_or_else(|| {
+        TyrionError::ControlDenied("credentialed operation has no Credential Grant".into())
+    })?;
+    let stored = connection
+        .query_row(
+            "SELECT id, assignment_id, attempt_id, worker_lease_id, mandate_revision,
+                    plan_revision, credential_reference, capability, destination,
+                    exposure, credential_expires_at, status
+             FROM credential_grants
+             WHERE id = ?1 AND commission_id = ?2",
+            params![credential_use.grant_id, commission_id],
+            |row| {
+                Ok((
+                    StoredCredentialGrant {
+                        id: row.get(0)?,
+                        credential_reference: row.get(6)?,
+                        capability: row.get(7)?,
+                        destination: row.get(8)?,
+                        exposure: row.get(9)?,
+                        expires_at: row.get(10)?,
+                        status: row.get(11)?,
+                    },
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(
+                "the Credential Grant is not bound to the exact current Assignment grant".into(),
+            )
+        })?;
+    if stored.1 != operation.assignment_id
+        || stored.2 != operation.attempt_id
+        || stored.3 != operation.worker_lease_id
+        || stored.4 != operation.mandate_revision
+        || stored.5 != operation.plan_revision
+    {
+        return Err(TyrionError::ControlDenied(
+            "the Credential Grant is not bound to the exact current Assignment grant".into(),
+        ));
+    }
+    Ok(stored.0)
+}
+
+fn validate_credential_operation_grant(
+    operation: &OperationRequest,
+    grant: &StoredCredentialGrant,
+) -> Result<(), TyrionError> {
+    let credential_use = operation.credential.as_ref().ok_or_else(|| {
+        TyrionError::ControlDenied("credentialed operation has no Credential Grant".into())
+    })?;
+    let mode_allowed = match credential_use.mode {
+        CredentialUseMode::Brokered => grant.exposure == CredentialExposure::BrokeredOnly.as_str(),
+        CredentialUseMode::OneShotExposure => {
+            grant.exposure == CredentialExposure::OneShot.as_str()
+        }
+    };
+    if grant.id != credential_use.grant_id
+        || grant.status != "active"
+        || grant.expires_at <= unix_timestamp()?
+        || grant.capability != "http_bearer"
+        || operation.destination.as_deref() != Some(grant.destination.as_str())
+        || !mode_allowed
+    {
+        return Err(TyrionError::ControlDenied(
+            "the Credential Grant is stale, consumed, mismatched, or does not permit this delivery mode"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn execute_file_replacement(
     operation: &OperationRequest,
     commission_storage_ceiling: u64,
@@ -10185,7 +11104,7 @@ fn execute_file_replacement(
     started: Instant,
     leave_started_after_rename: bool,
     hold_before_commit_milliseconds: u64,
-) -> Result<Value, FileEffectError> {
+) -> Result<Value, EffectExecutionError> {
     if operation.operation != "filesystem.write"
         || operation.effect.as_deref() != Some("filesystem.write")
         || operation.destination.as_deref() != Some("local")
@@ -10272,7 +11191,7 @@ fn execute_file_replacement(
     })();
     if let Err(error) = write_result {
         let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
-        return Err(FileEffectError::Failed(error));
+        return Err(EffectExecutionError::Failed(error));
     }
     ensure_effect_deadline(
         started,
@@ -10293,14 +11212,14 @@ fn execute_file_replacement(
         rename_noreplace(&directory, target_name, &directory, OsStr::new(&displaced))
     {
         let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
-        return Err(FileEffectError::Failed(error.into()));
+        return Err(EffectExecutionError::Failed(error.into()));
     }
     if let Err(error) = ensure_bound_target(&directory, OsStr::new(&displaced), binding) {
         let restored =
             rename_noreplace(&directory, OsStr::new(&displaced), &directory, target_name).is_ok();
         let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
         if restored {
-            return Err(FileEffectError::Failed(error));
+            return Err(EffectExecutionError::Failed(error));
         }
         return Err(uncertain_file_effect(
             error,
@@ -10324,7 +11243,7 @@ fn execute_file_replacement(
             rename_noreplace(&directory, OsStr::new(&displaced), &directory, target_name).is_ok();
         let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
         if restored {
-            return Err(FileEffectError::Failed(error));
+            return Err(EffectExecutionError::Failed(error));
         }
         return Err(uncertain_file_effect(
             error,
@@ -10346,7 +11265,7 @@ fn execute_file_replacement(
             rename_noreplace(&directory, OsStr::new(&displaced), &directory, target_name).is_ok();
         let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
         if restored {
-            return Err(FileEffectError::Failed(error.into()));
+            return Err(EffectExecutionError::Failed(error.into()));
         }
         return Err(uncertain_file_effect(
             error.into(),
@@ -10392,10 +11311,10 @@ fn execute_file_replacement(
         ));
     }
     if leave_started_after_rename {
-        return Err(FileEffectError::LeaveStartedAfterEffect);
+        return Err(EffectExecutionError::LeaveStartedAfterEffect);
     }
     if started.elapsed() > Duration::from_secs(operation.limits.max_duration_seconds) {
-        return Err(FileEffectError::Uncertain {
+        return Err(EffectExecutionError::Uncertain {
             error: TyrionError::InvalidRequest(
                 "filesystem.write exceeded its exact duration limit while containing the committed effect"
                     .into(),
@@ -10510,8 +11429,8 @@ struct UncertainEffectDetails<'a> {
 fn uncertain_file_effect(
     error: TyrionError,
     details: UncertainEffectDetails<'_>,
-) -> FileEffectError {
-    FileEffectError::Uncertain {
+) -> EffectExecutionError {
+    EffectExecutionError::Uncertain {
         error,
         receipt: serde_json::json!({
             "status": "uncertain",
@@ -10530,10 +11449,42 @@ fn uncertain_file_effect(
     }
 }
 
-enum FileEffectError {
+enum EffectExecutionError {
     Failed(TyrionError),
     Uncertain { error: TyrionError, receipt: Value },
     LeaveStartedAfterEffect,
+}
+
+fn credential_execution_contained(execution: &Result<Value, EffectExecutionError>) -> bool {
+    let receipt = match execution {
+        Ok(receipt) | Err(EffectExecutionError::Uncertain { receipt, .. }) => receipt,
+        Err(EffectExecutionError::Failed(_) | EffectExecutionError::LeaveStartedAfterEffect) => {
+            return false
+        }
+    };
+    receipt
+        .get("broker_process_contained")
+        .or_else(|| {
+            receipt
+                .get("external_response")
+                .and_then(|external| external.get("broker_process_contained"))
+        })
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn active_broker_process<'a>(
+    process_id: Option<u32>,
+    marker: Option<&'a str>,
+    status: Option<&str>,
+) -> Result<Option<(u32, &'a str)>, TyrionError> {
+    match (status, process_id, marker) {
+        (Some("active"), Some(process_id), Some(marker)) => Ok(Some((process_id, marker))),
+        (Some("contained"), _, _) | (None, None, None) => Ok(None),
+        _ => Err(TyrionError::ControlDenied(
+            "credential broker process identity is incomplete or inconsistent".into(),
+        )),
+    }
 }
 
 fn ensure_bound_target(
@@ -10563,21 +11514,33 @@ fn ensure_bound_target(
     Ok(metadata)
 }
 
-impl From<TyrionError> for FileEffectError {
+impl From<TyrionError> for EffectExecutionError {
     fn from(error: TyrionError) -> Self {
         Self::Failed(error)
     }
 }
 
-impl From<std::io::Error> for FileEffectError {
+impl From<std::io::Error> for EffectExecutionError {
     fn from(error: std::io::Error) -> Self {
         Self::Failed(error.into())
     }
 }
 
-impl From<rustix::io::Errno> for FileEffectError {
+impl From<rustix::io::Errno> for EffectExecutionError {
     fn from(error: rustix::io::Errno) -> Self {
         Self::Failed(std::io::Error::from(error).into())
+    }
+}
+
+impl From<CredentialEffectError> for EffectExecutionError {
+    fn from(error: CredentialEffectError) -> Self {
+        match error {
+            CredentialEffectError::Failed(error) => Self::Failed(error),
+            CredentialEffectError::Uncertain { error, receipt } => {
+                Self::Uncertain { error, receipt }
+            }
+            CredentialEffectError::LeaveStartedAfterEffect => Self::LeaveStartedAfterEffect,
+        }
     }
 }
 

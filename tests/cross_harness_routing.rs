@@ -1067,7 +1067,7 @@ fn failed_interrupt_delivery_does_not_interrupt_the_worker_locally() {
         "claude-opus-review",
     );
 
-    thread::sleep(Duration::from_millis(100));
+    wait_for_path(&temp.path().join("fake-openshell/control-pipe-closed"));
     let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
         .args(["--socket", path_text(&daemon.socket_path)])
         .args([
@@ -1326,6 +1326,18 @@ fn wait_for_live_adapter_telemetry(
             "Worker did not publish live adapter telemetry: {inspected}"
         );
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "Expected fixture signal was not created: {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

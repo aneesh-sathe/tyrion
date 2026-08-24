@@ -13,8 +13,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::credential::CredentialRuntime;
 use crate::protocol::{Command, Request, Response, PROTOCOL_VERSION};
-use crate::store::{EffectExecutionOptions, Store};
+use crate::store::{
+    EffectExecutionContext, EffectExecutionOptions, EffectReconciliationContext, Store,
+};
 use crate::worker::{WorkerRuntime, WorkerRuntimeOptions};
 use crate::TyrionError;
 
@@ -33,6 +36,7 @@ pub struct DaemonOptions {
     pub incorrect_first_worker_result: bool,
     pub codex_worker_config: Option<PathBuf>,
     pub worker_catalog: Option<PathBuf>,
+    pub credential_runtime: Option<PathBuf>,
     pub principal_control_bootstrap_fd: Option<i32>,
     pub hold_worker_for_control: bool,
     pub hold_worker_before_integration: bool,
@@ -41,6 +45,7 @@ pub struct DaemonOptions {
     pub skip_sandbox_cleanup: bool,
     pub leave_effect_started: bool,
     pub leave_effect_started_after_rename: bool,
+    pub leave_one_shot_effect_started_before_cleanup: bool,
     pub hold_effect_before_commit_milliseconds: u64,
     pub watchdog_stall_milliseconds: u64,
 }
@@ -53,6 +58,7 @@ impl Default for DaemonOptions {
             incorrect_first_worker_result: false,
             codex_worker_config: None,
             worker_catalog: None,
+            credential_runtime: None,
             principal_control_bootstrap_fd: None,
             hold_worker_for_control: false,
             hold_worker_before_integration: false,
@@ -61,6 +67,7 @@ impl Default for DaemonOptions {
             skip_sandbox_cleanup: false,
             leave_effect_started: false,
             leave_effect_started_after_rename: false,
+            leave_one_shot_effect_started_before_cleanup: false,
             hold_effect_before_commit_milliseconds: 0,
             watchdog_stall_milliseconds: 30_000,
         }
@@ -95,7 +102,13 @@ pub fn run_daemon_with_options(
             hold_after_external_integration: options.hold_worker_after_external_integration,
         },
     )?);
-    store.recover_stranded_operations()?;
+    let credential = options
+        .credential_runtime
+        .as_deref()
+        .map(CredentialRuntime::load)
+        .transpose()?
+        .map(Arc::new);
+    store.recover_stranded_operations(credential.as_deref())?;
     let pending_cleanups = store.recover_stranded_attempts()?;
     if !options.skip_sandbox_cleanup {
         for cleanup in pending_cleanups {
@@ -131,6 +144,7 @@ pub fn run_daemon_with_options(
     for worker_index in 0..REQUEST_WORKERS {
         let database_path = database_path.clone();
         let worker = Arc::clone(&worker);
+        let credential = credential.clone();
         let options = options.clone();
         let principal_token_hash = principal_token_hash.clone();
         let request_receiver = Arc::clone(&request_receiver);
@@ -162,6 +176,7 @@ pub fn run_daemon_with_options(
                     &options,
                     &database_path,
                     &worker,
+                    credential.as_deref(),
                     &principal_token_hash,
                 );
             })?;
@@ -373,10 +388,19 @@ fn serve_connection(
     options: &DaemonOptions,
     database_path: &Path,
     worker: &Arc<WorkerRuntime>,
+    credential: Option<&CredentialRuntime>,
     principal_token_hash: &str,
 ) {
-    let outcome = read_request(&stream)
-        .and_then(|request| dispatch(store, worker, &request, principal_token_hash, options));
+    let outcome = read_request(&stream).and_then(|request| {
+        dispatch(
+            store,
+            worker,
+            credential,
+            &request,
+            principal_token_hash,
+            options,
+        )
+    });
     let (response, follow_up) = match outcome {
         Ok(outcome) => (Response::success(outcome.data), outcome.follow_up),
         Err(error) => (Response::failure(&error), None),
@@ -425,6 +449,7 @@ fn read_request(stream: &UnixStream) -> Result<Request, TyrionError> {
 fn dispatch(
     store: &mut Store,
     worker: &WorkerRuntime,
+    credential: Option<&CredentialRuntime>,
     request: &Request,
     principal_token_hash: &str,
     options: &DaemonOptions,
@@ -471,8 +496,18 @@ fn dispatch(
             commission_id,
             operation,
         } => Ok(DispatchOutcome::without_follow_up(
-            store.propose_operation(request, commission_id, operation)?,
+            store.propose_operation(request, commission_id, operation, credential)?,
         )),
+        Command::GrantCredential {
+            commission_id,
+            grant,
+        } => Ok(DispatchOutcome::without_follow_up(store.grant_credential(
+            request,
+            commission_id,
+            grant,
+            principal_token_hash,
+            credential,
+        )?)),
         Command::RecordVerificationEvidence {
             commission_id,
             evidence,
@@ -542,11 +577,17 @@ fn dispatch(
                 commission_id,
                 approval_gate_id,
                 operation,
-                worker,
-                EffectExecutionOptions {
-                    leave_started_before_effect: options.leave_effect_started,
-                    leave_started_after_effect: options.leave_effect_started_after_rename,
-                    hold_before_commit_milliseconds: options.hold_effect_before_commit_milliseconds,
+                EffectExecutionContext {
+                    worker,
+                    credential,
+                    options: EffectExecutionOptions {
+                        leave_started_before_effect: options.leave_effect_started,
+                        leave_started_after_effect: options.leave_effect_started_after_rename,
+                        leave_one_shot_started_before_cleanup: options
+                            .leave_one_shot_effect_started_before_cleanup,
+                        hold_before_commit_milliseconds: options
+                            .hold_effect_before_commit_milliseconds,
+                    },
                 },
             )?,
         )),
@@ -562,7 +603,11 @@ fn dispatch(
                 operation_request_id,
                 *outcome,
                 observed_sha256,
-                principal_token_hash,
+                EffectReconciliationContext {
+                    worker,
+                    principal_token_hash,
+                    credential,
+                },
             )?,
         )),
         Command::SteerWorker {
