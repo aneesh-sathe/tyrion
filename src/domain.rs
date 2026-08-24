@@ -161,6 +161,85 @@ pub(crate) enum EventKind {
     RecoveryDecided,
     AttemptContained,
     RestartReconciled,
+    OperationClassified,
+    OperationNotification,
+    ApprovalGateOpened,
+    ApprovalGateAuthorized,
+    OperationStarted,
+    OperationConfirmed,
+    OperationFailed,
+    OperationUncertain,
+    CommissionAmendmentProposed,
+    ResourceCeilingApproaching,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationClassification {
+    SilentJournaled,
+    NonBlockingNotification,
+    ApprovalGate,
+    Prohibited,
+}
+
+impl OperationClassification {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SilentJournaled => "silent_journaled",
+            Self::NonBlockingNotification => "non_blocking_notification",
+            Self::ApprovalGate => "approval_gate",
+            Self::Prohibited => "prohibited",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationStatus {
+    Completed,
+    ApprovalRequired,
+    Authorized,
+    Started,
+    Confirmed,
+    Failed,
+    Uncertain,
+    Prohibited,
+    Revoked,
+}
+
+impl OperationStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::ApprovalRequired => "approval_required",
+            Self::Authorized => "authorized",
+            Self::Started => "started",
+            Self::Confirmed => "confirmed",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+            Self::Prohibited => "prohibited",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApprovalGateStatus {
+    Open,
+    Authorized,
+    Consumed,
+    Invalidated,
+    Revoked,
+}
+
+impl ApprovalGateStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Authorized => "authorized",
+            Self::Consumed => "consumed",
+            Self::Invalidated => "invalidated",
+            Self::Revoked => "revoked",
+        }
+    }
 }
 
 impl EventKind {
@@ -192,6 +271,16 @@ impl EventKind {
             Self::RecoveryDecided => "recovery_decided",
             Self::AttemptContained => "attempt_contained",
             Self::RestartReconciled => "restart_reconciled",
+            Self::OperationClassified => "operation_classified",
+            Self::OperationNotification => "operation_notification",
+            Self::ApprovalGateOpened => "approval_gate_opened",
+            Self::ApprovalGateAuthorized => "approval_gate_authorized",
+            Self::OperationStarted => "operation_started",
+            Self::OperationConfirmed => "operation_confirmed",
+            Self::OperationFailed => "operation_failed",
+            Self::OperationUncertain => "operation_uncertain",
+            Self::CommissionAmendmentProposed => "commission_amendment_proposed",
+            Self::ResourceCeilingApproaching => "resource_ceiling_approaching",
         }
     }
 }

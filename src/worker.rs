@@ -667,7 +667,7 @@ impl WorkerRuntime {
         requirements: &WorkerRequirements,
         resources: &AssignmentResources,
         required_authority_action: &str,
-        authority: &AuthorityEnvelope,
+        required_authority_scope_types: &[&str],
         entry_harness: &str,
         unavailable_configuration_ids: &std::collections::HashSet<String>,
     ) -> Result<serde_json::Value, TyrionError> {
@@ -676,7 +676,7 @@ impl WorkerRuntime {
                 requirements,
                 resources,
                 required_authority_action,
-                authority,
+                required_authority_scope_types,
                 entry_harness,
             },
             unavailable_configuration_ids,

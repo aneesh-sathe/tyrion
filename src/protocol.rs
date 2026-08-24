@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -232,6 +234,14 @@ pub struct VerificationAmendment {
     pub criteria: Vec<AcceptanceCriterion>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommissionAmendment {
+    pub authority: AuthorityEnvelope,
+    pub resource_ceilings: ResourceCeilings,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionSpec {
@@ -267,11 +277,58 @@ pub struct ResourceCeilings {
     pub max_paid_service_spend_cents: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationRequest {
+    pub assignment_id: String,
+    pub attempt_id: String,
+    pub worker_lease_id: String,
+    pub mandate_revision: i64,
+    pub plan_revision: i64,
+    pub operation: String,
+    pub repository: Option<String>,
+    pub target: String,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+    pub destination: Option<String>,
+    pub effect: Option<String>,
+    pub consequences: Vec<String>,
+    pub limits: OperationLimits,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationLimits {
+    pub max_output_bytes: u64,
+    pub max_duration_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationReconciliationOutcome {
+    Confirmed,
+    NotApplied,
+}
+
+impl std::str::FromStr for OperationReconciliationOutcome {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "confirmed" => Ok(Self::Confirmed),
+            "not-applied" | "not_applied" => Ok(Self::NotApplied),
+            _ => Err("outcome must be confirmed or not-applied".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Request {
     pub protocol_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_token: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
@@ -323,6 +380,41 @@ pub enum Command {
     CancelCommission {
         commission_id: String,
     },
+    ProposeOperation {
+        commission_id: String,
+        operation: Box<OperationRequest>,
+    },
+    InspectApprovalGate {
+        approval_gate_id: String,
+    },
+    ApproveOperation {
+        commission_id: String,
+        approval_gate_id: String,
+        expected_operation_digest: String,
+    },
+    ExecuteOperation {
+        commission_id: String,
+        approval_gate_id: String,
+        operation: Box<OperationRequest>,
+    },
+    ReconcileOperation {
+        commission_id: String,
+        operation_request_id: String,
+        outcome: OperationReconciliationOutcome,
+        observed_sha256: String,
+    },
+    ProposeCommissionAmendment {
+        commission_id: String,
+        amendment: Box<CommissionAmendment>,
+    },
+    InspectCommissionAmendment {
+        amendment_id: String,
+    },
+    AcceptCommissionAmendment {
+        commission_id: String,
+        amendment_id: String,
+        expected_amendment_digest: String,
+    },
     RecordVerificationEvidence {
         commission_id: String,
         evidence: Box<VerificationEvidenceSubmission>,
@@ -372,6 +464,8 @@ impl Command {
         !matches!(
             self,
             Self::InspectCommission { .. }
+                | Self::InspectApprovalGate { .. }
+                | Self::InspectCommissionAmendment { .. }
                 | Self::ResumeAttachment { .. }
                 | Self::ReplayEvents { .. }
         )

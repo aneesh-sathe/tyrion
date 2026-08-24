@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS worker_leases (
     attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),
     issued_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
+    mandate_revision INTEGER NOT NULL,
     released_at INTEGER,
     status TEXT NOT NULL CHECK (status IN ('active', 'released', 'revoked', 'expired'))
 );
@@ -425,6 +426,75 @@ CREATE TABLE IF NOT EXISTS blockers (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS operation_requests (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    worker_lease_id TEXT NOT NULL REFERENCES worker_leases(id),
+    mandate_revision INTEGER NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    repository TEXT,
+    target TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    destination TEXT,
+    effect TEXT,
+    consequences_json TEXT NOT NULL,
+    limits_json TEXT NOT NULL,
+    canonical_operation_json TEXT NOT NULL,
+    operation_digest TEXT NOT NULL,
+    classification TEXT NOT NULL CHECK (classification IN (
+        'silent_journaled', 'non_blocking_notification', 'approval_gate', 'prohibited'
+    )),
+    status TEXT NOT NULL CHECK (status IN (
+        'completed', 'approval_required', 'authorized', 'started', 'confirmed',
+        'failed', 'uncertain', 'prohibited', 'revoked'
+    )),
+    classification_reason TEXT NOT NULL,
+    proposed_at INTEGER NOT NULL,
+    authorized_at INTEGER,
+    started_at INTEGER,
+    completed_at INTEGER,
+    receipt_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS approval_gates (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    operation_request_id TEXT NOT NULL UNIQUE REFERENCES operation_requests(id),
+    operation_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'open', 'authorized', 'consumed', 'invalidated', 'revoked'
+    )),
+    opened_at INTEGER NOT NULL,
+    authorized_at INTEGER,
+    consumed_at INTEGER,
+    invalidated_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS operation_execution_identities (
+    operation_request_id TEXT PRIMARY KEY REFERENCES operation_requests(id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS commission_amendments (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    base_revision INTEGER NOT NULL,
+    authority_json TEXT NOT NULL,
+    resource_ceilings_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    diff_json TEXT NOT NULL,
+    amendment_digest TEXT NOT NULL,
+    impact_json TEXT NOT NULL,
+    revalidation_json TEXT,
+    status TEXT NOT NULL CHECK (status IN ('proposed', 'accepted', 'invalidated')),
+    proposed_at INTEGER NOT NULL,
+    accepted_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS attachment_launch_tokens (
     token_hash TEXT PRIMARY KEY,
     expected_harness TEXT NOT NULL,
@@ -473,7 +543,11 @@ CREATE TABLE IF NOT EXISTS events (
         'attachment_joined', 'active_attachment_changed',
         'worker_steered', 'worker_interrupted', 'worker_activity',
         'commission_paused', 'commission_resumed', 'commission_cancelled',
-        'recovery_decided', 'attempt_contained', 'restart_reconciled'
+        'recovery_decided', 'attempt_contained', 'restart_reconciled',
+        'operation_classified', 'operation_notification', 'approval_gate_opened',
+        'approval_gate_authorized', 'operation_started', 'operation_confirmed',
+        'operation_failed', 'operation_uncertain', 'commission_amendment_proposed',
+        'resource_ceiling_approaching'
     )),
     commission_revision INTEGER NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -576,11 +650,18 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),
             issued_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
+            mandate_revision INTEGER NOT NULL DEFAULT 0,
             released_at INTEGER,
             status TEXT NOT NULL CHECK (status IN ('active', 'released', 'revoked', 'expired'))
         );
         "#,
     )?;
+    if !column_exists(connection, "worker_leases", "mandate_revision")? {
+        connection.execute(
+            "ALTER TABLE worker_leases ADD COLUMN mandate_revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     add_result_columns(connection)?;
     upgrade_results(connection)?;
     let events_schema = connection
@@ -598,6 +679,12 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             || !schema.contains("useful_concurrency_observed")
             || !schema.contains("worker_steered")
             || !schema.contains("commission_paused")
+            || !schema.contains("operation_classified")
+            || !schema.contains("operation_notification")
+            || !schema.contains("approval_gate_opened")
+            || !schema.contains("operation_confirmed")
+            || !schema.contains("commission_amendment_proposed")
+            || !schema.contains("resource_ceiling_approaching")
     });
     if needs_event_upgrade {
         let payload_projection = if events_schema
@@ -625,7 +712,11 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
                     'attachment_joined', 'active_attachment_changed',
                     'worker_steered', 'worker_interrupted', 'worker_activity',
                     'commission_paused', 'commission_resumed', 'commission_cancelled',
-                    'recovery_decided', 'attempt_contained', 'restart_reconciled'
+                    'recovery_decided', 'attempt_contained', 'restart_reconciled',
+                    'operation_classified', 'operation_notification', 'approval_gate_opened',
+                    'approval_gate_authorized', 'operation_started', 'operation_confirmed',
+                    'operation_failed', 'operation_uncertain', 'commission_amendment_proposed',
+                    'resource_ceiling_approaching'
                 )),
                 commission_revision INTEGER NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{{}}',
@@ -644,7 +735,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     backfill_planned_assignments(connection)?;
     backfill_assignment_metadata(connection)?;
     upgrade_worker_commands(connection)?;
-    connection.pragma_update(None, "user_version", 11)?;
+    connection.pragma_update(None, "user_version", 12)?;
     Ok(())
 }
 
@@ -662,7 +753,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 11
+    Ok(user_version < 12
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -673,11 +764,16 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
             .as_ref()
             .is_some_and(|schema| !schema.contains("'superseded'"))
         || !table_exists(connection, "worker_leases")?
+        || !column_exists(connection, "worker_leases", "mandate_revision")?
         || !table_exists(connection, "sandbox_cleanups")?
         || !table_exists(connection, "worker_configuration_failures")?
         || !table_exists(connection, "attempt_recoveries")?
         || !table_exists(connection, "restart_recoveries")?
         || !table_exists(connection, "watchdog_findings")?
+        || !table_exists(connection, "operation_requests")?
+        || !table_exists(connection, "approval_gates")?
+        || !table_exists(connection, "operation_execution_identities")?
+        || !table_exists(connection, "commission_amendments")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
@@ -735,6 +831,12 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
                 || !schema.contains("useful_concurrency_observed")
                 || !schema.contains("worker_steered")
                 || !schema.contains("commission_paused")
+                || !schema.contains("operation_classified")
+                || !schema.contains("operation_notification")
+                || !schema.contains("approval_gate_opened")
+                || !schema.contains("operation_confirmed")
+                || !schema.contains("commission_amendment_proposed")
+                || !schema.contains("resource_ceiling_approaching")
         }))
 }
 
@@ -742,7 +844,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v11", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v12", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -769,7 +871,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 11
+    if user_version != 12
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -777,11 +879,16 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || !table_exists(connection, "worker_leases")?
+        || !column_exists(connection, "worker_leases", "mandate_revision")?
         || !table_exists(connection, "sandbox_cleanups")?
         || !table_exists(connection, "worker_configuration_failures")?
         || !table_exists(connection, "attempt_recoveries")?
         || !table_exists(connection, "restart_recoveries")?
         || !table_exists(connection, "watchdog_findings")?
+        || !table_exists(connection, "operation_requests")?
+        || !table_exists(connection, "approval_gates")?
+        || !table_exists(connection, "operation_execution_identities")?
+        || !table_exists(connection, "commission_amendments")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
@@ -834,6 +941,12 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !events_schema.contains("useful_concurrency_observed")
         || !events_schema.contains("worker_steered")
         || !events_schema.contains("commission_paused")
+        || !events_schema.contains("operation_classified")
+        || !events_schema.contains("operation_notification")
+        || !events_schema.contains("approval_gate_opened")
+        || !events_schema.contains("operation_confirmed")
+        || !events_schema.contains("commission_amendment_proposed")
+        || !events_schema.contains("resource_ceiling_approaching")
     {
         return Err(TyrionError::InvalidRequest(
             "events schema migration verification failed".into(),

@@ -1,10 +1,12 @@
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tyrion::protocol::{
-    AdapterIdentity, AttachmentHandshake, Command, CommissionProposal, CommissionReplayCursor,
-    Request, VerificationAmendment, VerificationEvidenceSubmission, PROTOCOL_VERSION,
+    AdapterIdentity, AttachmentHandshake, Command, CommissionAmendment, CommissionProposal,
+    CommissionReplayCursor, OperationReconciliationOutcome, OperationRequest, Request,
+    VerificationAmendment, VerificationEvidenceSubmission, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -14,6 +16,8 @@ struct Arguments {
     socket: PathBuf,
     #[arg(long, global = true)]
     attachment_token: Option<String>,
+    #[arg(long, global = true)]
+    principal_token_stdin: bool,
     #[command(subcommand)]
     command: TopLevelCommand,
 }
@@ -35,6 +39,14 @@ enum TopLevelCommand {
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
+    },
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommand,
+    },
+    Principal {
+        #[command(subcommand)]
+        command: PrincipalCommand,
     },
 }
 
@@ -159,6 +171,15 @@ enum CommissionCommand {
         #[arg(long)]
         idempotency_key: String,
     },
+    ProposeAmendment {
+        commission_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
     TakeControl {
         commission_id: String,
         #[arg(long)]
@@ -195,6 +216,71 @@ enum WorkerCommand {
     Retry {
         commission_id: String,
         worker_handle: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperationCommand {
+    Propose {
+        commission_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Execute {
+        commission_id: String,
+        approval_gate_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PrincipalCommand {
+    InspectGate {
+        approval_gate_id: String,
+    },
+    ApproveGate {
+        commission_id: String,
+        approval_gate_id: String,
+        #[arg(long)]
+        expected_operation_digest: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    ReconcileOperation {
+        commission_id: String,
+        operation_request_id: String,
+        #[arg(long)]
+        outcome: OperationReconciliationOutcome,
+        #[arg(long)]
+        observed_sha256: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    InspectAmendment {
+        amendment_id: String,
+    },
+    AcceptAmendment {
+        commission_id: String,
+        amendment_id: String,
+        #[arg(long)]
+        expected_amendment_digest: String,
         #[arg(long)]
         expected_revision: i64,
         #[arg(long)]
@@ -359,6 +445,26 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     Command::RecordVerificationEvidence {
                         commission_id: commission_id.clone(),
                         evidence: Box::new(evidence),
+                    },
+                    Some(idempotency_key.clone()),
+                    Some(*expected_revision),
+                    None,
+                )
+            }
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::ProposeAmendment {
+                        commission_id,
+                        file,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => {
+                let amendment: CommissionAmendment = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::ProposeCommissionAmendment {
+                        commission_id: commission_id.clone(),
+                        amendment: Box::new(amendment),
                     },
                     Some(idempotency_key.clone()),
                     Some(*expected_revision),
@@ -560,10 +666,139 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                 Some(*expected_revision),
                 None,
             ),
+            TopLevelCommand::Operation {
+                command:
+                    OperationCommand::Propose {
+                        commission_id,
+                        file,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => {
+                let operation: OperationRequest = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::ProposeOperation {
+                        commission_id: commission_id.clone(),
+                        operation: Box::new(operation),
+                    },
+                    Some(idempotency_key.clone()),
+                    Some(*expected_revision),
+                    None,
+                )
+            }
+            TopLevelCommand::Operation {
+                command:
+                    OperationCommand::Execute {
+                        commission_id,
+                        approval_gate_id,
+                        file,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => {
+                let operation: OperationRequest = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::ExecuteOperation {
+                        commission_id: commission_id.clone(),
+                        approval_gate_id: approval_gate_id.clone(),
+                        operation: Box::new(operation),
+                    },
+                    Some(idempotency_key.clone()),
+                    Some(*expected_revision),
+                    None,
+                )
+            }
+            TopLevelCommand::Principal {
+                command: PrincipalCommand::InspectGate { approval_gate_id },
+            } => (
+                Command::InspectApprovalGate {
+                    approval_gate_id: approval_gate_id.clone(),
+                },
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::ApproveGate {
+                        commission_id,
+                        approval_gate_id,
+                        expected_operation_digest,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ApproveOperation {
+                    commission_id: commission_id.clone(),
+                    approval_gate_id: approval_gate_id.clone(),
+                    expected_operation_digest: expected_operation_digest.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::ReconcileOperation {
+                        commission_id,
+                        operation_request_id,
+                        outcome,
+                        observed_sha256,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ReconcileOperation {
+                    commission_id: commission_id.clone(),
+                    operation_request_id: operation_request_id.clone(),
+                    outcome: *outcome,
+                    observed_sha256: observed_sha256.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command: PrincipalCommand::InspectAmendment { amendment_id },
+            } => (
+                Command::InspectCommissionAmendment {
+                    amendment_id: amendment_id.clone(),
+                },
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::AcceptAmendment {
+                        commission_id,
+                        amendment_id,
+                        expected_amendment_digest,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::AcceptCommissionAmendment {
+                    commission_id: commission_id.clone(),
+                    amendment_id: amendment_id.clone(),
+                    expected_amendment_digest: expected_amendment_digest.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
         };
+    let principal_token = if arguments.principal_token_stdin {
+        let mut token = String::new();
+        io::stdin().read_to_string(&mut token)?;
+        Some(token.trim().to_owned())
+    } else {
+        None
+    };
     Ok(Request {
         protocol_version: PROTOCOL_VERSION,
         attachment_token: arguments.attachment_token.clone(),
+        principal_token,
         idempotency_key,
         expected_revision,
         expected_control_revision,

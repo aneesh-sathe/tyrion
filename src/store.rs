@@ -1,23 +1,32 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsStr};
 use std::fs;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rustix::fs::{openat, Mode, OFlags, CWD};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::{
-    AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus, CriterionStatus,
-    EventKind, ResultStatus, WorkerLeaseStatus,
+    ApprovalGateStatus, AssignmentStatus, AttemptStatus, AuthorityScopeType, CommissionStatus,
+    CriterionStatus, EventKind, OperationClassification, OperationStatus, ResultStatus,
+    WorkerLeaseStatus,
 };
 use crate::protocol::{
     AcceptanceCriterion, AdapterIdentity, AssignmentPurpose, AssignmentResources,
-    AttachmentHandshake, AuthorityEnvelope, CommissionPlan, CommissionProposal,
-    CommissionReplayCursor, ExecutionSpec, PlannedAssignment, Request, ResourceCeilings,
-    VerificationAmendment, VerificationDefect, VerificationDepth, VerificationEvidenceSubmission,
-    VerificationVerdict, Verifier, VerifierType, WorkerRequirements, PROTOCOL_VERSION,
+    AttachmentHandshake, AuthorityEnvelope, CommissionAmendment, CommissionPlan,
+    CommissionProposal, CommissionReplayCursor, ExecutionSpec, OperationReconciliationOutcome,
+    OperationRequest, PlannedAssignment, Request, ResourceCeilings, VerificationAmendment,
+    VerificationDefect, VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict,
+    Verifier, VerifierType, WorkerRequirements, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
@@ -31,6 +40,13 @@ use projection::{event_value, inspect_commission as project_commission};
 
 pub struct Store {
     connection: Connection,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EffectExecutionOptions {
+    pub(crate) leave_started_before_effect: bool,
+    pub(crate) leave_started_after_effect: bool,
+    pub(crate) hold_before_commit_milliseconds: u64,
 }
 
 pub(crate) struct PendingCleanup {
@@ -118,6 +134,19 @@ struct AttemptRecovery<'a> {
     equivalence_key: &'a str,
     action: &'a str,
     requirement: &'a str,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FileEffectBinding {
+    canonical_repository: String,
+    canonical_parent: String,
+    repository_device: u64,
+    repository_inode: u64,
+    parent_device: u64,
+    parent_inode: u64,
+    target_device: u64,
+    target_inode: u64,
+    before_sha256: String,
 }
 
 #[derive(Clone, Copy)]
@@ -676,6 +705,22 @@ impl Store {
                 expected_status.as_str()
             )));
         }
+        if next_status == CommissionStatus::Active {
+            let uncertain_effects = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM operation_requests
+                    WHERE commission_id = ?1 AND status = 'uncertain'
+                 )",
+                [commission_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if uncertain_effects {
+                return Err(TyrionError::ControlDenied(
+                    "the Commission cannot resume until every uncertain consequential effect is explicitly reconciled by the Principal"
+                        .into(),
+                ));
+            }
+        }
         transaction.execute(
             "UPDATE commissions SET status = ?2 WHERE id = ?1",
             params![commission_id, next_status.as_str()],
@@ -765,6 +810,63 @@ impl Store {
         }
         let now = unix_timestamp()?;
         let now_ms = unix_timestamp_millis()?;
+        let revoked_operation_request_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM operation_requests
+                 WHERE commission_id = ?1 AND status IN ('approval_required', 'authorized')
+                 ORDER BY proposed_at, id",
+            )?;
+            let rows = statement.query_map([commission_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let affected_in_flight_operations = {
+            let mut statement = transaction.prepare(
+                "SELECT operation_requests.id,
+                        operation_execution_identities.idempotency_key,
+                        operation_execution_identities.request_hash
+                 FROM operation_requests
+                 LEFT JOIN operation_execution_identities
+                   ON operation_execution_identities.operation_request_id = operation_requests.id
+                 WHERE operation_requests.commission_id = ?1
+                   AND operation_requests.status = 'started'
+                 ORDER BY operation_requests.proposed_at, operation_requests.id",
+            )?;
+            let rows = statement.query_map([commission_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let affected_in_flight_operation_ids = affected_in_flight_operations
+            .iter()
+            .map(|operation| &operation.0)
+            .collect::<Vec<_>>();
+        let irreversible_effects = {
+            let mut statement = transaction.prepare(
+                "SELECT id, operation_digest, receipt_json FROM operation_requests
+                 WHERE commission_id = ?1 AND status = 'confirmed'
+                 ORDER BY proposed_at, id",
+            )?;
+            let rows = statement.query_map([commission_id], |row| {
+                let receipt_json = row.get::<_, String>(2)?;
+                let receipt = serde_json::from_str::<Value>(&receipt_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(serde_json::json!({
+                    "operation_request_id": row.get::<_, String>(0)?,
+                    "operation_digest": row.get::<_, String>(1)?,
+                    "receipt": receipt,
+                }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         transaction.execute(
             "UPDATE commissions SET status = ?2, completed_at = ?3 WHERE id = ?1",
             params![commission_id, CommissionStatus::Cancelled.as_str(), now],
@@ -815,6 +917,30 @@ impl Store {
             params![commission_id, now_ms],
         )?;
         transaction.execute(
+            "UPDATE approval_gates SET status = ?2, invalidated_at = ?3
+             WHERE commission_id = ?1 AND status IN ('open', 'authorized')",
+            params![commission_id, ApprovalGateStatus::Revoked.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE operation_requests SET status = ?2, completed_at = ?3
+             WHERE commission_id = ?1 AND status IN ('approval_required', 'authorized')",
+            params![commission_id, OperationStatus::Revoked.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE operation_requests SET status = 'uncertain', completed_at = ?2,
+                    receipt_json = ?3
+             WHERE commission_id = ?1 AND status = 'started'",
+            params![
+                commission_id,
+                now,
+                serde_json::to_string(&serde_json::json!({
+                    "status": "uncertain",
+                    "requirement": "Reconcile the exact effect before any linked Commission retries it.",
+                    "rollback_claimed": false,
+                }))?,
+            ],
+        )?;
+        transaction.execute(
             "UPDATE results SET revision_disposition = 'retained'
              WHERE attempt_id IN (
                  SELECT attempts.id FROM attempts
@@ -847,7 +973,1227 @@ impl Store {
                 "attachment_id": attachment_id,
                 "revoked_attempt_ids": running_attempts.iter().map(|item| &item.0).collect::<Vec<_>>(),
                 "authority_grants_revoked": true,
+                "revoked_operation_request_ids": revoked_operation_request_ids,
+                "affected_in_flight_operation_ids": affected_in_flight_operation_ids,
+                "irreversible_effects": irreversible_effects,
                 "rollback_claimed": false,
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        for (_, execution_key, execution_hash) in &affected_in_flight_operations {
+            if let (Some(execution_key), Some(execution_hash)) =
+                (execution_key.as_deref(), execution_hash.as_deref())
+            {
+                save_idempotent_result(&transaction, execution_key, execution_hash, &result)?;
+            }
+        }
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn propose_operation(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        operation: &OperationRequest,
+    ) -> Result<Value, TyrionError> {
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "operation proposal requires an expected Commission revision".into(),
+            )
+        })?;
+        validate_operation_shape(operation)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+        ensure_current_operation_context(
+            &transaction,
+            commission_id,
+            operation,
+            expected_revision,
+        )?;
+
+        let authority = load_authority(&transaction, commission_id)?;
+        let (initial_classification, initial_reason) = classify_operation(operation, &authority);
+        let mut classification = initial_classification;
+        let mut classification_reason = initial_reason.to_owned();
+        let ceilings = load_resource_ceilings(&transaction, commission_id)?;
+        let accepted_at = transaction.query_row(
+            "SELECT accepted_at FROM commissions WHERE id = ?1",
+            [commission_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let now = unix_timestamp()?;
+        let elapsed_seconds = now.saturating_sub(accepted_at) as u64;
+        let remaining_seconds = ceilings.max_elapsed_seconds.saturating_sub(elapsed_seconds);
+        if operation.limits.max_duration_seconds > remaining_seconds {
+            classification = OperationClassification::Prohibited;
+            classification_reason = format!(
+                "the exact max_duration_seconds limit is {} but only {remaining_seconds} Commission seconds remain; accept a Commission Amendment before retrying",
+                operation.limits.max_duration_seconds
+            );
+        }
+        let storage_ceiling = ceilings.max_storage_bytes;
+        let projected_storage = (classification == OperationClassification::ApprovalGate
+            && operation.operation == "filesystem.write")
+            .then(|| {
+                operation
+                    .parameters
+                    .get("content")
+                    .map(|content| content.len() as u64)
+            })
+            .flatten();
+        if let Some(projected_storage) = projected_storage {
+            if projected_storage > operation.limits.max_output_bytes {
+                classification = OperationClassification::Prohibited;
+                classification_reason = format!(
+                    "filesystem.write requires {projected_storage} bytes but the exact approved max_output_bytes limit is {}",
+                    operation.limits.max_output_bytes
+                );
+            } else if projected_storage > storage_ceiling {
+                classification = OperationClassification::Prohibited;
+                classification_reason = format!(
+                    "filesystem.write requires {projected_storage} bytes but max_storage_bytes is {storage_ceiling}; accept a Commission Amendment before retrying"
+                );
+            }
+        }
+        let status = match classification {
+            OperationClassification::SilentJournaled
+            | OperationClassification::NonBlockingNotification => OperationStatus::Completed,
+            OperationClassification::ApprovalGate => OperationStatus::ApprovalRequired,
+            OperationClassification::Prohibited => OperationStatus::Prohibited,
+        };
+        let (canonical_operation_value, _) =
+            if classification == OperationClassification::ApprovalGate {
+                canonical_operation(operation)?
+            } else {
+                (serde_json::to_value(operation)?, None)
+            };
+        let canonical_operation = serde_json::to_string(&canonical_operation_value)?;
+        let operation_digest = format!("{:x}", Sha256::digest(canonical_operation.as_bytes()));
+        let operation_id = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT INTO operation_requests (
+                id, commission_id, assignment_id, attempt_id, worker_lease_id,
+                mandate_revision, plan_revision, operation, repository, target,
+                parameters_json, destination, effect, consequences_json, limits_json,
+                canonical_operation_json, operation_digest, classification, status,
+                classification_reason, proposed_at, completed_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                CASE WHEN ?19 = 'completed' THEN ?21 ELSE NULL END
+             )",
+            params![
+                operation_id,
+                commission_id,
+                operation.assignment_id,
+                operation.attempt_id,
+                operation.worker_lease_id,
+                operation.mandate_revision,
+                operation.plan_revision,
+                operation.operation,
+                operation.repository,
+                operation.target,
+                serde_json::to_string(&operation.parameters)?,
+                operation.destination,
+                operation.effect,
+                serde_json::to_string(&operation.consequences)?,
+                serde_json::to_string(&operation.limits)?,
+                canonical_operation,
+                operation_digest,
+                classification.as_str(),
+                status.as_str(),
+                classification_reason,
+                now,
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::OperationClassified,
+            expected_revision,
+            &serde_json::json!({
+                "operation_request_id": operation_id,
+                "operation_digest": operation_digest,
+                "classification": classification.as_str(),
+                "status": status.as_str(),
+                "reason": classification_reason,
+            }),
+        )?;
+        if classification == OperationClassification::ApprovalGate {
+            let approval_gate_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT INTO approval_gates (
+                    id, commission_id, operation_request_id, operation_digest, status, opened_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'open', ?5)",
+                params![
+                    approval_gate_id,
+                    commission_id,
+                    operation_id,
+                    operation_digest,
+                    now,
+                ],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::ApprovalGateOpened,
+                expected_revision,
+                &serde_json::json!({
+                    "approval_gate_id": approval_gate_id,
+                    "operation_request_id": operation_id,
+                    "operation_digest": operation_digest,
+                    "canonical_operation": canonical_operation_value,
+                    "exact_target": operation.target,
+                    "governing_revision": {
+                        "mandate": operation.mandate_revision,
+                        "plan": operation.plan_revision,
+                    },
+                    "consequences": operation.consequences,
+                    "limits": operation.limits,
+                }),
+            )?;
+        }
+        if classification == OperationClassification::NonBlockingNotification {
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::OperationNotification,
+                expected_revision,
+                &serde_json::json!({
+                    "operation_request_id": operation_id,
+                    "operation_digest": operation_digest,
+                    "classification": classification.as_str(),
+                    "consequences": operation.consequences,
+                    "limits": operation.limits,
+                }),
+            )?;
+        }
+        if projected_storage.is_some_and(|projected| {
+            classification == OperationClassification::ApprovalGate
+                && projected >= storage_ceiling.saturating_sub(storage_ceiling / 5)
+        }) {
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::ResourceCeilingApproaching,
+                expected_revision,
+                &serde_json::json!({
+                    "operation_request_id": operation_id,
+                    "resource": "max_storage_bytes",
+                    "projected": projected_storage,
+                    "ceiling": storage_ceiling,
+                    "blocking": false,
+                }),
+            )?;
+        }
+        if classification != OperationClassification::Prohibited
+            && operation.limits.max_duration_seconds
+                >= remaining_seconds.saturating_sub(remaining_seconds / 5)
+        {
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::ResourceCeilingApproaching,
+                expected_revision,
+                &serde_json::json!({
+                    "operation_request_id": operation_id,
+                    "resource": "max_elapsed_seconds",
+                    "projected": elapsed_seconds.saturating_add(operation.limits.max_duration_seconds),
+                    "ceiling": ceilings.max_elapsed_seconds,
+                    "blocking": false,
+                }),
+            )?;
+        }
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn inspect_approval_gate(
+        &self,
+        request: &Request,
+        approval_gate_id: &str,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let commission_id = self
+            .connection
+            .query_row(
+                "SELECT commission_id FROM approval_gates WHERE id = ?1",
+                [approval_gate_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(approval_gate_id.to_owned()))?;
+        let projection = project_commission(&self.connection, &commission_id)?;
+        let gate = projection["approval_gates"]
+            .as_array()
+            .and_then(|gates| gates.iter().find(|gate| gate["id"] == approval_gate_id))
+            .cloned()
+            .ok_or_else(|| TyrionError::NotFound(approval_gate_id.to_owned()))?;
+        Ok(serde_json::json!({"approval_gate": gate}))
+    }
+
+    pub fn approve_operation(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        approval_gate_id: &str,
+        expected_operation_digest: &str,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Approval Gate confirmation requires an expected Commission revision".into(),
+            )
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let (gate_status, operation_status, stored_digest, operation_json) = transaction
+            .query_row(
+                "SELECT approval_gates.status, operation_requests.status,
+                        approval_gates.operation_digest,
+                        operation_requests.canonical_operation_json
+                 FROM approval_gates
+                 JOIN operation_requests
+                   ON operation_requests.id = approval_gates.operation_request_id
+                 WHERE approval_gates.id = ?1 AND approval_gates.commission_id = ?2",
+                params![approval_gate_id, commission_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(approval_gate_id.to_owned()))?;
+        if gate_status != ApprovalGateStatus::Open.as_str()
+            || operation_status != OperationStatus::ApprovalRequired.as_str()
+        {
+            return Err(TyrionError::ControlDenied(
+                "Approval Gate is no longer open".into(),
+            ));
+        }
+        if stored_digest != expected_operation_digest {
+            return Err(TyrionError::ControlDenied(
+                "confirmation does not match the presented canonical operation".into(),
+            ));
+        }
+        let mut operation_value: Value = serde_json::from_str(&operation_json)?;
+        operation_value
+            .as_object_mut()
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest("stored canonical operation is not an object".into())
+            })?
+            .remove("target_revision");
+        let operation: OperationRequest = serde_json::from_value(operation_value)?;
+        ensure_current_operation_context(
+            &transaction,
+            commission_id,
+            &operation,
+            expected_revision,
+        )?;
+        let authority = load_authority(&transaction, commission_id)?;
+        if classify_operation(&operation, &authority).0 != OperationClassification::ApprovalGate {
+            return Err(TyrionError::ControlDenied(
+                "the operation is no longer permitted by current authority".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        transaction.execute(
+            "UPDATE approval_gates SET status = 'authorized', authorized_at = ?2
+             WHERE id = ?1 AND status = 'open'",
+            params![approval_gate_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE operation_requests SET status = 'authorized', authorized_at = ?2
+             WHERE id = (SELECT operation_request_id FROM approval_gates WHERE id = ?1)
+               AND status = 'approval_required'",
+            params![approval_gate_id, now],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::ApprovalGateAuthorized,
+            expected_revision,
+            &serde_json::json!({
+                "approval_gate_id": approval_gate_id,
+                "operation_digest": stored_digest,
+                "principal_confirmation": "independent_control_credential",
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn execute_operation(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        approval_gate_id: &str,
+        operation: &OperationRequest,
+        runtime: &worker::WorkerRuntime,
+        options: EffectExecutionOptions,
+    ) -> Result<Value, TyrionError> {
+        let execution_started = Instant::now();
+        let idempotency_key = mutation_key(request)?.to_owned();
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "effect execution requires an expected Commission revision".into(),
+            )
+        })?;
+        validate_operation_shape(operation)?;
+        let integration_lock = runtime.commission_integration_lock(commission_id)?;
+        let _integration_guard = integration_lock.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Commission Integration lock is unavailable".into())
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, &idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+        let (operation_request_id, gate_status, operation_status, stored_digest, operation_json) =
+            transaction
+                .query_row(
+                    "SELECT operation_requests.id, approval_gates.status,
+                            operation_requests.status, approval_gates.operation_digest,
+                            operation_requests.canonical_operation_json
+                     FROM approval_gates
+                     JOIN operation_requests
+                       ON operation_requests.id = approval_gates.operation_request_id
+                     WHERE approval_gates.id = ?1 AND approval_gates.commission_id = ?2",
+                    params![approval_gate_id, commission_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| TyrionError::NotFound(approval_gate_id.to_owned()))?;
+        if gate_status != ApprovalGateStatus::Authorized.as_str()
+            || operation_status != OperationStatus::Authorized.as_str()
+        {
+            return Err(TyrionError::ControlDenied(
+                "Approval Gate is not authorized or has already been consumed".into(),
+            ));
+        }
+        let stored_value: Value = serde_json::from_str(&operation_json)?;
+        let effect_binding: FileEffectBinding =
+            serde_json::from_value(stored_value.get("target_revision").cloned().ok_or_else(
+                || {
+                    TyrionError::ControlDenied(
+                        "the approved operation has no bound target revision".into(),
+                    )
+                },
+            )?)?;
+        let supplied_value = canonical_operation_with_binding(operation, &effect_binding)?;
+        let supplied_json = serde_json::to_string(&supplied_value)?;
+        let supplied_digest = format!("{:x}", Sha256::digest(supplied_json.as_bytes()));
+        if supplied_digest != stored_digest || supplied_json != operation_json {
+            return Err(TyrionError::ControlDenied(
+                "execution does not match the exact approved canonical operation".into(),
+            ));
+        }
+        ensure_file_effect_binding(operation, &effect_binding)?;
+        ensure_current_operation_context(
+            &transaction,
+            commission_id,
+            operation,
+            expected_revision,
+        )?;
+        let authority = load_authority(&transaction, commission_id)?;
+        if classify_operation(operation, &authority).0 != OperationClassification::ApprovalGate {
+            return Err(TyrionError::ControlDenied(
+                "the approved operation is no longer within current authority".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        let consumed = transaction.execute(
+            "UPDATE approval_gates SET status = ?2, consumed_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                approval_gate_id,
+                ApprovalGateStatus::Consumed.as_str(),
+                now,
+                ApprovalGateStatus::Authorized.as_str(),
+            ],
+        )?;
+        if consumed != 1 {
+            return Err(TyrionError::ControlDenied(
+                "Approval Gate was already consumed".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE operation_requests SET status = ?2, started_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                operation_request_id,
+                OperationStatus::Started.as_str(),
+                now,
+                OperationStatus::Authorized.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_execution_identities (
+                operation_request_id, idempotency_key, request_hash
+             ) VALUES (?1, ?2, ?3)",
+            params![operation_request_id, idempotency_key, request_hash],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::OperationStarted,
+            expected_revision,
+            &serde_json::json!({
+                "approval_gate_id": approval_gate_id,
+                "operation_request_id": operation_request_id,
+                "operation_digest": stored_digest,
+            }),
+        )?;
+        transaction.commit()?;
+        if options.leave_started_before_effect {
+            return Err(TyrionError::InvalidRequest(
+                "fault injection left the effect durably started".into(),
+            ));
+        }
+
+        let current_limits = (|| -> Result<(u64, i64), TyrionError> {
+            let transaction = self.connection.transaction()?;
+            ensure_current_operation_context(
+                &transaction,
+                commission_id,
+                operation,
+                expected_revision,
+            )?;
+            let authority = load_authority(&transaction, commission_id)?;
+            if classify_operation(operation, &authority).0 != OperationClassification::ApprovalGate
+            {
+                return Err(TyrionError::ControlDenied(
+                    "the approved operation left current authority before execution".into(),
+                ));
+            }
+            let (storage, elapsed, accepted_at, lease_expires_at) = transaction.query_row(
+                "SELECT resource_ceilings.max_storage_bytes,
+                        resource_ceilings.max_elapsed_seconds, commissions.accepted_at,
+                        worker_leases.expires_at
+                 FROM resource_ceilings
+                 JOIN commissions ON commissions.id = resource_ceilings.commission_id
+                 JOIN worker_leases ON worker_leases.id = ?2
+                 WHERE resource_ceilings.commission_id = ?1",
+                params![commission_id, operation.worker_lease_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            let now = unix_timestamp()?;
+            let elapsed_seconds = now.saturating_sub(accepted_at) as u64;
+            if elapsed_seconds.saturating_add(operation.limits.max_duration_seconds) > elapsed {
+                return Err(TyrionError::ControlDenied(
+                    "the approved operation no longer fits the Commission elapsed-time ceiling"
+                        .into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok((
+                storage,
+                lease_expires_at.min(accepted_at.saturating_add(elapsed as i64)),
+            ))
+        })();
+        let execution = match current_limits {
+            Ok((commission_storage_ceiling, effect_deadline)) => execute_file_replacement(
+                operation,
+                commission_storage_ceiling,
+                &effect_binding,
+                effect_deadline,
+                execution_started,
+                options.leave_started_after_effect,
+                options.hold_before_commit_milliseconds,
+            ),
+            Err(error) => Err(FileEffectError::Failed(error)),
+        };
+        if matches!(execution, Err(FileEffectError::LeaveStartedAfterEffect)) {
+            return Err(TyrionError::InvalidRequest(
+                "fault injection left the committed effect durably started".into(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match execution {
+            Ok(receipt) => {
+                let completed_at = unix_timestamp()?;
+                transaction.execute(
+                    "UPDATE operation_requests
+                     SET status = 'confirmed', completed_at = ?2, receipt_json = ?3
+                     WHERE id = ?1 AND status = 'started'",
+                    params![
+                        operation_request_id,
+                        completed_at,
+                        serde_json::to_string(&receipt)?,
+                    ],
+                )?;
+                record_event_with_payload(
+                    &transaction,
+                    commission_id,
+                    EventKind::OperationConfirmed,
+                    expected_revision,
+                    &serde_json::json!({
+                        "approval_gate_id": approval_gate_id,
+                        "operation_request_id": operation_request_id,
+                        "operation_digest": stored_digest,
+                        "receipt": receipt,
+                    }),
+                )?;
+                let result = project_commission(&transaction, commission_id)?;
+                save_idempotent_result(&transaction, &idempotency_key, &request_hash, &result)?;
+                transaction.commit()?;
+                Ok(result)
+            }
+            Err(FileEffectError::Failed(error)) => {
+                let completed_at = unix_timestamp()?;
+                let receipt = serde_json::json!({
+                    "status": "failed",
+                    "error": error.to_string(),
+                    "secret_material_retained": false,
+                });
+                transaction.execute(
+                    "UPDATE operation_requests
+                     SET status = 'failed', completed_at = ?2, receipt_json = ?3
+                     WHERE id = ?1 AND status = 'started'",
+                    params![
+                        operation_request_id,
+                        completed_at,
+                        serde_json::to_string(&receipt)?,
+                    ],
+                )?;
+                record_event_with_payload(
+                    &transaction,
+                    commission_id,
+                    EventKind::OperationFailed,
+                    expected_revision,
+                    &serde_json::json!({
+                        "approval_gate_id": approval_gate_id,
+                        "operation_request_id": operation_request_id,
+                        "operation_digest": stored_digest,
+                        "receipt": receipt,
+                    }),
+                )?;
+                let result = project_commission(&transaction, commission_id)?;
+                save_idempotent_result(&transaction, &idempotency_key, &request_hash, &result)?;
+                transaction.commit()?;
+                Ok(result)
+            }
+            Err(FileEffectError::Uncertain { error, receipt }) => {
+                let completed_at = unix_timestamp()?;
+                transaction.execute(
+                    "UPDATE operation_requests
+                     SET status = 'uncertain', completed_at = ?2, receipt_json = ?3
+                     WHERE id = ?1 AND status = 'started'",
+                    params![
+                        operation_request_id,
+                        completed_at,
+                        serde_json::to_string(&receipt)?,
+                    ],
+                )?;
+                let paused = transaction.execute(
+                    "UPDATE commissions SET status = 'paused'
+                     WHERE id = ?1 AND status = 'active'",
+                    [commission_id],
+                )?;
+                record_event_with_payload(
+                    &transaction,
+                    commission_id,
+                    EventKind::OperationUncertain,
+                    expected_revision,
+                    &serde_json::json!({
+                        "approval_gate_id": approval_gate_id,
+                        "operation_request_id": operation_request_id,
+                        "operation_digest": stored_digest,
+                        "receipt": receipt,
+                    }),
+                )?;
+                if paused == 1 {
+                    record_event_with_payload(
+                        &transaction,
+                        commission_id,
+                        EventKind::CommissionPaused,
+                        expected_revision,
+                        &serde_json::json!({
+                            "cause": "uncertain_consequential_effect",
+                            "operation_request_id": operation_request_id,
+                            "dispatch_enabled": false,
+                            "resumable_after_principal_reconciliation": true,
+                        }),
+                    )?;
+                }
+                let result = project_commission(&transaction, commission_id)?;
+                save_idempotent_result(&transaction, &idempotency_key, &request_hash, &result)?;
+                transaction.commit()?;
+                let _ = error;
+                Ok(result)
+            }
+            Err(FileEffectError::LeaveStartedAfterEffect) => unreachable!(),
+        }
+    }
+
+    pub fn reconcile_operation(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        operation_request_id: &str,
+        outcome: OperationReconciliationOutcome,
+        observed_sha256: &str,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        validate_sha256(observed_sha256)?;
+        let idempotency_key = mutation_key(request)?.to_owned();
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "operation reconciliation requires an expected Commission revision".into(),
+            )
+        })?;
+        let (canonical_json, binding, operation) = {
+            let transaction = self.connection.transaction()?;
+            if let Some(prior) = prior_result(&transaction, &idempotency_key, &request_hash)? {
+                return Ok(prior);
+            }
+            let revision = transaction
+                .query_row(
+                    "SELECT revision FROM commissions WHERE id = ?1",
+                    [commission_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+            if revision != expected_revision {
+                return Err(TyrionError::StaleRevision {
+                    expected: expected_revision,
+                    actual: revision,
+                });
+            }
+            let (status, canonical_json) = transaction
+                .query_row(
+                    "SELECT status, canonical_operation_json
+                     FROM operation_requests
+                     WHERE id = ?1 AND commission_id = ?2",
+                    params![operation_request_id, commission_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| TyrionError::NotFound(operation_request_id.to_owned()))?;
+            if status != OperationStatus::Uncertain.as_str() {
+                return Err(TyrionError::ControlDenied(
+                    "only an uncertain consequential effect can be reconciled".into(),
+                ));
+            }
+            let mut canonical: Value = serde_json::from_str(&canonical_json)?;
+            let binding: FileEffectBinding = serde_json::from_value(
+                canonical.get("target_revision").cloned().ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "uncertain effect has no exact target revision".into(),
+                    )
+                })?,
+            )?;
+            canonical
+                .as_object_mut()
+                .ok_or_else(|| {
+                    TyrionError::InvalidRequest("canonical operation must be an object".into())
+                })?
+                .remove("target_revision");
+            let operation: OperationRequest = serde_json::from_value(canonical)?;
+            transaction.commit()?;
+            (canonical_json, binding, operation)
+        };
+        let actual_sha256 = observe_effect_target(&operation, &binding)?;
+        let expected_sha256 = match outcome {
+            OperationReconciliationOutcome::Confirmed => {
+                let content = operation.parameters.get("content").ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "filesystem.write reconciliation requires content".into(),
+                    )
+                })?;
+                format!("{:x}", Sha256::digest(content.as_bytes()))
+            }
+            OperationReconciliationOutcome::NotApplied => binding.before_sha256.clone(),
+        };
+        if observed_sha256 != actual_sha256 || observed_sha256 != expected_sha256 {
+            return Err(TyrionError::ControlDenied(
+                "Principal reconciliation does not match the independently observed exact target revision"
+                    .into(),
+            ));
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(prior) = prior_result(&transaction, &idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let (revision, status, current_canonical_json) = transaction.query_row(
+            "SELECT commissions.revision, operation_requests.status,
+                        operation_requests.canonical_operation_json
+                 FROM operation_requests
+                 JOIN commissions ON commissions.id = operation_requests.commission_id
+                 WHERE operation_requests.id = ?1 AND operation_requests.commission_id = ?2",
+            params![operation_request_id, commission_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if revision != expected_revision
+            || status != OperationStatus::Uncertain.as_str()
+            || current_canonical_json != canonical_json
+        {
+            return Err(TyrionError::ControlDenied(
+                "the uncertain effect changed while Principal reconciliation was in progress"
+                    .into(),
+            ));
+        }
+        let (status, event, reconciliation) = match outcome {
+            OperationReconciliationOutcome::Confirmed => (
+                OperationStatus::Confirmed,
+                EventKind::OperationConfirmed,
+                "confirmed_after_restart",
+            ),
+            OperationReconciliationOutcome::NotApplied => (
+                OperationStatus::Failed,
+                EventKind::OperationFailed,
+                "confirmed_not_applied",
+            ),
+        };
+        let reconciled_at = unix_timestamp()?;
+        let receipt = serde_json::json!({
+            "status": status.as_str(),
+            "reconciliation": reconciliation,
+            "principal_observed_sha256": observed_sha256,
+            "independently_observed_sha256": actual_sha256,
+            "rollback_claimed": false,
+            "secret_material_retained": false,
+        });
+        transaction.execute(
+            "UPDATE operation_requests
+             SET status = ?2, completed_at = ?3, receipt_json = ?4
+             WHERE id = ?1 AND status = 'uncertain'",
+            params![
+                operation_request_id,
+                status.as_str(),
+                reconciled_at,
+                serde_json::to_string(&receipt)?,
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            event,
+            revision,
+            &serde_json::json!({
+                "operation_request_id": operation_request_id,
+                "principal_reconciliation": reconciliation,
+                "observed_sha256": observed_sha256,
+                "receipt": receipt,
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, &idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn propose_commission_amendment(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        amendment: &CommissionAmendment,
+    ) -> Result<Value, TyrionError> {
+        validate_commission_amendment(amendment)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Commission Amendment proposal requires an expected revision".into(),
+            )
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+        let (status, current_revision) = transaction
+            .query_row(
+                "SELECT status, revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if current_revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        if status != CommissionStatus::Active.as_str()
+            && status != CommissionStatus::Paused.as_str()
+        {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Commission {commission_id} is {status}; only an active or paused mandate can be amended"
+            )));
+        }
+        let has_pending_amendment = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM commission_amendments
+                WHERE commission_id = ?1 AND status = 'proposed'
+             )",
+            [commission_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_pending_amendment {
+            return Err(TyrionError::InvalidRequest(
+                "the Commission already has a proposed Amendment".into(),
+            ));
+        }
+        let current_authority = load_authority(&transaction, commission_id)?;
+        let current_ceilings = load_resource_ceilings(&transaction, commission_id)?;
+        let diff = commission_amendment_diff(
+            &current_authority,
+            &amendment.authority,
+            &current_ceilings,
+            &amendment.resource_ceilings,
+        );
+        if diff["changed"] != true {
+            return Err(TyrionError::InvalidRequest(
+                "Commission Amendment must contain an exact authority or resource change".into(),
+            ));
+        }
+        validate_amended_execution_authority(&transaction, commission_id, &amendment.authority)?;
+        validate_amended_resource_ceilings(
+            &transaction,
+            commission_id,
+            &amendment.resource_ceilings,
+        )?;
+        let canonical_amendment = serde_json::json!({
+            "base_revision": current_revision,
+            "amendment": amendment,
+        });
+        let amendment_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&canonical_amendment)?)
+        );
+        let active_leases = query_active_lease_impact(&transaction, commission_id)?;
+        let affected_operations = query_open_operation_ids(&transaction, commission_id)?;
+        let impact = serde_json::json!({
+            "worker_leases": active_leases,
+            "operation_request_ids_requiring_revalidation": affected_operations,
+            "revalidation_required_before_effect_execution": true,
+        });
+        let amendment_id = Uuid::new_v4().to_string();
+        let proposed_at = unix_timestamp()?;
+        transaction.execute(
+            "INSERT INTO commission_amendments (
+                id, commission_id, base_revision, authority_json, resource_ceilings_json,
+                reason, diff_json, amendment_digest, impact_json, status, proposed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'proposed', ?10)",
+            params![
+                amendment_id,
+                commission_id,
+                current_revision,
+                serde_json::to_string(&amendment.authority)?,
+                serde_json::to_string(&amendment.resource_ceilings)?,
+                amendment.reason,
+                serde_json::to_string(&diff)?,
+                amendment_digest,
+                serde_json::to_string(&impact)?,
+                proposed_at,
+            ],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::CommissionAmendmentProposed,
+            current_revision,
+            &serde_json::json!({
+                "amendment_id": amendment_id,
+                "amendment_digest": amendment_digest,
+                "diff": diff,
+                "impact": impact,
+                "attachment_id": attachment_id,
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn inspect_commission_amendment(
+        &self,
+        request: &Request,
+        amendment_id: &str,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let commission_id = self
+            .connection
+            .query_row(
+                "SELECT commission_id FROM commission_amendments WHERE id = ?1",
+                [amendment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(amendment_id.to_owned()))?;
+        let projection = project_commission(&self.connection, &commission_id)?;
+        let amendment = projection["commission_amendments"]
+            .as_array()
+            .and_then(|amendments| {
+                amendments
+                    .iter()
+                    .find(|amendment| amendment["id"] == amendment_id)
+            })
+            .cloned()
+            .ok_or_else(|| TyrionError::NotFound(amendment_id.to_owned()))?;
+        Ok(serde_json::json!({"commission_amendment": amendment}))
+    }
+
+    pub fn accept_commission_amendment(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        amendment_id: &str,
+        expected_amendment_digest: &str,
+        principal_token_hash: &str,
+        runtime: &worker::WorkerRuntime,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Commission Amendment acceptance requires an expected revision".into(),
+            )
+        })?;
+        let integration_lock = runtime.commission_integration_lock(commission_id)?;
+        let _integration_guard = integration_lock.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Commission Integration lock is unavailable".into())
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let (base_revision, authority_json, ceilings_json, stored_digest, amendment_status) =
+            transaction
+                .query_row(
+                    "SELECT base_revision, authority_json, resource_ceilings_json,
+                            amendment_digest, status
+                     FROM commission_amendments WHERE id = ?1 AND commission_id = ?2",
+                    params![amendment_id, commission_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| TyrionError::NotFound(amendment_id.to_owned()))?;
+        if amendment_status != "proposed" {
+            return Err(TyrionError::ControlDenied(
+                "Commission Amendment is no longer proposed".into(),
+            ));
+        }
+        if stored_digest != expected_amendment_digest {
+            return Err(TyrionError::ControlDenied(
+                "acceptance does not match the exact proposed Commission Amendment".into(),
+            ));
+        }
+        let (commission_status, current_revision) = transaction.query_row(
+            "SELECT status, revision FROM commissions WHERE id = ?1",
+            [commission_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if current_revision != expected_revision || base_revision != current_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        if commission_status != CommissionStatus::Active.as_str()
+            && commission_status != CommissionStatus::Paused.as_str()
+        {
+            return Err(TyrionError::ControlDenied(
+                "only an active or paused Commission can accept an Amendment".into(),
+            ));
+        }
+        let authority: AuthorityEnvelope = serde_json::from_str(&authority_json)?;
+        let ceilings: ResourceCeilings = serde_json::from_str(&ceilings_json)?;
+        validate_amended_execution_authority(&transaction, commission_id, &authority)?;
+        validate_amended_resource_ceilings(&transaction, commission_id, &ceilings)?;
+
+        replace_authority(&transaction, commission_id, &authority)?;
+        replace_resource_ceilings(&transaction, commission_id, &ceilings)?;
+        let mandate_revision = current_revision + 1;
+        transaction.execute(
+            "UPDATE commissions SET revision = ?2 WHERE id = ?1",
+            params![commission_id, mandate_revision],
+        )?;
+        copy_current_criterion_versions(&transaction, commission_id, mandate_revision)?;
+
+        let execution_json = transaction.query_row(
+            "SELECT execution_json FROM commissions WHERE id = ?1",
+            [commission_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        let execution: ExecutionSpec = serde_json::from_str(&execution_json)?;
+        let active_leases = query_active_leases(&transaction, commission_id)?;
+        let mut lease_revalidation = Vec::new();
+        for (lease_id, attempt_id) in active_leases {
+            let authority_current =
+                attempt_authority_is_current(&transaction, commission_id, &attempt_id, &execution)?;
+            let resources_current =
+                attempt_resources_fit(&transaction, commission_id, &attempt_id, &ceilings)?;
+            let _ = runtime.cancel_attempt(&attempt_id);
+            let now = unix_timestamp()?;
+            let now_ms = unix_timestamp_millis()?;
+            transaction.execute(
+                "UPDATE worker_leases SET status = 'revoked', released_at = ?2
+                 WHERE id = ?1 AND status = 'active'",
+                params![lease_id, now],
+            )?;
+            transaction.execute(
+                "UPDATE resource_reservations SET status = 'revoked', released_at = ?2
+                 WHERE attempt_id = ?1 AND status = 'active'",
+                params![attempt_id, now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE attempts
+                 SET status = 'cancelled', completed_at = ?2, completed_at_ms = ?3,
+                     execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?3),
+                     revision_disposition = 'requires_revalidation'
+                 WHERE id = ?1 AND status = 'running'",
+                params![attempt_id, now, now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE workers
+                 SET status = 'cancelled', latest_activity = ?2, activity_at_ms = ?3
+                 WHERE attempt_id = ?1 AND status = 'running'",
+                params![
+                    attempt_id,
+                    "Commission Amendment requires a revision-bound replacement Attempt",
+                    now_ms,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE assignments SET status = 'ready'
+                 WHERE id = (SELECT assignment_id FROM attempts WHERE id = ?1)
+                   AND status = 'running'",
+                [&attempt_id],
+            )?;
+            lease_revalidation.push(serde_json::json!({
+                "worker_lease_id": lease_id,
+                "attempt_id": attempt_id,
+                "outcome": "restart_required",
+                "authority_current": authority_current,
+                "resources_current": resources_current,
+                "replacement_mandate_revision": mandate_revision,
+            }));
+        }
+        let invalidated_operation_ids = query_open_operation_ids(&transaction, commission_id)?;
+        let now = unix_timestamp()?;
+        transaction.execute(
+            "UPDATE approval_gates
+             SET status = ?2, invalidated_at = ?3
+             WHERE commission_id = ?1 AND status IN ('open', 'authorized')",
+            params![commission_id, ApprovalGateStatus::Invalidated.as_str(), now,],
+        )?;
+        transaction.execute(
+            "UPDATE operation_requests SET status = 'revoked', completed_at = ?2
+             WHERE commission_id = ?1 AND status IN ('approval_required', 'authorized')",
+            params![commission_id, now],
+        )?;
+        let revalidation = serde_json::json!({
+            "worker_leases": lease_revalidation,
+            "invalidated_operation_request_ids": invalidated_operation_ids,
+            "criteria_rebound_to_mandate_revision": mandate_revision,
+        });
+        transaction.execute(
+            "UPDATE commission_amendments
+             SET status = 'accepted', accepted_at = ?2, revalidation_json = ?3
+             WHERE id = ?1 AND status = 'proposed'",
+            params![amendment_id, now, serde_json::to_string(&revalidation)?],
+        )?;
+        transaction.execute(
+            "UPDATE commission_amendments SET status = 'invalidated'
+             WHERE commission_id = ?1 AND id != ?2 AND status = 'proposed'",
+            params![commission_id, amendment_id],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::CommissionAmended,
+            mandate_revision,
+            &serde_json::json!({
+                "amendment_id": amendment_id,
+                "amendment_digest": stored_digest,
+                "base_revision": base_revision,
+                "mandate_revision": mandate_revision,
+                "revalidation": revalidation,
             }),
         )?;
         let result = project_commission(&transaction, commission_id)?;
@@ -1236,6 +2582,105 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn recover_stranded_operations(&mut self) -> Result<(), TyrionError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stranded = {
+            let mut statement = transaction.prepare(
+                "SELECT operation_requests.id, operation_requests.commission_id,
+                        operation_requests.operation_digest, commissions.revision,
+                        operation_execution_identities.idempotency_key,
+                        operation_execution_identities.request_hash
+                 FROM operation_requests
+                 JOIN commissions ON commissions.id = operation_requests.commission_id
+                 LEFT JOIN operation_execution_identities
+                   ON operation_execution_identities.operation_request_id = operation_requests.id
+                 WHERE operation_requests.status = 'started'
+                 ORDER BY operation_requests.started_at, operation_requests.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let recovered_at = unix_timestamp()?;
+        let mut replay_results = Vec::new();
+        for (
+            operation_request_id,
+            commission_id,
+            operation_digest,
+            revision,
+            idempotency_key,
+            request_hash,
+        ) in stranded
+        {
+            let receipt = serde_json::json!({
+                "status": "uncertain",
+                "effect_may_have_occurred": true,
+                "rollback_claimed": false,
+                "requirement": "Reconcile the exact target revision before any linked Commission retries it.",
+                "recovered_after_control_plane_restart": true,
+            });
+            transaction.execute(
+                "UPDATE operation_requests
+                 SET status = 'uncertain', completed_at = ?2, receipt_json = ?3
+                 WHERE id = ?1 AND status = 'started'",
+                params![
+                    operation_request_id,
+                    recovered_at,
+                    serde_json::to_string(&receipt)?,
+                ],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                &commission_id,
+                EventKind::OperationUncertain,
+                revision,
+                &serde_json::json!({
+                    "operation_request_id": operation_request_id,
+                    "operation_digest": operation_digest,
+                    "receipt": receipt,
+                }),
+            )?;
+            let paused = transaction.execute(
+                "UPDATE commissions SET status = 'paused'
+                 WHERE id = ?1 AND status = 'active'",
+                [&commission_id],
+            )?;
+            if paused == 1 {
+                record_event_with_payload(
+                    &transaction,
+                    &commission_id,
+                    EventKind::CommissionPaused,
+                    revision,
+                    &serde_json::json!({
+                        "cause": "uncertain_consequential_effect",
+                        "operation_request_id": operation_request_id,
+                        "dispatch_enabled": false,
+                        "resumable_after_principal_reconciliation": true,
+                    }),
+                )?;
+            }
+            if let (Some(idempotency_key), Some(request_hash)) = (idempotency_key, request_hash) {
+                replay_results.push((commission_id, idempotency_key, request_hash));
+            }
+        }
+        for (commission_id, idempotency_key, request_hash) in replay_results {
+            let result = project_commission(&transaction, &commission_id)?;
+            save_idempotent_result(&transaction, &idempotency_key, &request_hash, &result)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn recover_stranded_attempts(&mut self) -> Result<Vec<PendingCleanup>, TyrionError> {
@@ -2760,13 +4205,15 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO worker_leases (id, attempt_id, issued_at, expires_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO worker_leases (
+                id, attempt_id, issued_at, expires_at, mandate_revision, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 lease_id,
                 attempt_id,
                 now,
                 lease_expires_at,
+                ready.mandate_revision,
                 WorkerLeaseStatus::Active.as_str(),
             ],
         )?;
@@ -4868,11 +6315,10 @@ fn route_ready_assignments(
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
     let execution: ExecutionSpec = serde_json::from_str(&execution_json)?;
-    let required_authority_action = match execution {
+    let required_authority_action = match &execution {
         ExecutionSpec::Deterministic => worker::DETERMINISTIC_ACTION,
         ExecutionSpec::CodexGit { .. } => worker::CODEX_GIT_ACTION,
     };
-    let authority = load_authority(transaction, commission_id)?;
     let assignments = {
         let mut statement = transaction.prepare(
             "SELECT assignments.id, assignments.status,
@@ -4880,7 +6326,9 @@ fn route_ready_assignments(
                     assignment_metadata.concurrency_slots,
                     assignment_metadata.max_storage_bytes,
                     assignment_metadata.max_model_spend_cents,
-                    assignment_metadata.max_paid_service_spend_cents
+                    assignment_metadata.max_paid_service_spend_cents,
+                    planned_assignments.read_scopes_json,
+                    planned_assignments.write_scopes_json
              FROM assignments
              JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
              JOIN planned_assignments
@@ -4907,13 +6355,31 @@ fn route_ready_assignments(
                         max_model_spend_cents: row.get(5)?,
                         max_paid_service_spend_cents: row.get(6)?,
                     },
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (assignment_id, prior_status, requirements_json, resources) in assignments {
+    for (
+        assignment_id,
+        prior_status,
+        requirements_json,
+        resources,
+        read_scopes_json,
+        write_scopes_json,
+    ) in assignments
+    {
         let requirements: WorkerRequirements = serde_json::from_str(&requirements_json)?;
+        let has_artifact_scopes = !serde_json::from_str::<Vec<String>>(&read_scopes_json)?
+            .is_empty()
+            || !serde_json::from_str::<Vec<String>>(&write_scopes_json)?.is_empty();
+        let required_authority_scope_types = match execution {
+            ExecutionSpec::CodexGit { .. } => vec!["repository", "path", "action"],
+            ExecutionSpec::Deterministic if has_artifact_scopes => vec!["path", "action"],
+            ExecutionSpec::Deterministic => vec!["action"],
+        };
         let unavailable_configuration_ids = {
             let mut statement = transaction.prepare(
                 "SELECT configuration_id FROM worker_configuration_failures
@@ -4933,7 +6399,7 @@ fn route_ready_assignments(
             &requirements,
             &resources,
             required_authority_action,
-            &authority,
+            &required_authority_scope_types,
             &entry_harness,
             &unavailable_configuration_ids,
         )?;
@@ -5314,6 +6780,407 @@ fn load_authority(
         )?,
         effects: load_authority_scope(connection, commission_id, AuthorityScopeType::Effect)?,
     })
+}
+
+fn load_resource_ceilings(
+    connection: &Connection,
+    commission_id: &str,
+) -> Result<ResourceCeilings, TyrionError> {
+    Ok(connection.query_row(
+        "SELECT max_attempts, max_elapsed_seconds, max_worker_concurrency,
+                max_storage_bytes, max_model_spend_cents,
+                max_paid_service_spend_cents
+         FROM resource_ceilings WHERE commission_id = ?1",
+        [commission_id],
+        |row| {
+            Ok(ResourceCeilings {
+                max_attempts: row.get(0)?,
+                max_elapsed_seconds: row.get(1)?,
+                max_worker_concurrency: row.get(2)?,
+                max_storage_bytes: row.get(3)?,
+                max_model_spend_cents: row.get(4)?,
+                max_paid_service_spend_cents: row.get(5)?,
+            })
+        },
+    )?)
+}
+
+fn validate_commission_amendment(amendment: &CommissionAmendment) -> Result<(), TyrionError> {
+    if amendment.reason.trim().is_empty() {
+        return Err(TyrionError::InvalidRequest(
+            "Commission Amendment reason must not be empty".into(),
+        ));
+    }
+    let named_scopes = [
+        ("repository", &amendment.authority.repositories),
+        ("path", &amendment.authority.paths),
+        ("action", &amendment.authority.actions),
+        ("destination", &amendment.authority.destinations),
+        ("effect", &amendment.authority.effects),
+    ];
+    for (name, values) in named_scopes {
+        let mut unique = HashSet::new();
+        for value in values {
+            if value.trim().is_empty() || value.contains('\0') || !unique.insert(value) {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Commission Amendment {name} scopes must be non-empty and unique"
+                )));
+            }
+        }
+    }
+    for repository in &amendment.authority.repositories {
+        if !Path::new(repository).is_absolute() || fs::canonicalize(repository).is_err() {
+            return Err(TyrionError::InvalidRequest(
+                "Commission Amendment repositories must be resolvable absolute paths".into(),
+            ));
+        }
+    }
+    for path in &amendment.authority.paths {
+        validate_relative_scope(path)?;
+    }
+    if amendment
+        .authority
+        .effects
+        .iter()
+        .any(|effect| effect == "filesystem.write")
+        && (!amendment
+            .authority
+            .actions
+            .iter()
+            .any(|action| action == "filesystem.write")
+            || !amendment
+                .authority
+                .destinations
+                .iter()
+                .any(|destination| destination == "local"))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "filesystem.write effect authority requires its exact action and local destination"
+                .into(),
+        ));
+    }
+    let ceilings = &amendment.resource_ceilings;
+    if ceilings.max_attempts == 0
+        || ceilings.max_elapsed_seconds == 0
+        || ceilings.max_worker_concurrency == 0
+        || ceilings.max_storage_bytes == 0
+        || ceilings.max_elapsed_seconds > i64::MAX as u64
+        || ceilings.max_storage_bytes > i64::MAX as u64
+        || ceilings.max_model_spend_cents > i64::MAX as u64
+        || ceilings.max_paid_service_spend_cents > i64::MAX as u64
+    {
+        return Err(TyrionError::InvalidRequest(
+            "Commission Amendment resource ceilings must be positive and fit SQLite integers"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn commission_amendment_diff(
+    current_authority: &AuthorityEnvelope,
+    proposed_authority: &AuthorityEnvelope,
+    current_ceilings: &ResourceCeilings,
+    proposed_ceilings: &ResourceCeilings,
+) -> Value {
+    let mut resource_changes = serde_json::Map::new();
+    insert_resource_change(
+        &mut resource_changes,
+        "max_attempts",
+        current_ceilings.max_attempts,
+        proposed_ceilings.max_attempts,
+    );
+    insert_resource_change(
+        &mut resource_changes,
+        "max_elapsed_seconds",
+        current_ceilings.max_elapsed_seconds,
+        proposed_ceilings.max_elapsed_seconds,
+    );
+    insert_resource_change(
+        &mut resource_changes,
+        "max_worker_concurrency",
+        current_ceilings.max_worker_concurrency,
+        proposed_ceilings.max_worker_concurrency,
+    );
+    insert_resource_change(
+        &mut resource_changes,
+        "max_storage_bytes",
+        current_ceilings.max_storage_bytes,
+        proposed_ceilings.max_storage_bytes,
+    );
+    insert_resource_change(
+        &mut resource_changes,
+        "max_model_spend_cents",
+        current_ceilings.max_model_spend_cents,
+        proposed_ceilings.max_model_spend_cents,
+    );
+    insert_resource_change(
+        &mut resource_changes,
+        "max_paid_service_spend_cents",
+        current_ceilings.max_paid_service_spend_cents,
+        proposed_ceilings.max_paid_service_spend_cents,
+    );
+    serde_json::json!({
+        "changed": current_authority != proposed_authority || current_ceilings != proposed_ceilings,
+        "authority": {
+            "repositories": authority_list_diff(
+                &current_authority.repositories,
+                &proposed_authority.repositories,
+            ),
+            "paths": authority_list_diff(&current_authority.paths, &proposed_authority.paths),
+            "actions": authority_list_diff(&current_authority.actions, &proposed_authority.actions),
+            "destinations": authority_list_diff(
+                &current_authority.destinations,
+                &proposed_authority.destinations,
+            ),
+            "effects": authority_list_diff(&current_authority.effects, &proposed_authority.effects),
+        },
+        "resource_ceilings": resource_changes,
+    })
+}
+
+fn authority_list_diff(current: &[String], proposed: &[String]) -> Value {
+    serde_json::json!({
+        "added": proposed
+            .iter()
+            .filter(|value| !current.contains(value))
+            .collect::<Vec<_>>(),
+        "removed": current
+            .iter()
+            .filter(|value| !proposed.contains(value))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn insert_resource_change<T: Serialize + PartialEq>(
+    changes: &mut serde_json::Map<String, Value>,
+    name: &str,
+    before: T,
+    after: T,
+) {
+    if before != after {
+        changes.insert(
+            name.to_owned(),
+            serde_json::json!({"before": before, "after": after}),
+        );
+    }
+}
+
+fn validate_amended_execution_authority(
+    connection: &Connection,
+    commission_id: &str,
+    authority: &AuthorityEnvelope,
+) -> Result<(), TyrionError> {
+    let execution_json = connection.query_row(
+        "SELECT execution_json FROM commissions WHERE id = ?1",
+        [commission_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let required_action = match serde_json::from_str::<ExecutionSpec>(&execution_json)? {
+        ExecutionSpec::Deterministic => worker::DETERMINISTIC_ACTION,
+        ExecutionSpec::CodexGit { .. } => worker::CODEX_GIT_ACTION,
+    };
+    if !authority
+        .actions
+        .iter()
+        .any(|action| action == required_action)
+    {
+        return Err(TyrionError::InvalidRequest(format!(
+            "Commission Amendment cannot remove required execution action {required_action}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_amended_resource_ceilings(
+    connection: &Connection,
+    commission_id: &str,
+    ceilings: &ResourceCeilings,
+) -> Result<(), TyrionError> {
+    let (attempts, active_concurrency, active_storage, model_spend, paid_spend) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 WHERE assignments.commission_id = ?1),
+                COALESCE(SUM(CASE WHEN status = 'active' THEN concurrency_slots ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'active' THEN storage_bytes ELSE 0 END), 0),
+                COALESCE(SUM(model_spend_cents), 0),
+                COALESCE(SUM(paid_service_spend_cents), 0)
+             FROM resource_reservations WHERE commission_id = ?1",
+            [commission_id],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            },
+        )?;
+    if attempts > ceilings.max_attempts
+        || active_concurrency > ceilings.max_worker_concurrency
+        || active_storage > ceilings.max_storage_bytes
+        || model_spend > ceilings.max_model_spend_cents
+        || paid_spend > ceilings.max_paid_service_spend_cents
+    {
+        return Err(TyrionError::InvalidRequest(
+            "Commission Amendment resource ceilings cannot fall below committed use".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn query_active_lease_impact(
+    connection: &Connection,
+    commission_id: &str,
+) -> Result<Vec<Value>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT worker_leases.id, attempts.id, worker_leases.mandate_revision
+         FROM worker_leases
+         JOIN attempts ON attempts.id = worker_leases.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE assignments.commission_id = ?1 AND worker_leases.status = 'active'
+         ORDER BY attempts.started_at, attempts.id",
+    )?;
+    let rows = statement.query_map([commission_id], |row| {
+        Ok(serde_json::json!({
+            "worker_lease_id": row.get::<_, String>(0)?,
+            "attempt_id": row.get::<_, String>(1)?,
+            "current_mandate_revision": row.get::<_, i64>(2)?,
+            "required_action": "revalidate_before_mandate_change",
+        }))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn query_active_leases(
+    connection: &Connection,
+    commission_id: &str,
+) -> Result<Vec<(String, String)>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT worker_leases.id, attempts.id
+         FROM worker_leases
+         JOIN attempts ON attempts.id = worker_leases.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE assignments.commission_id = ?1 AND worker_leases.status = 'active'
+         ORDER BY attempts.started_at, attempts.id",
+    )?;
+    let rows = statement.query_map([commission_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn query_open_operation_ids(
+    connection: &Connection,
+    commission_id: &str,
+) -> Result<Vec<String>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM operation_requests
+         WHERE commission_id = ?1
+           AND status IN ('approval_required', 'authorized', 'started')
+         ORDER BY proposed_at, id",
+    )?;
+    let rows = statement.query_map([commission_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn replace_authority(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    authority: &AuthorityEnvelope,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "DELETE FROM authority_scopes WHERE commission_id = ?1",
+        [commission_id],
+    )?;
+    let scopes = [
+        (AuthorityScopeType::Repository, &authority.repositories),
+        (AuthorityScopeType::Path, &authority.paths),
+        (AuthorityScopeType::Action, &authority.actions),
+        (AuthorityScopeType::Destination, &authority.destinations),
+        (AuthorityScopeType::Effect, &authority.effects),
+    ];
+    for (scope_type, values) in scopes {
+        for (position, value) in values.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO authority_scopes (commission_id, scope_type, position, value)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![commission_id, scope_type.as_str(), position as i64, value],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_resource_ceilings(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    ceilings: &ResourceCeilings,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "UPDATE resource_ceilings SET
+            max_attempts = ?2, max_elapsed_seconds = ?3, max_worker_concurrency = ?4,
+            max_storage_bytes = ?5, max_model_spend_cents = ?6,
+            max_paid_service_spend_cents = ?7
+         WHERE commission_id = ?1",
+        params![
+            commission_id,
+            ceilings.max_attempts,
+            ceilings.max_elapsed_seconds,
+            ceilings.max_worker_concurrency,
+            ceilings.max_storage_bytes,
+            ceilings.max_model_spend_cents,
+            ceilings.max_paid_service_spend_cents,
+        ],
+    )?;
+    Ok(())
+}
+
+fn copy_current_criterion_versions(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "INSERT INTO criterion_versions (
+            commission_id, mandate_revision, criterion_id, position, description,
+            required_evidence, verifier_type, verification_depth, verifier_configuration,
+            verification_environment, verifier_kind, expected
+         )
+         SELECT commission_id, ?2, criterion_id, position, description, required_evidence,
+                verifier_type, verification_depth, verifier_configuration,
+                verification_environment, verifier_kind, expected
+         FROM criteria WHERE commission_id = ?1",
+        params![commission_id, mandate_revision],
+    )?;
+    Ok(())
+}
+
+fn attempt_resources_fit(
+    connection: &Connection,
+    commission_id: &str,
+    attempt_id: &str,
+    ceilings: &ResourceCeilings,
+) -> Result<bool, TyrionError> {
+    Ok(connection
+        .query_row(
+            "SELECT concurrency_slots, storage_bytes, model_spend_cents,
+                    paid_service_spend_cents
+             FROM resource_reservations
+             WHERE commission_id = ?1 AND attempt_id = ?2",
+            params![commission_id, attempt_id],
+            |row| {
+                Ok(row.get::<_, u32>(0)? <= ceilings.max_worker_concurrency
+                    && row.get::<_, u64>(1)? <= ceilings.max_storage_bytes
+                    && row.get::<_, u64>(2)? <= ceilings.max_model_spend_cents
+                    && row.get::<_, u64>(3)? <= ceilings.max_paid_service_spend_cents)
+            },
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 fn load_authority_scope(
@@ -5889,6 +7756,17 @@ fn complete_commission(
                 WHERE commission_id = ?1 AND mandate_revision = ?2 AND status = 'open'
             )
             AND NOT EXISTS(
+                SELECT 1 FROM approval_gates
+                JOIN operation_requests
+                  ON operation_requests.id = approval_gates.operation_request_id
+                WHERE approval_gates.commission_id = ?1
+                  AND operation_requests.mandate_revision = ?2
+                  AND (
+                      approval_gates.status != 'consumed'
+                      OR operation_requests.status != 'confirmed'
+                  )
+            )
+            AND NOT EXISTS(
                 SELECT 1 FROM evidence
                 JOIN results ON results.id = evidence.result_id
                 WHERE evidence.commission_id = ?1
@@ -5909,7 +7787,7 @@ fn complete_commission(
     )?;
     if !preconditions_hold {
         return Err(TyrionError::InvalidRequest(
-            "Verified Completion requires passed current criteria, closed gates, and no material contradiction"
+            "Verified Completion requires passed current criteria, confirmed current Approval Gates, and no material contradiction"
                 .into(),
         ));
     }
@@ -7080,6 +8958,25 @@ fn authenticated_attachment_id(
         .ok_or_else(|| TyrionError::ControlDenied("Attachment credential is invalid".into()))
 }
 
+fn authenticate_principal(request: &Request, expected_token_hash: &str) -> Result<(), TyrionError> {
+    let token = request
+        .principal_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(
+                "the independent Principal control credential is required".into(),
+            )
+        })?;
+    let actual_token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    if actual_token_hash != expected_token_hash {
+        return Err(TyrionError::ControlDenied(
+            "the Principal control credential is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_commission_exists(
     connection: &Connection,
     commission_id: &str,
@@ -7370,7 +9267,17 @@ fn replay_events(
             .filter(|event| {
                 matches!(
                     event["type"].as_str(),
-                    Some("commission_verified_complete" | "assignment_blocked")
+                    Some(
+                        "commission_verified_complete"
+                            | "assignment_blocked"
+                            | "operation_notification"
+                            | "approval_gate_opened"
+                            | "operation_confirmed"
+                            | "operation_failed"
+                            | "operation_uncertain"
+                            | "commission_amendment_proposed"
+                            | "resource_ceiling_approaching"
+                    )
                 )
             })
             .cloned()
@@ -7872,6 +9779,806 @@ fn validate_relative_scope(scope: &str) -> Result<(), TyrionError> {
 
 fn path_is_within_scope(path: &str, scope: &str) -> bool {
     path == scope || path.starts_with(&format!("{scope}/"))
+}
+
+fn validate_operation_shape(operation: &OperationRequest) -> Result<(), TyrionError> {
+    if operation.operation.trim().is_empty()
+        || operation.assignment_id.trim().is_empty()
+        || operation.attempt_id.trim().is_empty()
+        || operation.worker_lease_id.trim().is_empty()
+        || operation.consequences.is_empty()
+        || operation
+            .consequences
+            .iter()
+            .any(|consequence| consequence.trim().is_empty())
+        || operation.limits.max_output_bytes == 0
+        || operation.limits.max_duration_seconds == 0
+    {
+        return Err(TyrionError::InvalidRequest(
+            "operation identity, consequences, and positive limits are required".into(),
+        ));
+    }
+    validate_relative_scope(&operation.target)?;
+    if operation
+        .parameters
+        .iter()
+        .any(|(name, value)| name.trim().is_empty() || name.contains('\0') || value.contains('\0'))
+        || operation
+            .repository
+            .as_deref()
+            .is_some_and(|repository| repository.trim().is_empty() || repository.contains('\0'))
+        || operation
+            .destination
+            .as_deref()
+            .is_some_and(|destination| destination.trim().is_empty() || destination.contains('\0'))
+        || operation
+            .effect
+            .as_deref()
+            .is_some_and(|effect| effect.trim().is_empty() || effect.contains('\0'))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "operation fields must not be empty or contain NUL bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_operation(
+    operation: &OperationRequest,
+) -> Result<(Value, Option<FileEffectBinding>), TyrionError> {
+    let mut canonical = serde_json::to_value(operation)?;
+    let binding = (operation.operation == "filesystem.write"
+        && operation.effect.as_deref() == Some("filesystem.write")
+        && operation.destination.as_deref() == Some("local"))
+    .then(|| bind_file_effect(operation))
+    .transpose()?;
+    if let Some(binding) = &binding {
+        canonical
+            .as_object_mut()
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest("canonical operation must be an object".into())
+            })?
+            .insert("target_revision".into(), serde_json::to_value(binding)?);
+    }
+    Ok((canonical, binding))
+}
+
+fn canonical_operation_with_binding(
+    operation: &OperationRequest,
+    binding: &FileEffectBinding,
+) -> Result<Value, TyrionError> {
+    let mut canonical = serde_json::to_value(operation)?;
+    canonical
+        .as_object_mut()
+        .ok_or_else(|| TyrionError::InvalidRequest("canonical operation must be an object".into()))?
+        .insert("target_revision".into(), serde_json::to_value(binding)?);
+    Ok(canonical)
+}
+
+fn bind_file_effect(operation: &OperationRequest) -> Result<FileEffectBinding, TyrionError> {
+    let repository = operation.repository.as_deref().ok_or_else(|| {
+        TyrionError::InvalidRequest("filesystem.write requires an exact repository".into())
+    })?;
+    let canonical_repository = fs::canonicalize(repository)?;
+    if !canonical_repository.is_dir() {
+        return Err(TyrionError::InvalidRequest(
+            "the approved repository is not a directory".into(),
+        ));
+    }
+    let target = canonical_repository.join(&operation.target);
+    let parent = target.parent().ok_or_else(|| {
+        TyrionError::InvalidRequest("the approved target has no parent directory".into())
+    })?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(&canonical_repository) {
+        return Err(TyrionError::ControlDenied(
+            "the approved target escapes its exact repository".into(),
+        ));
+    }
+    let target_name = target.file_name().ok_or_else(|| {
+        TyrionError::InvalidRequest("the approved target has no file name".into())
+    })?;
+    let directory = fs::File::from(
+        openat(
+            CWD,
+            &canonical_parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let mut target_file = fs::File::from(
+        openat(
+            &directory,
+            target_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let repository_metadata = fs::metadata(&canonical_repository)?;
+    let parent_metadata = directory.metadata()?;
+    let target_metadata = target_file.metadata()?;
+    if !target_metadata.is_file() {
+        return Err(TyrionError::ControlDenied(
+            "filesystem.write requires an existing regular non-symlink target".into(),
+        ));
+    }
+    let before_sha256 = sha256_reader(&mut target_file)?;
+    Ok(FileEffectBinding {
+        canonical_repository: path_string(&canonical_repository)?,
+        canonical_parent: path_string(&canonical_parent)?,
+        repository_device: repository_metadata.dev(),
+        repository_inode: repository_metadata.ino(),
+        parent_device: parent_metadata.dev(),
+        parent_inode: parent_metadata.ino(),
+        target_device: target_metadata.dev(),
+        target_inode: target_metadata.ino(),
+        before_sha256,
+    })
+}
+
+fn observe_effect_target(
+    operation: &OperationRequest,
+    binding: &FileEffectBinding,
+) -> Result<String, TyrionError> {
+    let repository_metadata = fs::metadata(&binding.canonical_repository)?;
+    if repository_metadata.dev() != binding.repository_device
+        || repository_metadata.ino() != binding.repository_inode
+    {
+        return Err(TyrionError::ControlDenied(
+            "the reconciled repository is not the exact approved repository".into(),
+        ));
+    }
+    let directory = fs::File::from(
+        openat(
+            CWD,
+            binding.canonical_parent.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let directory_metadata = directory.metadata()?;
+    if directory_metadata.dev() != binding.parent_device
+        || directory_metadata.ino() != binding.parent_inode
+    {
+        return Err(TyrionError::ControlDenied(
+            "the reconciled directory is not the exact approved directory".into(),
+        ));
+    }
+    let target_name = Path::new(&operation.target)
+        .file_name()
+        .ok_or_else(|| TyrionError::InvalidRequest("effect target has no file name".into()))?;
+    let mut target = fs::File::from(
+        openat(
+            &directory,
+            target_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    if !target.metadata()?.is_file() {
+        return Err(TyrionError::ControlDenied(
+            "Principal reconciliation requires an exact regular non-symlink target".into(),
+        ));
+    }
+    sha256_reader(&mut target)
+}
+
+fn ensure_file_effect_binding(
+    operation: &OperationRequest,
+    binding: &FileEffectBinding,
+) -> Result<(), TyrionError> {
+    let requested_repository = operation.repository.as_deref().ok_or_else(|| {
+        TyrionError::InvalidRequest("filesystem.write requires an exact repository".into())
+    })?;
+    if fs::canonicalize(requested_repository)? != Path::new(&binding.canonical_repository) {
+        return Err(TyrionError::ControlDenied(
+            "the exact approved repository path resolves to a different repository".into(),
+        ));
+    }
+    let repository_metadata = fs::metadata(&binding.canonical_repository)?;
+    if repository_metadata.dev() != binding.repository_device
+        || repository_metadata.ino() != binding.repository_inode
+    {
+        return Err(TyrionError::ControlDenied(
+            "the approved repository identity changed before execution".into(),
+        ));
+    }
+    let directory = fs::File::from(
+        openat(
+            CWD,
+            binding.canonical_parent.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let directory_metadata = directory.metadata()?;
+    if directory_metadata.dev() != binding.parent_device
+        || directory_metadata.ino() != binding.parent_inode
+    {
+        return Err(TyrionError::ControlDenied(
+            "the approved target directory identity changed before execution".into(),
+        ));
+    }
+    let target_name = Path::new(&operation.target)
+        .file_name()
+        .ok_or_else(|| TyrionError::InvalidRequest("effect target has no file name".into()))?;
+    ensure_bound_target(&directory, target_name, binding)?;
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), TyrionError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TyrionError::InvalidRequest(
+            "observed_sha256 must be an exact 64-character hexadecimal digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn path_string(path: &Path) -> Result<String, TyrionError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| TyrionError::InvalidRequest("effect paths must contain valid UTF-8".into()))
+}
+
+fn sha256_reader(reader: &mut impl Read) -> Result<String, TyrionError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn classify_operation(
+    operation: &OperationRequest,
+    authority: &AuthorityEnvelope,
+) -> (OperationClassification, &'static str) {
+    let repository_authorized = operation.repository.as_ref().is_some_and(|repository| {
+        authority
+            .repositories
+            .iter()
+            .any(|authorized| authorized == repository)
+    });
+    let target_authorized = authority
+        .paths
+        .iter()
+        .any(|authorized| path_is_within_scope(&operation.target, authorized));
+    let action_authorized = authority
+        .actions
+        .iter()
+        .any(|authorized| authorized == &operation.operation);
+    let destination_authorized = operation.destination.as_ref().is_none_or(|destination| {
+        authority
+            .destinations
+            .iter()
+            .any(|authorized| authorized == destination)
+    });
+    let effect_authorized = operation.effect.as_ref().is_none_or(|effect| {
+        authority
+            .effects
+            .iter()
+            .any(|authorized| authorized == effect)
+    });
+    if !repository_authorized
+        || !target_authorized
+        || !action_authorized
+        || !destination_authorized
+        || !effect_authorized
+    {
+        return (
+            OperationClassification::Prohibited,
+            "the exact repository, target, action, destination, or effect is outside the current Authority Envelope",
+        );
+    }
+    match operation.operation.as_str() {
+        "repository.read" if operation.destination.is_none() && operation.effect.is_none() => (
+            OperationClassification::SilentJournaled,
+            "authorized read-only repository work is routine and journaled",
+        ),
+        "repository.edit" if operation.destination.is_none() && operation.effect.is_none() => (
+            OperationClassification::NonBlockingNotification,
+            "authorized reversible repository edits remain visible without blocking work",
+        ),
+        "filesystem.write"
+            if operation.destination.as_deref() == Some("local")
+                && operation.effect.as_deref() == Some("filesystem.write") =>
+        {
+            (
+                OperationClassification::ApprovalGate,
+                "the requested file replacement is a consequential effect requiring exact Principal approval",
+            )
+        }
+        _ => (
+            OperationClassification::Prohibited,
+            "the canonical operation is unsupported or its effect fields are inconsistent",
+        ),
+    }
+}
+
+fn ensure_current_operation_context(
+    connection: &Connection,
+    commission_id: &str,
+    operation: &OperationRequest,
+    expected_revision: i64,
+) -> Result<(), TyrionError> {
+    let context = connection
+        .query_row(
+            "SELECT commissions.status, commissions.revision, assignments.plan_revision,
+                    attempts.status, worker_leases.status, worker_leases.expires_at,
+                    worker_leases.mandate_revision
+             FROM commissions
+             JOIN assignments ON assignments.commission_id = commissions.id
+             JOIN attempts ON attempts.assignment_id = assignments.id
+             JOIN worker_leases ON worker_leases.attempt_id = attempts.id
+             WHERE commissions.id = ?1 AND assignments.id = ?2
+               AND attempts.id = ?3 AND worker_leases.id = ?4",
+            params![
+                commission_id,
+                operation.assignment_id,
+                operation.attempt_id,
+                operation.worker_lease_id,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            TyrionError::ControlDenied(
+                "operation does not identify a current Assignment, Attempt, and Worker Lease"
+                    .into(),
+            )
+        })?;
+    let (
+        commission_status,
+        current_revision,
+        plan_revision,
+        attempt_status,
+        lease_status,
+        expires_at,
+        lease_mandate_revision,
+    ) = context;
+    if current_revision != expected_revision {
+        return Err(TyrionError::StaleRevision {
+            expected: expected_revision,
+            actual: current_revision,
+        });
+    }
+    if commission_status != CommissionStatus::Active.as_str()
+        || operation.mandate_revision != current_revision
+        || operation.plan_revision != plan_revision
+        || attempt_status != AttemptStatus::Running.as_str()
+        || lease_status != WorkerLeaseStatus::Active.as_str()
+        || lease_mandate_revision != current_revision
+        || expires_at <= unix_timestamp()?
+    {
+        return Err(TyrionError::ControlDenied(
+            "operation authority is stale or no longer active".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn execute_file_replacement(
+    operation: &OperationRequest,
+    commission_storage_ceiling: u64,
+    binding: &FileEffectBinding,
+    effect_deadline: i64,
+    started: Instant,
+    leave_started_after_rename: bool,
+    hold_before_commit_milliseconds: u64,
+) -> Result<Value, FileEffectError> {
+    if operation.operation != "filesystem.write"
+        || operation.effect.as_deref() != Some("filesystem.write")
+        || operation.destination.as_deref() != Some("local")
+        || operation.parameters.len() != 1
+    {
+        return Err(TyrionError::ControlDenied(
+            "only the exact canonical filesystem.write effect can execute".into(),
+        )
+        .into());
+    }
+    let content = operation.parameters.get("content").ok_or_else(|| {
+        TyrionError::InvalidRequest("filesystem.write requires one content parameter".into())
+    })?;
+    let content_bytes = content.as_bytes();
+    if content_bytes.len() as u64 > operation.limits.max_output_bytes
+        || content_bytes.len() as u64 > commission_storage_ceiling
+    {
+        return Err(TyrionError::InvalidRequest(
+            "filesystem.write content exceeds the approved or Commission storage ceiling".into(),
+        )
+        .into());
+    }
+    let repository_metadata = fs::metadata(&binding.canonical_repository)?;
+    if repository_metadata.dev() != binding.repository_device
+        || repository_metadata.ino() != binding.repository_inode
+    {
+        return Err(TyrionError::ControlDenied(
+            "the approved repository identity changed before execution".into(),
+        )
+        .into());
+    }
+    let directory = fs::File::from(openat(
+        CWD,
+        binding.canonical_parent.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let directory_metadata = directory.metadata()?;
+    if directory_metadata.dev() != binding.parent_device
+        || directory_metadata.ino() != binding.parent_inode
+    {
+        return Err(TyrionError::ControlDenied(
+            "the approved target directory identity changed before execution".into(),
+        )
+        .into());
+    }
+    let target_name = Path::new(&operation.target)
+        .file_name()
+        .ok_or_else(|| TyrionError::InvalidRequest("effect target has no file name".into()))?;
+    let metadata = ensure_bound_target(&directory, target_name, binding)?;
+    let after_digest = format!("{:x}", Sha256::digest(content_bytes));
+    let temporary = format!(".tyrion-effect-{}", Uuid::new_v4());
+    let write_result = (|| -> Result<(), TyrionError> {
+        let mut file = fs::File::from(
+            openat(
+                &directory,
+                temporary.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(std::io::Error::from)?,
+        );
+        file.set_permissions(metadata.permissions())?;
+        for chunk in content_bytes.chunks(64 * 1024) {
+            ensure_effect_deadline(
+                started,
+                operation.limits.max_duration_seconds,
+                effect_deadline,
+            )?;
+            file.write_all(chunk)?;
+        }
+        ensure_effect_deadline(
+            started,
+            operation.limits.max_duration_seconds,
+            effect_deadline,
+        )?;
+        file.sync_all()?;
+        ensure_effect_deadline(
+            started,
+            operation.limits.max_duration_seconds,
+            effect_deadline,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
+        return Err(FileEffectError::Failed(error));
+    }
+    ensure_effect_deadline(
+        started,
+        operation.limits.max_duration_seconds,
+        effect_deadline,
+    )?;
+    ensure_bound_target(&directory, target_name, binding)?;
+    if hold_before_commit_milliseconds > 0 {
+        std::thread::sleep(Duration::from_millis(hold_before_commit_milliseconds));
+    }
+    ensure_effect_deadline(
+        started,
+        operation.limits.max_duration_seconds,
+        effect_deadline,
+    )?;
+    let displaced = format!(".tyrion-displaced-{}", Uuid::new_v4());
+    if let Err(error) =
+        rename_noreplace(&directory, target_name, &directory, OsStr::new(&displaced))
+    {
+        let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
+        return Err(FileEffectError::Failed(error.into()));
+    }
+    if let Err(error) = ensure_bound_target(&directory, OsStr::new(&displaced), binding) {
+        let restored =
+            rename_noreplace(&directory, OsStr::new(&displaced), &directory, target_name).is_ok();
+        let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
+        if restored {
+            return Err(FileEffectError::Failed(error));
+        }
+        return Err(uncertain_file_effect(
+            error,
+            UncertainEffectDetails {
+                operation,
+                binding,
+                bytes_written: content_bytes.len(),
+                after_sha256: &after_digest,
+                started,
+                effect_observed_after_rename: false,
+                requirement: "The target raced after approval and the approved inode could not be restored; reconcile it before resuming.",
+            },
+        ));
+    }
+    if let Err(error) = ensure_effect_deadline(
+        started,
+        operation.limits.max_duration_seconds,
+        effect_deadline,
+    ) {
+        let restored =
+            rename_noreplace(&directory, OsStr::new(&displaced), &directory, target_name).is_ok();
+        let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
+        if restored {
+            return Err(FileEffectError::Failed(error));
+        }
+        return Err(uncertain_file_effect(
+            error,
+            UncertainEffectDetails {
+                operation,
+                binding,
+                bytes_written: content_bytes.len(),
+                after_sha256: &after_digest,
+                started,
+                effect_observed_after_rename: false,
+                requirement: "The approved inode could not be restored after the deadline; reconcile it before resuming.",
+            },
+        ));
+    }
+    if let Err(error) =
+        rename_noreplace(&directory, OsStr::new(&temporary), &directory, target_name)
+    {
+        let restored =
+            rename_noreplace(&directory, OsStr::new(&displaced), &directory, target_name).is_ok();
+        let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
+        if restored {
+            return Err(FileEffectError::Failed(error.into()));
+        }
+        return Err(uncertain_file_effect(
+            error.into(),
+            UncertainEffectDetails {
+                operation,
+                binding,
+                bytes_written: content_bytes.len(),
+                after_sha256: &after_digest,
+                started,
+                effect_observed_after_rename: false,
+                requirement: "A concurrent target appeared and the approved inode could not be restored; reconcile it before resuming.",
+            },
+        ));
+    }
+    if let Err(error) =
+        rustix::fs::unlinkat(&directory, displaced.as_str(), rustix::fs::AtFlags::empty())
+    {
+        return Err(uncertain_file_effect(
+            std::io::Error::from(error).into(),
+            UncertainEffectDetails {
+                operation,
+                binding,
+                bytes_written: content_bytes.len(),
+                after_sha256: &after_digest,
+                started,
+                effect_observed_after_rename: true,
+                requirement: "The approved prior inode could not be removed after replacement; reconcile the target before resuming.",
+            },
+        ));
+    }
+    if let Err(error) = directory.sync_all() {
+        return Err(uncertain_file_effect(
+            error.into(),
+            UncertainEffectDetails {
+                operation,
+                binding,
+                bytes_written: content_bytes.len(),
+                after_sha256: &after_digest,
+                started,
+                effect_observed_after_rename: true,
+                requirement: "Reconcile the exact target before any linked Commission retries it.",
+            },
+        ));
+    }
+    if leave_started_after_rename {
+        return Err(FileEffectError::LeaveStartedAfterEffect);
+    }
+    if started.elapsed() > Duration::from_secs(operation.limits.max_duration_seconds) {
+        return Err(FileEffectError::Uncertain {
+            error: TyrionError::InvalidRequest(
+                "filesystem.write exceeded its exact duration limit while containing the committed effect"
+                    .into(),
+            ),
+            receipt: serde_json::json!({
+                "status": "uncertain",
+                "operation": operation.operation,
+                "repository": binding.canonical_repository,
+                "target": operation.target,
+                "bytes_written": content_bytes.len(),
+                "before_sha256": binding.before_sha256,
+                "after_sha256": after_digest,
+                "duration_millis": started.elapsed().as_millis(),
+                "effect_observed_after_rename": true,
+                "requirement": "Reconcile the exact target before any linked Commission retries it.",
+                "credential_used": false,
+                "secret_material_retained": false,
+            }),
+        });
+    }
+    Ok(serde_json::json!({
+        "status": "confirmed",
+        "operation": operation.operation,
+        "repository": binding.canonical_repository,
+        "target": operation.target,
+        "bytes_written": content_bytes.len(),
+        "before_sha256": binding.before_sha256,
+        "after_sha256": after_digest,
+        "duration_millis": started.elapsed().as_millis(),
+        "credential_used": false,
+        "secret_material_retained": false,
+    }))
+}
+
+fn ensure_effect_deadline(
+    started: Instant,
+    max_duration_seconds: u64,
+    effect_deadline: i64,
+) -> Result<(), TyrionError> {
+    if started.elapsed() >= Duration::from_secs(max_duration_seconds) {
+        return Err(TyrionError::InvalidRequest(
+            "filesystem.write reached its exact duration limit before committing the effect".into(),
+        ));
+    }
+    if unix_timestamp()? >= effect_deadline {
+        return Err(TyrionError::ControlDenied(
+            "filesystem.write reached its Worker Lease or Commission deadline before committing the effect"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rename_noreplace(
+    old_directory: &fs::File,
+    old_name: &OsStr,
+    new_directory: &fs::File,
+    new_name: &OsStr,
+) -> std::io::Result<()> {
+    let old_name = CString::new(old_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let new_name = CString::new(new_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            old_directory.as_raw_fd(),
+            old_name.as_ptr(),
+            new_directory.as_raw_fd(),
+            new_name.as_ptr(),
+            0x0000_0004,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            old_directory.as_raw_fd(),
+            old_name.as_ptr(),
+            new_directory.as_raw_fd(),
+            new_name.as_ptr(),
+            1_u32,
+        ) as libc::c_int
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ));
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+struct UncertainEffectDetails<'a> {
+    operation: &'a OperationRequest,
+    binding: &'a FileEffectBinding,
+    bytes_written: usize,
+    after_sha256: &'a str,
+    started: Instant,
+    effect_observed_after_rename: bool,
+    requirement: &'a str,
+}
+
+fn uncertain_file_effect(
+    error: TyrionError,
+    details: UncertainEffectDetails<'_>,
+) -> FileEffectError {
+    FileEffectError::Uncertain {
+        error,
+        receipt: serde_json::json!({
+            "status": "uncertain",
+            "operation": details.operation.operation,
+            "repository": details.binding.canonical_repository,
+            "target": details.operation.target,
+            "bytes_written": details.bytes_written,
+            "before_sha256": details.binding.before_sha256,
+            "after_sha256": details.after_sha256,
+            "duration_millis": details.started.elapsed().as_millis(),
+            "effect_observed_after_rename": details.effect_observed_after_rename,
+            "requirement": details.requirement,
+            "credential_used": false,
+            "secret_material_retained": false,
+        }),
+    }
+}
+
+enum FileEffectError {
+    Failed(TyrionError),
+    Uncertain { error: TyrionError, receipt: Value },
+    LeaveStartedAfterEffect,
+}
+
+fn ensure_bound_target(
+    directory: &fs::File,
+    target_name: &std::ffi::OsStr,
+    binding: &FileEffectBinding,
+) -> Result<fs::Metadata, TyrionError> {
+    let mut target = fs::File::from(
+        openat(
+            directory,
+            target_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    let metadata = target.metadata()?;
+    if !metadata.is_file()
+        || metadata.dev() != binding.target_device
+        || metadata.ino() != binding.target_inode
+        || sha256_reader(&mut target)? != binding.before_sha256
+    {
+        return Err(TyrionError::ControlDenied(
+            "the exact approved target revision changed before execution".into(),
+        ));
+    }
+    Ok(metadata)
+}
+
+impl From<TyrionError> for FileEffectError {
+    fn from(error: TyrionError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<std::io::Error> for FileEffectError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+impl From<rustix::io::Errno> for FileEffectError {
+    fn from(error: rustix::io::Errno) -> Self {
+        Self::Failed(std::io::Error::from(error).into())
+    }
 }
 
 fn ensure_acyclic_plan(plan: &CommissionPlan) -> Result<(), TyrionError> {

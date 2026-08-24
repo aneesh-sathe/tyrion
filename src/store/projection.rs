@@ -313,7 +313,7 @@ pub(super) fn inspect_commission(
                 attempts.status, attempts.started_at, attempts.completed_at,
                 attempts.started_at_ms, attempts.execution_completed_at_ms, attempts.completed_at_ms,
                 worker_leases.id, worker_leases.issued_at, worker_leases.expires_at,
-                worker_leases.released_at, worker_leases.status,
+                worker_leases.mandate_revision, worker_leases.released_at, worker_leases.status,
                 resource_reservations.concurrency_slots,
                 resource_reservations.storage_bytes,
                 resource_reservations.model_spend_cents,
@@ -336,8 +336,9 @@ pub(super) fn inspect_commission(
                     "id": id,
                     "issued_at": row.get::<_, i64>(10)?,
                     "expires_at": row.get::<_, i64>(11)?,
-                    "released_at": row.get::<_, Option<i64>>(12)?,
-                    "status": row.get::<_, String>(13)?,
+                    "mandate_revision": row.get::<_, i64>(12)?,
+                    "released_at": row.get::<_, Option<i64>>(13)?,
+                    "status": row.get::<_, String>(14)?,
                 })),
                 None => None,
             };
@@ -353,14 +354,14 @@ pub(super) fn inspect_commission(
                 "completed_at_ms": row.get::<_, Option<i64>>(8)?,
                 "lease": lease,
                 "reservation": {
-                    "concurrency_slots": row.get::<_, Option<u32>>(14)?,
-                    "storage_bytes": row.get::<_, Option<u64>>(15)?,
-                    "model_spend_cents": row.get::<_, Option<u64>>(16)?,
-                    "paid_service_spend_cents": row.get::<_, Option<u64>>(17)?,
-                    "status": row.get::<_, Option<String>>(18)?,
+                    "concurrency_slots": row.get::<_, Option<u32>>(15)?,
+                    "storage_bytes": row.get::<_, Option<u64>>(16)?,
+                    "model_spend_cents": row.get::<_, Option<u64>>(17)?,
+                    "paid_service_spend_cents": row.get::<_, Option<u64>>(18)?,
+                    "status": row.get::<_, Option<String>>(19)?,
                 },
-                "revision_disposition": row.get::<_, String>(19)?,
-                "cleanup_pending": row.get::<_, bool>(20)?,
+                "revision_disposition": row.get::<_, String>(20)?,
+                "cleanup_pending": row.get::<_, bool>(21)?,
             }))
         },
     )?;
@@ -433,6 +434,130 @@ pub(super) fn inspect_commission(
                 "status": row.get::<_, String>(5)?,
                 "created_at": row.get::<_, i64>(6)?,
                 "attachment_id": row.get::<_, String>(7)?,
+            }))
+        },
+    )?;
+    let operation_requests = query_values(
+        connection,
+        "SELECT id, assignment_id, attempt_id, worker_lease_id, mandate_revision,
+                plan_revision, operation, repository, target, parameters_json,
+                destination, effect, consequences_json, limits_json,
+                canonical_operation_json, operation_digest, classification, status,
+                classification_reason, proposed_at, authorized_at, started_at,
+                completed_at, receipt_json
+         FROM operation_requests WHERE commission_id = ?1
+         ORDER BY proposed_at, rowid",
+        commission_id,
+        |row| {
+            let receipt = row
+                .get::<_, Option<String>>(23)?
+                .map(|encoded| serde_json::from_str::<Value>(&encoded))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        23,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "assignment_id": row.get::<_, String>(1)?,
+                "attempt_id": row.get::<_, String>(2)?,
+                "worker_lease_id": row.get::<_, String>(3)?,
+                "mandate_revision": row.get::<_, i64>(4)?,
+                "plan_revision": row.get::<_, i64>(5)?,
+                "operation": row.get::<_, String>(6)?,
+                "repository": row.get::<_, Option<String>>(7)?,
+                "target": row.get::<_, String>(8)?,
+                "parameters": json_column(row, 9)?,
+                "destination": row.get::<_, Option<String>>(10)?,
+                "effect": row.get::<_, Option<String>>(11)?,
+                "consequences": json_column(row, 12)?,
+                "limits": json_column(row, 13)?,
+                "canonical_operation": json_column(row, 14)?,
+                "operation_digest": row.get::<_, String>(15)?,
+                "classification": row.get::<_, String>(16)?,
+                "status": row.get::<_, String>(17)?,
+                "classification_reason": row.get::<_, String>(18)?,
+                "proposed_at": row.get::<_, i64>(19)?,
+                "authorized_at": row.get::<_, Option<i64>>(20)?,
+                "started_at": row.get::<_, Option<i64>>(21)?,
+                "completed_at": row.get::<_, Option<i64>>(22)?,
+                "receipt": receipt,
+            }))
+        },
+    )?;
+    let approval_gates = query_values(
+        connection,
+        "SELECT approval_gates.id, approval_gates.operation_request_id,
+                approval_gates.operation_digest, approval_gates.status,
+                approval_gates.opened_at, approval_gates.authorized_at,
+                approval_gates.consumed_at, approval_gates.invalidated_at,
+                operation_requests.canonical_operation_json,
+                operation_requests.target, operation_requests.mandate_revision,
+                operation_requests.plan_revision, operation_requests.consequences_json,
+                operation_requests.limits_json
+         FROM approval_gates
+         JOIN operation_requests ON operation_requests.id = approval_gates.operation_request_id
+         WHERE approval_gates.commission_id = ?1
+         ORDER BY approval_gates.opened_at, approval_gates.rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "operation_request_id": row.get::<_, String>(1)?,
+                "operation_digest": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "opened_at": row.get::<_, i64>(4)?,
+                "authorized_at": row.get::<_, Option<i64>>(5)?,
+                "consumed_at": row.get::<_, Option<i64>>(6)?,
+                "invalidated_at": row.get::<_, Option<i64>>(7)?,
+                "canonical_operation": json_column(row, 8)?,
+                "exact_target": row.get::<_, String>(9)?,
+                "governing_revision": {
+                    "mandate": row.get::<_, i64>(10)?,
+                    "plan": row.get::<_, i64>(11)?,
+                },
+                "consequences": json_column(row, 12)?,
+                "limits": json_column(row, 13)?,
+                "confirmation_path": "principal_control",
+            }))
+        },
+    )?;
+    let commission_amendments = query_values(
+        connection,
+        "SELECT id, base_revision, authority_json, resource_ceilings_json, reason,
+                diff_json, amendment_digest, impact_json, revalidation_json, status,
+                proposed_at, accepted_at
+         FROM commission_amendments WHERE commission_id = ?1
+         ORDER BY proposed_at, rowid",
+        commission_id,
+        |row| {
+            let revalidation = row
+                .get::<_, Option<String>>(8)?
+                .map(|encoded| serde_json::from_str::<Value>(&encoded))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "base_revision": row.get::<_, i64>(1)?,
+                "authority": json_column(row, 2)?,
+                "resource_ceilings": json_column(row, 3)?,
+                "reason": row.get::<_, String>(4)?,
+                "diff": json_column(row, 5)?,
+                "amendment_digest": row.get::<_, String>(6)?,
+                "impact": json_column(row, 7)?,
+                "revalidation": revalidation,
+                "status": row.get::<_, String>(9)?,
+                "proposed_at": row.get::<_, i64>(10)?,
+                "accepted_at": row.get::<_, Option<i64>>(11)?,
             }))
         },
     )?;
@@ -936,6 +1061,27 @@ pub(super) fn inspect_commission(
             "exact_next_requirement": exact_next_requirement,
         })
     });
+    let irreversible_effects = operation_requests
+        .iter()
+        .filter(|operation| operation["status"] == "confirmed")
+        .map(|operation| {
+            json!({
+                "operation_request_id": operation["id"],
+                "operation_digest": operation["operation_digest"],
+                "receipt": operation["receipt"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let revoked_operation_request_ids = operation_requests
+        .iter()
+        .filter(|operation| operation["status"] == "revoked")
+        .map(|operation| operation["id"].clone())
+        .collect::<Vec<_>>();
+    let uncertain_operation_request_ids = operation_requests
+        .iter()
+        .filter(|operation| operation["status"] == "uncertain")
+        .map(|operation| operation["id"].clone())
+        .collect::<Vec<_>>();
     let recovery = json!({
         "state": recovery_state,
         "resumable": recovery_state == "paused" || recovery_state == "blocked",
@@ -946,6 +1092,9 @@ pub(super) fn inspect_commission(
             "integrated_artifact_revision": commission["artifact_revision"],
             "retained_results": results.len(),
             "retained_evidence": evidence.len(),
+            "irreversible_effects": irreversible_effects,
+            "revoked_operation_request_ids": revoked_operation_request_ids,
+            "affected_in_flight_operation_ids": uncertain_operation_request_ids,
         })),
     });
     let watchdog = json!({
@@ -973,6 +1122,9 @@ pub(super) fn inspect_commission(
         "attempts": attempts,
         "workers": workers,
         "worker_commands": worker_commands,
+        "operation_requests": operation_requests,
+        "approval_gates": approval_gates,
+        "commission_amendments": commission_amendments,
         "results": results,
         "evidence": evidence,
         "briefing": briefing,

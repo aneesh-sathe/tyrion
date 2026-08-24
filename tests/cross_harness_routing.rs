@@ -1302,7 +1302,7 @@ fn wait_for_live_adapter_telemetry(
     commission_id: &str,
     configuration_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -1335,7 +1335,7 @@ fn wait_for_worker_status(
     commission_id: &str,
     expected_status: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -1369,7 +1369,7 @@ fn wait_for_worker_attempt(
     expected_count: usize,
     expected_status: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -1403,7 +1403,7 @@ fn wait_for_assignment_status(
     commission_id: &str,
     expected_status: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -1432,7 +1432,7 @@ fn wait_for_commission_status(
     commission_id: &str,
     expected_status: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,

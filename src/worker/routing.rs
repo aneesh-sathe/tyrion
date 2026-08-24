@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{AssignmentResources, AuthorityEnvelope, WorkerRequirements};
+use crate::protocol::{AssignmentResources, WorkerRequirements};
 use crate::TyrionError;
 
 const REQUIRED_ADAPTER_CAPABILITIES: [&str; 7] = [
@@ -118,7 +118,7 @@ pub(super) struct RouteRequest<'a> {
     pub requirements: &'a WorkerRequirements,
     pub resources: &'a AssignmentResources,
     pub required_authority_action: &'a str,
-    pub authority: &'a AuthorityEnvelope,
+    pub required_authority_scope_types: &'a [&'a str],
     pub entry_harness: &'a str,
 }
 
@@ -619,19 +619,16 @@ fn failed_gates(
     {
         failures.push("authority_compatibility");
     }
-    let required_scope_types = [
-        (!request.authority.repositories.is_empty()).then_some("repository"),
-        (!request.authority.paths.is_empty()).then_some("path"),
-        (!request.authority.actions.is_empty()).then_some("action"),
-        (!request.authority.destinations.is_empty()).then_some("destination"),
-        (!request.authority.effects.is_empty()).then_some("effect"),
-    ];
-    if required_scope_types.into_iter().flatten().any(|required| {
-        !configuration
-            .authority_scope_types
-            .iter()
-            .any(|actual| actual == required)
-    }) {
+    if request
+        .required_authority_scope_types
+        .iter()
+        .any(|required| {
+            !configuration
+                .authority_scope_types
+                .iter()
+                .any(|actual| actual == *required)
+        })
+    {
         failures.push("authority_scope_compatibility");
     }
     let limits = &configuration.resource_limits;

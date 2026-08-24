@@ -13,6 +13,8 @@ struct Arguments {
     codex_worker_config: Option<PathBuf>,
     #[arg(long)]
     worker_catalog: Option<PathBuf>,
+    #[arg(long)]
+    principal_control_bootstrap_fd: Option<i32>,
     #[arg(long, hide = true)]
     fault_defer_ready_dispatch: bool,
     #[arg(long, hide = true)]
@@ -29,6 +31,12 @@ struct Arguments {
     fault_hold_worker_after_external_integration: bool,
     #[arg(long, hide = true)]
     fault_skip_sandbox_cleanup: bool,
+    #[arg(long, hide = true)]
+    fault_leave_effect_started: bool,
+    #[arg(long, hide = true)]
+    fault_leave_effect_started_after_rename: bool,
+    #[arg(long, default_value_t = 0, hide = true)]
+    fault_hold_effect_before_commit_milliseconds: u64,
     #[arg(long, default_value_t = 30_000, hide = true)]
     watchdog_stall_milliseconds: u64,
 }
@@ -41,12 +49,17 @@ fn main() {
         incorrect_first_worker_result: arguments.fault_incorrect_first_worker_result,
         codex_worker_config: arguments.codex_worker_config,
         worker_catalog: arguments.worker_catalog,
+        principal_control_bootstrap_fd: arguments.principal_control_bootstrap_fd,
         hold_worker_for_control: arguments.fault_hold_worker_for_control,
         hold_worker_before_integration: arguments.fault_hold_worker_before_integration,
         hold_worker_after_integration: arguments.fault_hold_worker_after_integration,
         hold_worker_after_external_integration: arguments
             .fault_hold_worker_after_external_integration,
         skip_sandbox_cleanup: arguments.fault_skip_sandbox_cleanup,
+        leave_effect_started: arguments.fault_leave_effect_started,
+        leave_effect_started_after_rename: arguments.fault_leave_effect_started_after_rename,
+        hold_effect_before_commit_milliseconds: arguments
+            .fault_hold_effect_before_commit_milliseconds,
         watchdog_stall_milliseconds: arguments.watchdog_stall_milliseconds,
     };
     if let Err(error) =

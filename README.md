@@ -1,6 +1,6 @@
 # Tyrion
 
-Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6), and inspectable cross-harness Worker routing and control from [issue #7](https://github.com/aneesh-sathe/tyrion/issues/7). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
+Tyrion is a durable local Control Plane for software-building Commissions. The walking skeleton implements the deterministic lifecycle from [issue #2](https://github.com/aneesh-sathe/tyrion/issues/2), the durable Entry Session attachment contract from [issue #3](https://github.com/aneesh-sathe/tyrion/issues/3), the contained Codex Git path from [issue #4](https://github.com/aneesh-sathe/tyrion/issues/4), the verification and rework kernel from [issue #5](https://github.com/aneesh-sathe/tyrion/issues/5), useful conflict-aware parallel Assignments from [issue #6](https://github.com/aneesh-sathe/tyrion/issues/6), inspectable cross-harness Worker routing and control from [issue #7](https://github.com/aneesh-sathe/tyrion/issues/7), and exact consequential-effect authorization from [issue #9](https://github.com/aneesh-sathe/tyrion/issues/9). A Principal connects an explicit Entry Session, reviews and accepts a proposal through the Active Attachment, and receives Verified Completion only after current integrated Evidence passes.
 
 ## What exists
 
@@ -42,6 +42,8 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - A daemon Watchdog that contains the narrowest stalled, unhealthy, over-budget, non-live, or unauthorized Attempt
 - Fail-closed restart reconciliation with explicit identity, acknowledgement, lease, authority, and containment proofs
 - Durable pause, resume, and Principal cancellation with lease and reservation revocation
+- Exact operation classification, independent Principal Approval Gates, and single-use effect authorization
+- Revision-bound Commission Amendments with exact diffs and affected-work revalidation
 - Actionable resumable Blockers containing criteria, Evidence, artifacts, failed approaches, resource use, and the exact next requirement
 - Structured Codex app-server and Claude Agent SDK lifecycle contract validation
 - Approximately equal replacement or a durable Attention Condition when a preferred configuration is unavailable
@@ -260,6 +262,56 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --expected-revision CURRENT_REVISION \
   --idempotency-key cancel-1
 ```
+
+Workers propose operations through the Active Attachment. The daemon classifies each request as `silent_journaled`, `non_blocking_notification`, `approval_gate`, or `prohibited`. Classification is bound to the current Commission and plan revisions, Assignment, Attempt, Worker Lease, exact repository and target, parameters, destination, effect, consequences, and limits. Capability declarations, installed tools, ambient machine access, prior approvals, and requested outcomes never add authority.
+
+A consequential `filesystem.write` remains blocked until the Principal approves its canonical digest through an ephemeral control credential. A trusted launcher may create an anonymous private pipe, inherit its write end as a dedicated descriptor numbered 3 or greater, and pass that number with `--principal-control-bootstrap-fd`. The daemon rejects absent and non-pipe descriptors, writes one `TYRION_PRINCIPAL_CONTROL_TOKEN=...` line, closes the descriptor immediately, retains only the hash, and never writes the secret to disk or sends it to standard output, an Attachment, or a Worker. Without that option, Principal control remains deliberately unavailable. The launcher must keep the read end out of logs, repositories, harness environments, and Worker sandboxes. After the launcher obtains the token, a typical flow is:
+
+```sh
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  operation propose COMMISSION_ID \
+  --file operation.json \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key propose-effect-1
+
+printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --principal-token-stdin principal inspect-gate APPROVAL_GATE_ID
+
+printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --principal-token-stdin principal approve-gate COMMISSION_ID APPROVAL_GATE_ID \
+  --expected-operation-digest OPERATION_DIGEST \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key approve-effect-1
+
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  operation execute COMMISSION_ID APPROVAL_GATE_ID \
+  --file operation.json \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key execute-effect-1
+```
+
+Execution accepts only the canonical request represented by the approved digest, including the canonical repository, directory and target identities, and before-content digest. It consumes the gate once and records a redacted receipt. Changed parameters, target identity or content revision, destination, effect, mandate revision, or replay are rejected. The current implementation uses descriptor-relative, no-follow access and atomic replacement of an existing regular file within the exact authorized repository and path.
+
+Replacement moves the current target aside without overwriting anything, verifies that the moved inode and digest are exactly those approved, then installs the prepared file with an atomic no-replace rename. A concurrent target change therefore fails closed rather than being overwritten. If restart recovery cannot prove whether a started effect committed, Tyrion marks it uncertain and pauses the Commission. The Principal must independently observe the exact target digest and reconcile it before the Commission can resume:
+
+```sh
+printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --principal-token-stdin principal reconcile-operation \
+  COMMISSION_ID OPERATION_REQUEST_ID \
+  --outcome confirmed \
+  --observed-sha256 OBSERVED_TARGET_SHA256 \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key reconcile-effect-1
+```
+
+Use `--outcome not-applied` only when both Principal observation and Tyrion's independent no-follow observation match the approved before-content digest. Execution replay after recovery returns the stored uncertain projection rather than attempting the effect again.
+
+Authority or ceiling expansion uses `commission propose-amendment` with the complete replacement Authority Envelope and resource ceilings. The Principal inspects the exact diff with `principal inspect-amendment` and accepts its digest with `principal accept-amendment`. Acceptance advances the mandate revision, invalidates pending effect grants, and revalidates every active Worker Lease. Operations approaching the storage ceiling notify the Active Attachment; operations beyond it are prohibited until an Amendment is accepted. Cancellation revokes pending grants and Leases, marks started effects uncertain, and retains confirmed irreversible receipts.
 
 Commission inspection exposes `recovery_history`, `restart_recoveries`, `watchdog`, and a derived `recovery` briefing. When no useful safe frontier remains, `recovery.resumable_blocker` names passed and unresolved criteria, retained artifacts and Evidence, failed approaches, cumulative resource use, and the exact requirement for progress.
 
