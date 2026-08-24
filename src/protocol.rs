@@ -314,6 +314,15 @@ pub enum Command {
     AcceptCommission {
         commission_id: String,
     },
+    PauseCommission {
+        commission_id: String,
+    },
+    ResumeCommission {
+        commission_id: String,
+    },
+    CancelCommission {
+        commission_id: String,
+    },
     RecordVerificationEvidence {
         commission_id: String,
         evidence: Box<VerificationEvidenceSubmission>,

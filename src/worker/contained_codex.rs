@@ -412,15 +412,61 @@ impl ContainedCodexRuntime {
     }
 
     pub(super) fn cleanup_stranded_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
-        for prefix in ["adapter", "attempt"] {
-            let name = sandbox_name(prefix, attempt_id);
+        let mut sandboxes = vec![
+            sandbox_name("adapter", attempt_id),
+            sandbox_name("attempt", attempt_id),
+        ];
+        for scope in ["candidate", "integrated"] {
+            for verification_index in 1..=2 {
+                sandboxes.push(sandbox_name(
+                    scope,
+                    &format!("{attempt_id}-verification-{verification_index}"),
+                ));
+            }
+        }
+        for name in sandboxes {
             let output = Command::new(&self.config.openshell_binary)
-                .args(["sandbox", "delete", &name])
+                .args(["sandbox", "delete", name.as_str()])
                 .env_clear()
                 .env("XDG_CONFIG_HOME", &self.config.openshell_config_home)
                 .output()?;
             require_success("stranded OpenShell sandbox cleanup", output)?;
         }
+        Ok(())
+    }
+
+    pub(super) fn restore_integration_repository(
+        &self,
+        commission_id: &str,
+        durable_revision: &str,
+    ) -> Result<(), TyrionError> {
+        let integration_root = self.data_dir.join("integrations").join(commission_id);
+        let repository = integration_root.join("repository");
+        if !repository.exists() {
+            return Ok(());
+        }
+        let integration_lock_path = integration_root.join("integration.lock");
+        let integration_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&integration_lock_path)?;
+        fs::set_permissions(&integration_lock_path, fs::Permissions::from_mode(0o600))?;
+        integration_lock.lock_exclusive()?;
+        git_checked(
+            Some(&repository),
+            &[os("reset"), os("--hard"), os(durable_revision)],
+        )?;
+        git_checked(
+            Some(&repository),
+            &[
+                os("branch"),
+                os("-f"),
+                os("tyrion-integration"),
+                os(durable_revision),
+            ],
+        )?;
         Ok(())
     }
 

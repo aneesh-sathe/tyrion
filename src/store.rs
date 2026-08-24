@@ -33,6 +33,13 @@ pub struct Store {
     connection: Connection,
 }
 
+pub(crate) struct PendingCleanup {
+    pub(crate) attempt_id: String,
+    pub(crate) commission_id: String,
+    pub(crate) execution: ExecutionSpec,
+    pub(crate) artifact_revision: Option<String>,
+}
+
 struct ReadyAssignmentDispatch {
     assignment_id: String,
     logical_id: String,
@@ -100,6 +107,27 @@ struct VerifiedCommissionCompletion<'a> {
     mandate_revision: i64,
     artifact_revision: &'a str,
     goal: &'a str,
+}
+
+struct AttemptRecovery<'a> {
+    commission_id: &'a str,
+    assignment_id: &'a str,
+    attempt_id: &'a str,
+    cause: &'a str,
+    classification: &'a str,
+    equivalence_key: &'a str,
+    action: &'a str,
+    requirement: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum AttemptContinuation {
+    Current,
+    Cancelled,
+    Stale {
+        commission_revision: i64,
+        attempt_running: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -184,21 +212,32 @@ impl Store {
     pub fn open(database_path: &Path) -> Result<Self, TyrionError> {
         let connection = Connection::open(database_path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        let journal_mode =
+            connection.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        let backup_path = if schema::migration_required(&connection)? {
+        let initialized = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'commissions'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let migration_required = initialized && schema::migration_required(&connection)?;
+        let backup_path = if migration_required {
             let backup_path = schema::migration_backup_path(database_path)?;
             schema::create_backup(&connection, &backup_path)?;
             Some(backup_path)
         } else {
             None
         };
-        let migration = (|| {
+        if !initialized || migration_required {
             connection.execute_batch(schema::SCHEMA)?;
             schema::migrate(&connection)?;
-            schema::verify(&connection)
-        })();
-        migration?;
+        }
+        schema::verify(&connection)?;
         if let Some(backup_path) = backup_path {
             fs::remove_file(backup_path)?;
         }
@@ -554,6 +593,261 @@ impl Store {
                 "reason": "principal_retried_interrupted_worker",
                 "prior_worker_handle": worker_handle,
                 "attachment_id": attachment_id,
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn pause_commission(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+    ) -> Result<Value, TyrionError> {
+        self.change_commission_dispatch_state(
+            request,
+            commission_id,
+            CommissionStatus::Active,
+            CommissionStatus::Paused,
+            EventKind::CommissionPaused,
+        )
+    }
+
+    pub fn resume_commission(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+    ) -> Result<Value, TyrionError> {
+        self.change_commission_dispatch_state(
+            request,
+            commission_id,
+            CommissionStatus::Paused,
+            CommissionStatus::Active,
+            EventKind::CommissionResumed,
+        )
+    }
+
+    fn change_commission_dispatch_state(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        expected_status: CommissionStatus,
+        next_status: CommissionStatus,
+        event: EventKind,
+    ) -> Result<Value, TyrionError> {
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(format!(
+                "Commission {} requires an expected Commission revision",
+                next_status.as_str()
+            ))
+        })?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+        let (status, revision) = transaction
+            .query_row(
+                "SELECT status, revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            });
+        }
+        if status != expected_status.as_str() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Commission {commission_id} is {status}; expected {}",
+                expected_status.as_str()
+            )));
+        }
+        transaction.execute(
+            "UPDATE commissions SET status = ?2 WHERE id = ?1",
+            params![commission_id, next_status.as_str()],
+        )?;
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            event,
+            revision,
+            &serde_json::json!({
+                "attachment_id": attachment_id,
+                "dispatch_enabled": next_status == CommissionStatus::Active,
+                "resumable": next_status == CommissionStatus::Paused,
+            }),
+        )?;
+        let result = project_commission(&transaction, commission_id)?;
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn cancel_commission(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        runtime: &worker::WorkerRuntime,
+    ) -> Result<Value, TyrionError> {
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Commission cancellation requires an expected Commission revision".into(),
+            )
+        })?;
+        let integration_lock = runtime.commission_integration_lock(commission_id)?;
+        let _integration_guard = integration_lock.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Commission Integration lock is unavailable".into())
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_ACCEPTANCE,
+        )?;
+        let (status, revision) = transaction
+            .query_row(
+                "SELECT status, revision FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        if revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            });
+        }
+        if status != CommissionStatus::Active.as_str()
+            && status != CommissionStatus::Paused.as_str()
+        {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Commission {commission_id} is {status}; only active or paused work can be cancelled"
+            )));
+        }
+        let running_attempts = {
+            let mut statement = transaction.prepare(
+                "SELECT attempts.id, attempts.assignment_id
+                 FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 WHERE assignments.commission_id = ?1 AND attempts.status = 'running'",
+            )?;
+            let rows = statement.query_map([commission_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (attempt_id, _) in &running_attempts {
+            let _ = runtime.cancel_attempt(attempt_id);
+        }
+        let now = unix_timestamp()?;
+        let now_ms = unix_timestamp_millis()?;
+        transaction.execute(
+            "UPDATE commissions SET status = ?2, completed_at = ?3 WHERE id = ?1",
+            params![commission_id, CommissionStatus::Cancelled.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET status = ?2
+             WHERE commission_id = ?1 AND status NOT IN ('accepted', 'superseded')",
+            params![commission_id, AssignmentStatus::Cancelled.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE attempts
+             SET status = ?2, completed_at = ?3, completed_at_ms = ?4,
+                 execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?4),
+                 revision_disposition = 'retained'
+             WHERE assignment_id IN (SELECT id FROM assignments WHERE commission_id = ?1)
+               AND status = 'running'",
+            params![
+                commission_id,
+                AttemptStatus::Cancelled.as_str(),
+                now,
+                now_ms
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE workers
+             SET status = ?2, latest_activity = 'Commission cancelled by the Principal',
+                 activity_at_ms = ?3
+             WHERE commission_id = ?1 AND status = 'running'",
+            params![commission_id, AttemptStatus::Cancelled.as_str(), now_ms],
+        )?;
+        transaction.execute(
+            "UPDATE worker_commands SET status = 'failed'
+             WHERE commission_id = ?1 AND status = 'pending'",
+            [commission_id],
+        )?;
+        transaction.execute(
+            "UPDATE worker_leases SET status = 'revoked', released_at = ?2
+             WHERE attempt_id IN (
+                 SELECT attempts.id FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 WHERE assignments.commission_id = ?1
+             ) AND status = 'active'",
+            params![commission_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE resource_reservations SET status = 'revoked', released_at = ?2
+             WHERE commission_id = ?1 AND status = 'active'",
+            params![commission_id, now_ms],
+        )?;
+        transaction.execute(
+            "UPDATE results SET revision_disposition = 'retained'
+             WHERE attempt_id IN (
+                 SELECT attempts.id FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 WHERE assignments.commission_id = ?1
+             ) AND status != 'accepted'",
+            [commission_id],
+        )?;
+        for (attempt_id, assignment_id) in &running_attempts {
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: "principal_cancellation",
+                    classification: "cancelled",
+                    equivalence_key: "principal_cancellation",
+                    action: "cancel",
+                    requirement: "Create a linked Commission to continue cancelled work.",
+                },
+            )?;
+        }
+        record_event_with_payload(
+            &transaction,
+            commission_id,
+            EventKind::CommissionCancelled,
+            revision,
+            &serde_json::json!({
+                "attachment_id": attachment_id,
+                "revoked_attempt_ids": running_attempts.iter().map(|item| &item.0).collect::<Vec<_>>(),
+                "authority_grants_revoked": true,
+                "rollback_claimed": false,
             }),
         )?;
         let result = project_commission(&transaction, commission_id)?;
@@ -944,18 +1238,27 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn recover_stranded_attempts(&mut self) -> Result<Vec<String>, TyrionError> {
+    pub fn recover_stranded_attempts(&mut self) -> Result<Vec<PendingCleanup>, TyrionError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stranded = {
             let mut statement = transaction.prepare(
                 "SELECT attempts.id, attempts.assignment_id, assignments.commission_id,
-                        commissions.revision
+                        commissions.revision, worker_leases.expires_at,
+                        commissions.execution_json,
+                        EXISTS(
+                            SELECT 1 FROM results
+                            WHERE results.attempt_id = attempts.id
+                              AND commissions.artifact_revision IS NOT NULL
+                              AND results.integrated_artifact_revision = commissions.artifact_revision
+                        )
                  FROM attempts
                  JOIN assignments ON assignments.id = attempts.assignment_id
                  JOIN commissions ON commissions.id = assignments.commission_id
+                 JOIN worker_leases ON worker_leases.attempt_id = attempts.id
                  WHERE attempts.status = 'running'
+                   AND commissions.status IN ('active', 'paused')
                  ORDER BY attempts.started_at, attempts.id",
             )?;
             let rows = statement.query_map([], |row| {
@@ -964,13 +1267,25 @@ impl Store {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(6)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let now = unix_timestamp()?;
         let now_ms = unix_timestamp_millis()?;
-        for (attempt_id, assignment_id, commission_id, revision) in &stranded {
+        for (
+            attempt_id,
+            assignment_id,
+            commission_id,
+            revision,
+            lease_expires_at,
+            execution_json,
+            acknowledged_state,
+        ) in &stranded
+        {
             transaction.execute(
                 "INSERT OR IGNORE INTO sandbox_cleanups (attempt_id, created_at)
                  VALUES (?1, ?2)",
@@ -980,9 +1295,18 @@ impl Store {
                 "UPDATE attempts
                  SET status = 'failed', completed_at = ?2,
                      execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?3),
-                     completed_at_ms = ?3
+                     completed_at_ms = ?3, revision_disposition = ?4
                  WHERE id = ?1 AND status = 'running'",
-                params![attempt_id, now, now_ms],
+                params![
+                    attempt_id,
+                    now,
+                    now_ms,
+                    if *acknowledged_state {
+                        "requires_revalidation"
+                    } else {
+                        "retained"
+                    }
+                ],
             )?;
             transaction.execute(
                 "UPDATE worker_leases
@@ -1006,6 +1330,32 @@ impl Store {
                     now_ms
                 ],
             )?;
+            if *acknowledged_state {
+                transaction.execute(
+                    "UPDATE results
+                     SET status = 'candidate', revision_disposition = 'requires_revalidation'
+                     WHERE attempt_id = ?1 AND integrated_artifact_revision = (
+                         SELECT artifact_revision FROM commissions WHERE id = ?2
+                     )",
+                    params![attempt_id, commission_id],
+                )?;
+                transaction.execute(
+                    "UPDATE results
+                     SET status = 'superseded', revision_disposition = 'retained'
+                     WHERE attempt_id = ?1 AND status != 'accepted'
+                       AND integrated_artifact_revision IS NOT (
+                           SELECT artifact_revision FROM commissions WHERE id = ?2
+                       )",
+                    params![attempt_id, commission_id],
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE results
+                     SET status = 'superseded', revision_disposition = 'retained'
+                     WHERE attempt_id = ?1 AND status != 'accepted'",
+                    [attempt_id],
+                )?;
+            }
             transaction.execute(
                 "UPDATE worker_commands
                  SET status = 'failed'
@@ -1015,8 +1365,211 @@ impl Store {
                 [attempt_id],
             )?;
             transaction.execute(
-                "UPDATE assignments SET status = 'ready' WHERE id = ?1 AND status = 'running'",
+                "INSERT OR IGNORE INTO watchdog_findings (
+                    id, commission_id, assignment_id, attempt_id, signal, action, details, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'lost_liveness', 'contain_attempt', ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    "Control Plane restart found a durable running Attempt without a provable live Worker identity.",
+                    now,
+                ],
+            )?;
+            let attempt_count = transaction.query_row(
+                "SELECT COUNT(*) FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 WHERE assignments.commission_id = ?1",
+                [commission_id],
+                |row| row.get::<_, u32>(0),
+            )?;
+            let max_attempts = transaction.query_row(
+                "SELECT max_attempts FROM resource_ceilings WHERE commission_id = ?1",
+                [commission_id],
+                |row| row.get::<_, u32>(0),
+            )?;
+            let prior_equivalent_failures = transaction.query_row(
+                "SELECT COUNT(*) FROM attempt_recoveries
+                 WHERE assignment_id = ?1 AND equivalence_key = 'lost_liveness'",
                 [assignment_id],
+                |row| row.get::<_, u32>(0),
+            )?;
+            let execution: ExecutionSpec = serde_json::from_str(execution_json)?;
+            let current_authority =
+                attempt_authority_is_current(&transaction, commission_id, attempt_id, &execution)?;
+            let within_attempt_ceiling = attempt_count < max_attempts;
+            let retry_safe = !*acknowledged_state
+                && current_authority
+                && within_attempt_ceiling
+                && prior_equivalent_failures == 0;
+            let replan_required = !*acknowledged_state
+                && current_authority
+                && within_attempt_ceiling
+                && prior_equivalent_failures > 0;
+            let decision = if retry_safe {
+                "expire_and_retry"
+            } else if replan_required {
+                "expire_and_replan"
+            } else {
+                "expire_and_block"
+            };
+            let requirement = if *acknowledged_state {
+                "Revalidate the retained integrated Result against the current mandate before any further execution."
+            } else if retry_safe {
+                "Retry only after sandbox cleanup confirms containment; native reattachment was not proven."
+            } else if replan_required {
+                "Revise the Assignment and use a different eligible Worker Configuration; a second equivalent lost-liveness failure exhausted same-configuration retry."
+            } else if !current_authority {
+                "Restore the currently required execution authority in a linked Commission; restart reconciliation could not prove current authority."
+            } else {
+                "Increase max_attempts in a linked Commission; native reattachment was not proven."
+            };
+            let assignment_status = if *acknowledged_state {
+                AssignmentStatus::VerificationFailed
+            } else if retry_safe {
+                AssignmentStatus::Ready
+            } else if replan_required {
+                AssignmentStatus::AttentionRequired
+            } else {
+                AssignmentStatus::ResourceBlocked
+            };
+            transaction.execute(
+                "UPDATE assignments SET status = ?2 WHERE id = ?1 AND status = 'running'",
+                params![assignment_id, assignment_status.as_str()],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO restart_recoveries (
+                    attempt_id, commission_id, decision, process_identity,
+                    native_session_identity, acknowledged_state, lease_validity,
+                    current_authority, containment, cleanup_confirmed, requirement, created_at
+                 ) VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, 0, 0, ?7, ?8)",
+                params![
+                    attempt_id,
+                    commission_id,
+                    decision,
+                    acknowledged_state,
+                    *lease_expires_at > now,
+                    current_authority,
+                    requirement,
+                    now,
+                ],
+            )?;
+            if replan_required {
+                let next_plan_revision = transaction.query_row(
+                    "SELECT COALESCE(MAX(revision), 0) + 1 FROM commission_plans
+                     WHERE commission_id = ?1",
+                    [commission_id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let snapshot = serde_json::json!({
+                    "reason": "second_equivalent_restart_failure",
+                    "assignment_id": assignment_id,
+                    "attempt_id": attempt_id,
+                    "equivalence_key": "lost_liveness",
+                    "requirement": requirement,
+                });
+                transaction.execute(
+                    "INSERT INTO commission_plans (
+                        commission_id, revision, source, reason, snapshot_json, created_at
+                     ) VALUES (?1, ?2, 'control_plane',
+                               'second equivalent restart failure', ?3, ?4)",
+                    params![
+                        commission_id,
+                        next_plan_revision,
+                        serde_json::to_string(&snapshot)?,
+                        now,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO attention_conditions (
+                        id, commission_id, assignment_id, code, requirement, status, created_at
+                     ) VALUES (?1, ?2, ?3, 'replan_required', ?4, 'open', ?5)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        commission_id,
+                        assignment_id,
+                        requirement,
+                        now,
+                    ],
+                )?;
+                record_event_with_payload(
+                    &transaction,
+                    commission_id,
+                    EventKind::PlanRevised,
+                    *revision,
+                    &serde_json::json!({
+                        "plan_revision": next_plan_revision,
+                        "reason": "second_equivalent_restart_failure",
+                        "assignment_id": assignment_id,
+                    }),
+                )?;
+            } else if !retry_safe {
+                let blocker_code = if *acknowledged_state {
+                    "integrated_revalidation"
+                } else if current_authority {
+                    "max_attempts"
+                } else {
+                    "current_authority"
+                };
+                transaction.execute(
+                    "INSERT INTO blockers (
+                        id, commission_id, assignment_id, code, requirement, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        commission_id,
+                        assignment_id,
+                        blocker_code,
+                        requirement,
+                        now,
+                    ],
+                )?;
+            }
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: if *acknowledged_state {
+                        "acknowledged_integrated_state"
+                    } else {
+                        "lost_liveness"
+                    },
+                    classification: if *acknowledged_state {
+                        "repairable_context"
+                    } else if current_authority {
+                        "transient"
+                    } else {
+                        "authority"
+                    },
+                    equivalence_key: if *acknowledged_state {
+                        "integrated_revalidation"
+                    } else {
+                        "lost_liveness"
+                    },
+                    action: if retry_safe {
+                        "retry"
+                    } else if replan_required {
+                        "replan"
+                    } else {
+                        "block"
+                    },
+                    requirement,
+                },
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::RestartReconciled,
+                *revision,
+                &serde_json::json!({
+                    "attempt_id": attempt_id,
+                    "decision": decision,
+                    "all_reattachment_proofs_satisfied": false,
+                    "cleanup_required": true,
+                }),
             )?;
             record_event_with_payload(
                 &transaction,
@@ -1030,21 +1583,54 @@ impl Store {
                     "terminal_state": "failed",
                 }),
             )?;
-            record_event_with_payload(
-                &transaction,
-                commission_id,
-                EventKind::AssignmentReady,
-                *revision,
-                &serde_json::json!({
-                    "assignment_id": assignment_id,
-                    "reason": "stranded_attempt_recovered",
-                }),
-            )?;
+            if retry_safe {
+                record_event_with_payload(
+                    &transaction,
+                    commission_id,
+                    EventKind::AssignmentReady,
+                    *revision,
+                    &serde_json::json!({
+                        "assignment_id": assignment_id,
+                        "reason": "stranded_attempt_recovered",
+                    }),
+                )?;
+            } else {
+                record_event_with_payload(
+                    &transaction,
+                    commission_id,
+                    EventKind::AssignmentBlocked,
+                    *revision,
+                    &serde_json::json!({
+                        "assignment_id": assignment_id,
+                        "reason": if replan_required {
+                            "second_equivalent_restart_failure"
+                        } else {
+                            "restart_recovery_blocked"
+                        },
+                    }),
+                )?;
+            }
         }
         let pending_cleanups = {
-            let mut statement = transaction
-                .prepare("SELECT attempt_id FROM sandbox_cleanups ORDER BY created_at")?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut statement = transaction.prepare(
+                "SELECT sandbox_cleanups.attempt_id, assignments.commission_id,
+                        commissions.execution_json, commissions.artifact_revision
+                 FROM sandbox_cleanups
+                 JOIN attempts ON attempts.id = sandbox_cleanups.attempt_id
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 JOIN commissions ON commissions.id = assignments.commission_id
+                 ORDER BY sandbox_cleanups.created_at, sandbox_cleanups.attempt_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let execution_json = row.get::<_, String>(2)?;
+                Ok(PendingCleanup {
+                    attempt_id: row.get(0)?,
+                    commission_id: row.get(1)?,
+                    execution: serde_json::from_str(&execution_json)
+                        .map_err(|error| invalid_json_column(2, error))?,
+                    artifact_revision: row.get(3)?,
+                })
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         transaction.commit()?;
@@ -1052,11 +1638,250 @@ impl Store {
     }
 
     pub fn complete_sandbox_cleanup(&mut self, attempt_id: &str) -> Result<(), TyrionError> {
-        self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "DELETE FROM sandbox_cleanups WHERE attempt_id = ?1",
             [attempt_id],
         )?;
+        transaction.execute(
+            "UPDATE restart_recoveries SET cleanup_confirmed = 1 WHERE attempt_id = ?1",
+            [attempt_id],
+        )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn watchdog_sweep(
+        &mut self,
+        runtime: &worker::WorkerRuntime,
+        stall_milliseconds: u64,
+    ) -> Result<Vec<String>, TyrionError> {
+        let now = unix_timestamp()?;
+        let now_ms = unix_timestamp_millis()?;
+        let running = {
+            let mut statement = self.connection.prepare(
+                "SELECT attempts.id, attempts.assignment_id, assignments.commission_id,
+                        commissions.revision, workers.activity_at_ms, worker_leases.id,
+                        worker_leases.expires_at,
+                        resource_reservations.concurrency_slots,
+                        resource_reservations.storage_bytes,
+                        resource_ceilings.max_worker_concurrency,
+                        resource_ceilings.max_storage_bytes, commissions.execution_json
+                 FROM attempts
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 JOIN commissions ON commissions.id = assignments.commission_id
+                 JOIN workers ON workers.attempt_id = attempts.id
+                 JOIN worker_leases ON worker_leases.attempt_id = attempts.id
+                 JOIN resource_reservations ON resource_reservations.attempt_id = attempts.id
+                 JOIN resource_ceilings ON resource_ceilings.commission_id = commissions.id
+                 WHERE attempts.status = 'running' AND commissions.status IN ('active', 'paused')
+                 ORDER BY attempts.started_at_ms DESC, attempts.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, u32>(7)?,
+                    row.get::<_, u64>(8)?,
+                    row.get::<_, u32>(9)?,
+                    row.get::<_, u64>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut resource_containment_started = HashSet::new();
+        let mut redispatch_commissions = HashSet::new();
+        for (
+            attempt_id,
+            assignment_id,
+            commission_id,
+            revision,
+            persisted_activity_at_ms,
+            lease_id,
+            _lease_expires_at,
+            _reserved_concurrency,
+            _reserved_storage,
+            max_concurrency,
+            max_storage,
+            execution_json,
+        ) in running
+        {
+            let execution: ExecutionSpec = serde_json::from_str(&execution_json)?;
+            let authority_valid = attempt_authority_is_current(
+                &self.connection,
+                &commission_id,
+                &attempt_id,
+                &execution,
+            )?;
+            let retry_pattern = self.connection.query_row(
+                "SELECT COALESCE(MAX(repeats), 0) FROM (
+                    SELECT COUNT(*) AS repeats FROM attempt_recoveries
+                    WHERE commission_id = ?1 AND assignment_id = ?2
+                    GROUP BY equivalence_key
+                 )",
+                params![commission_id, assignment_id],
+                |row| row.get::<_, u32>(0),
+            )?;
+            let (active_concurrency, active_storage) = self.connection.query_row(
+                "SELECT COALESCE(SUM(concurrency_slots), 0), COALESCE(SUM(storage_bytes), 0)
+                 FROM resource_reservations
+                 WHERE commission_id = ?1 AND status = 'active'",
+                [&commission_id],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?)),
+            )?;
+            let repeated_verification = self.connection.query_row(
+                "SELECT COUNT(*) FROM evidence
+                 JOIN attempts ON attempts.id = evidence.producer_attempt_id
+                 WHERE evidence.commission_id = ?1 AND attempts.assignment_id = ?2
+                   AND evidence.outcome = 'failed'",
+                params![commission_id, assignment_id],
+                |row| row.get::<_, u32>(0),
+            )?;
+            let live_activity_at_ms = runtime
+                .live_telemetry(&attempt_id)
+                .and_then(|telemetry| telemetry["activity_at_ms"].as_i64());
+            let latest_activity_at_ms = live_activity_at_ms
+                .unwrap_or(persisted_activity_at_ms)
+                .max(persisted_activity_at_ms);
+            let (signal, details) = if !authority_valid {
+                (
+                    Some("invalid_authority"),
+                    "the current repository, path, action, or effect authority no longer covers the Attempt"
+                        .to_owned(),
+                )
+            } else if active_concurrency > max_concurrency || active_storage > max_storage {
+                if resource_containment_started.insert(commission_id.clone()) {
+                    (
+                        Some("abnormal_resource_use"),
+                        "the newest active reservation pushed aggregate use beyond the Commission resource ceiling"
+                            .to_owned(),
+                    )
+                } else {
+                    (None, String::new())
+                }
+            } else if !runtime.is_attempt_active(&attempt_id) {
+                (
+                    Some("lost_liveness"),
+                    "the durable running Attempt has no live Worker control identity".to_owned(),
+                )
+            } else if now_ms.saturating_sub(latest_activity_at_ms)
+                >= i64::try_from(stall_milliseconds.max(1)).unwrap_or(i64::MAX)
+            {
+                (
+                    Some("stall"),
+                    "meaningful Worker activity stopped before a safe terminal state".to_owned(),
+                )
+            } else if retry_pattern >= 2 {
+                (
+                    Some("unhealthy_retry_pattern"),
+                    "an equivalent recovery was attempted more than once".to_owned(),
+                )
+            } else if repeated_verification >= 2 {
+                (
+                    Some("repeated_verification_failure"),
+                    "the Assignment produced repeated failed verification Evidence".to_owned(),
+                )
+            } else {
+                (None, String::new())
+            };
+            let Some(signal) = signal else {
+                continue;
+            };
+            let fence_transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let still_running = fence_transaction.query_row(
+                "SELECT status = 'running' FROM attempts WHERE id = ?1",
+                [&attempt_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !still_running {
+                fence_transaction.commit()?;
+                continue;
+            }
+            fence_transaction.execute(
+                "INSERT OR IGNORE INTO sandbox_cleanups (attempt_id, created_at)
+                 VALUES (?1, ?2)",
+                params![attempt_id, now],
+            )?;
+            fence_transaction.commit()?;
+            let control_delivery = runtime.watchdog_contain(&attempt_id, signal);
+            let transaction = self.connection.transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO watchdog_findings (
+                    id, commission_id, assignment_id, attempt_id, signal, action, details, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'contain_attempt', ?6, ?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    signal,
+                    if let Err(error) = &control_delivery {
+                        format!("{details}; live control delivery reported: {error}")
+                    } else {
+                        details
+                    },
+                    now,
+                ],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                &commission_id,
+                EventKind::AttemptContained,
+                revision,
+                &serde_json::json!({
+                    "assignment_id": assignment_id,
+                    "attempt_id": attempt_id,
+                    "signal": signal,
+                    "scope": "attempt",
+                }),
+            )?;
+            transaction.commit()?;
+            self.fail_attempt(
+                &commission_id,
+                &assignment_id,
+                &attempt_id,
+                &lease_id,
+                revision,
+                &TyrionError::WatchdogContained { signal },
+            )?;
+            let integration_lock = runtime.commission_integration_lock(&commission_id)?;
+            let integration_guard = integration_lock.lock().map_err(|_| {
+                TyrionError::InvalidRequest("Commission Integration lock is unavailable".into())
+            })?;
+            let artifact_revision = self.connection.query_row(
+                "SELECT artifact_revision FROM commissions WHERE id = ?1",
+                [&commission_id],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            runtime.cleanup_stranded_attempt(
+                &attempt_id,
+                &commission_id,
+                &execution,
+                artifact_revision.as_deref(),
+            )?;
+            self.complete_sandbox_cleanup(&attempt_id)?;
+            drop(integration_guard);
+            let redispatchable = self.connection.query_row(
+                "SELECT assignments.status = 'ready' AND commissions.status = 'active'
+                 FROM assignments
+                 JOIN commissions ON commissions.id = assignments.commission_id
+                 WHERE assignments.id = ?1 AND commissions.id = ?2",
+                params![assignment_id, commission_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if redispatchable {
+                redispatch_commissions.insert(commission_id);
+            }
+        }
+        Ok(redispatch_commissions.into_iter().collect())
     }
 
     pub fn dispatch_snapshot(&self, commission_id: &str) -> Result<(u32, u32, u32), TyrionError> {
@@ -1340,7 +2165,7 @@ impl Store {
             unix_timestamp()?,
         )?;
         transaction.execute(
-            "UPDATE results SET status = ?2
+            "UPDATE results SET status = ?2, revision_disposition = 'superseded'
              WHERE status = ?3 AND attempt_id IN (
                  SELECT id FROM attempts WHERE assignment_id = ?1
              )",
@@ -1349,6 +2174,11 @@ impl Store {
                 ResultStatus::Superseded.as_str(),
                 ResultStatus::Candidate.as_str()
             ],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET revision_disposition = 'requires_revalidation'
+             WHERE assignment_id = ?1 AND status = 'succeeded'",
+            [&assignment_id],
         )?;
         transaction.execute(
             "UPDATE assignments SET plan_revision = ?2, status = ?3 WHERE id = ?1",
@@ -1625,6 +2455,12 @@ impl Store {
                  WHERE assignments.commission_id = ?1
                    AND assignments.status = ?2
                    AND commissions.status = ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attempts AS cleanup_attempts
+                       JOIN sandbox_cleanups
+                         ON sandbox_cleanups.attempt_id = cleanup_attempts.id
+                       WHERE cleanup_attempts.assignment_id = assignments.id
+                   )
                    AND EXISTS (
                        SELECT 1 FROM assignment_routes
                        WHERE assignment_routes.assignment_id = assignments.id
@@ -1997,6 +2833,7 @@ impl Store {
             worker.end_attempt(&attempt_id)?;
             return Err(error.into());
         }
+        let _attempt_control_scope = worker.attempt_control_scope(&attempt_id);
 
         let assignment = worker::AssignmentContext {
             commission_id: commission_id.to_owned(),
@@ -2024,7 +2861,6 @@ impl Store {
             params![attempt_id, execution_completed_at_ms],
         )?;
         let terminal_telemetry = worker.live_telemetry(&attempt_id);
-        worker.end_attempt(&attempt_id)?;
         if let Some(telemetry) = terminal_telemetry.as_ref() {
             self.persist_worker_telemetry(&attempt_id, telemetry)?;
         }
@@ -2042,12 +2878,15 @@ impl Store {
                 return Ok(());
             }
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, &ready, &attempt_id)?;
         transaction.execute(
             "UPDATE workers
              SET status = 'succeeded', native_session_id = ?2, usage_json = ?3,
                  latest_activity = ?4, activity_at_ms = ?5
-             WHERE attempt_id = ?1",
+             WHERE attempt_id = ?1 AND status = 'running'",
             params![
                 attempt_id,
                 candidate.native_session_id,
@@ -2056,17 +2895,11 @@ impl Store {
                 execution_completed_at_ms,
             ],
         )?;
-        let current_revision = transaction.query_row(
-            "SELECT revision FROM commissions WHERE id = ?1 AND status = ?2",
-            params![commission_id, CommissionStatus::Active.as_str()],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if current_revision != ready.mandate_revision {
-            return Err(TyrionError::InvalidRequest(format!(
-                "Assignment {} Result targets mandate revision {}, but Commission {} is at revision {}",
-                ready.assignment_id, ready.mandate_revision, commission_id, current_revision
-            )));
+        if matches!(continuation, AttemptContinuation::Cancelled) {
+            transaction.commit()?;
+            return Ok(());
         }
+        let stale = matches!(continuation, AttemptContinuation::Stale { .. });
         let result_id = Uuid::new_v4().to_string();
         let result_created_at = unix_timestamp()?;
         let candidate_commits_json = serde_json::to_string(&candidate.candidate_commits)?;
@@ -2084,7 +2917,11 @@ impl Store {
                 attempt_id,
                 candidate.output,
                 candidate.artifact_revision.as_str(),
-                ResultStatus::Candidate.as_str(),
+                if stale {
+                    ResultStatus::Superseded.as_str()
+                } else {
+                    ResultStatus::Candidate.as_str()
+                },
                 result_created_at,
                 ready.mandate_revision,
                 ready.plan_revision,
@@ -2095,6 +2932,44 @@ impl Store {
                 known_effects_json,
             ],
         )?;
+        if stale {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                false,
+            )?;
+            transaction.execute(
+                "UPDATE workers
+                 SET latest_activity = 'Stale Result retained without Integration', activity_at_ms = ?2
+                 WHERE attempt_id = ?1",
+                params![attempt_id, execution_completed_at_ms],
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::ResultSubmitted,
+                match continuation {
+                    AttemptContinuation::Stale {
+                        commission_revision,
+                        ..
+                    } => commission_revision,
+                    AttemptContinuation::Current | AttemptContinuation::Cancelled => {
+                        ready.mandate_revision
+                    }
+                },
+                &serde_json::json!({
+                    "result_id": result_id,
+                    "assignment_id": ready.assignment_id,
+                    "revision_disposition": "stale",
+                    "integrated_automatically": false,
+                }),
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         record_event(
             &transaction,
             commission_id,
@@ -2154,7 +3029,22 @@ impl Store {
         let candidate_passed = candidate_verification
             .iter()
             .all(worker::VerificationRecord::passed);
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, &ready, &attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                false,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE results SET verification_outcomes_json = ?2 WHERE id = ?1",
             params![result_id, serde_json::to_string(&candidate_verification)?],
@@ -2168,12 +3058,13 @@ impl Store {
             &candidate_verification,
         )?;
         if !candidate_passed {
-            finish_verification(
+            recover_failed_verification(
                 &transaction,
-                &assignment.assignment_id,
+                commission_id,
+                &ready,
                 &attempt_id,
                 &lease_id,
-                AssignmentStatus::VerificationFailed,
+                &result_id,
             )?;
             transaction.commit()?;
             return Ok(());
@@ -2191,9 +3082,33 @@ impl Store {
             return Ok(());
         }
 
+        worker.wait_before_integration();
+        let integration_lock = worker.commission_integration_lock(commission_id)?;
+        let integration_guard = integration_lock.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Commission Integration lock is unavailable".into())
+        })?;
+        let integration_transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation =
+            attempt_continuation(&integration_transaction, commission_id, &ready, &attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &integration_transaction,
+                continuation,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                false,
+            )?;
+            integration_transaction.commit()?;
+            return Ok(());
+        }
+        integration_transaction.commit()?;
         let integrated = match worker.integrate(&assignment, &candidate) {
             Ok(integrated) => integrated,
             Err(TyrionError::IntegrationFailure { kind, message }) if !ready.legacy => {
+                drop(integration_guard);
                 self.require_reconciliation(
                     commission_id,
                     &ready,
@@ -2207,6 +3122,7 @@ impl Store {
                 return Ok(());
             }
             Err(error) => {
+                drop(integration_guard);
                 self.fail_attempt(
                     commission_id,
                     &assignment.assignment_id,
@@ -2218,6 +3134,37 @@ impl Store {
                 return Ok(());
             }
         };
+        worker.wait_after_external_integration();
+        let integration_transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation =
+            attempt_continuation(&integration_transaction, commission_id, &ready, &attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            worker.rollback_integration(&integrated)?;
+            retain_noncurrent_result(
+                &integration_transaction,
+                continuation,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                false,
+            )?;
+            integration_transaction.commit()?;
+            drop(integration_guard);
+            return Ok(());
+        }
+        integration_transaction.execute(
+            "UPDATE results SET integrated_artifact_revision = ?2 WHERE id = ?1",
+            params![result_id, integrated.artifact_revision.as_str()],
+        )?;
+        integration_transaction.execute(
+            "UPDATE commissions SET artifact_revision = ?2 WHERE id = ?1",
+            params![commission_id, integrated.artifact_revision.as_str()],
+        )?;
+        integration_transaction.commit()?;
+        drop(integration_guard);
+        worker.wait_after_integration();
         let mut artifacts = candidate.artifacts.clone();
         artifacts.extend(integrated.artifacts.clone());
         if !ready.legacy {
@@ -2235,7 +3182,22 @@ impl Store {
                 integrated,
             );
         }
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, &ready, &attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                true,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE results
              SET artifacts_json = ?2, integrated_artifact_revision = ?3
@@ -2277,7 +3239,22 @@ impl Store {
             .all(worker::VerificationRecord::passed);
         let mut all_verification = candidate_verification;
         all_verification.extend(integrated_verification.clone());
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, &ready, &attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                true,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE results SET verification_outcomes_json = ?2 WHERE id = ?1",
             params![result_id, serde_json::to_string(&all_verification)?],
@@ -2366,7 +3343,33 @@ impl Store {
             match worker.verify_integrated(&assembled_assignment, &integrated) {
                 Ok(verification) => verification,
                 Err(error) => {
+                    let transaction = self
+                        .connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let continuation =
+                        attempt_continuation(&transaction, commission_id, ready, attempt_id)?;
+                    if !matches!(continuation, AttemptContinuation::Current) {
+                        retain_noncurrent_result(
+                            &transaction,
+                            continuation,
+                            attempt_id,
+                            lease_id,
+                            result_id,
+                            true,
+                        )?;
+                        transaction.commit()?;
+                        return Ok(());
+                    }
                     worker.rollback_integration(&integrated)?;
+                    transaction.execute(
+                        "UPDATE results SET integrated_artifact_revision = NULL WHERE id = ?1",
+                        [result_id],
+                    )?;
+                    transaction.execute(
+                        "UPDATE commissions SET artifact_revision = ?2 WHERE id = ?1",
+                        params![commission_id, ready.current_artifact_revision.as_deref()],
+                    )?;
+                    transaction.commit()?;
                     self.require_reconciliation(
                         commission_id,
                         ready,
@@ -2381,8 +3384,24 @@ impl Store {
                 }
             };
 
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, ready, attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                attempt_id,
+                lease_id,
+                result_id,
+                true,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         let expected_criteria = {
-            let mut statement = self.connection.prepare(
+            let mut statement = transaction.prepare(
                 "SELECT DISTINCT planned_assignment_criteria.criterion_id
                  FROM planned_assignment_criteria
                  LEFT JOIN assignment_metadata
@@ -2413,7 +3432,6 @@ impl Store {
         if integrated_regression {
             let mut retained_verification = candidate_verification.clone();
             retained_verification.extend(integrated_verification.clone());
-            let transaction = self.connection.transaction()?;
             transaction.execute(
                 "UPDATE results SET verification_outcomes_json = ?2 WHERE id = ?1",
                 params![result_id, serde_json::to_string(&retained_verification)?],
@@ -2426,8 +3444,16 @@ impl Store {
                 integrated.artifact_revision.as_str(),
                 &integrated_verification,
             )?;
-            transaction.commit()?;
             worker.rollback_integration(&integrated)?;
+            transaction.execute(
+                "UPDATE results SET integrated_artifact_revision = NULL WHERE id = ?1",
+                [result_id],
+            )?;
+            transaction.execute(
+                "UPDATE commissions SET artifact_revision = ?2 WHERE id = ?1",
+                params![commission_id, ready.current_artifact_revision.as_deref()],
+            )?;
+            transaction.commit()?;
             self.require_reconciliation(
                 commission_id,
                 ready,
@@ -2443,9 +3469,6 @@ impl Store {
 
         let mut all_verification = candidate_verification;
         all_verification.extend(integrated_verification.clone());
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "UPDATE results
              SET artifacts_json = ?2, integrated_artifact_revision = ?3,
@@ -2579,12 +3602,33 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, ready, attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                attempt_id,
+                lease_id,
+                result_id,
+                false,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         finish_verification(
             &transaction,
             &ready.assignment_id,
             attempt_id,
             lease_id,
             AssignmentStatus::VerificationPending,
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET revision_disposition = 'requires_revalidation' WHERE id = ?1",
+            [attempt_id],
+        )?;
+        transaction.execute(
+            "UPDATE results SET revision_disposition = 'requires_revalidation' WHERE id = ?1",
+            [result_id],
         )?;
         let (member_count, completed_count) = transaction.query_row(
             "SELECT COUNT(*),
@@ -2842,6 +3886,19 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, ready, attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                attempt_id,
+                lease_id,
+                result_id,
+                false,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         let now = unix_timestamp()?;
         release_successful_attempt(
             &transaction,
@@ -2849,6 +3906,14 @@ impl Store {
                 attempt_id,
                 lease_id,
             },
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET revision_disposition = 'requires_revalidation' WHERE id = ?1",
+            [attempt_id],
+        )?;
+        transaction.execute(
+            "UPDATE results SET revision_disposition = 'requires_revalidation' WHERE id = ?1",
+            [result_id],
         )?;
         transaction.execute(
             "UPDATE assignments SET status = ?2 WHERE id = ?1",
@@ -3024,32 +4089,210 @@ impl Store {
         error: &TyrionError,
     ) -> Result<(), TyrionError> {
         let transaction = self.connection.transaction()?;
+        let current_attempt_status = transaction.query_row(
+            "SELECT status FROM attempts WHERE id = ?1",
+            [attempt_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if current_attempt_status != AttemptStatus::Running.as_str() {
+            transaction.commit()?;
+            return Ok(());
+        }
         let now = unix_timestamp()?;
         let now_ms = unix_timestamp_millis()?;
         let interrupted = matches!(error, TyrionError::WorkerInterrupted);
+        let timed_out = matches!(error, TyrionError::WatchdogContained { .. });
+        let acknowledged_integrated = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM results
+                JOIN attempts ON attempts.id = results.attempt_id
+                JOIN assignments ON assignments.id = attempts.assignment_id
+                JOIN commissions ON commissions.id = assignments.commission_id
+                WHERE results.attempt_id = ?1 AND commissions.id = ?2
+                  AND commissions.artifact_revision IS NOT NULL
+                  AND results.integrated_artifact_revision = commissions.artifact_revision
+                  AND results.status != 'accepted'
+             )",
+            params![attempt_id, commission_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let attempt_status = if interrupted {
+            AttemptStatus::Interrupted
+        } else if timed_out {
+            AttemptStatus::TimedOut
+        } else {
+            AttemptStatus::Failed
+        };
         transaction.execute(
             "UPDATE attempts
-             SET status = ?2, completed_at = ?3,
-                 execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?4),
-                 completed_at_ms = ?4
-             WHERE id = ?1",
+                 SET status = ?2, completed_at = ?3,
+                     execution_completed_at_ms = COALESCE(execution_completed_at_ms, ?4),
+                     completed_at_ms = ?4, revision_disposition = ?5
+                 WHERE id = ?1",
             params![
                 attempt_id,
-                if interrupted {
-                    AttemptStatus::Interrupted.as_str()
-                } else {
-                    AttemptStatus::Failed.as_str()
-                },
+                attempt_status.as_str(),
                 now,
-                now_ms
+                now_ms,
+                if acknowledged_integrated {
+                    "requires_revalidation"
+                } else {
+                    "retained"
+                }
             ],
         )?;
-        let (lease_status, assignment_status, blocker_code, requirement, unavailable) = match error {
+        if acknowledged_integrated {
+            transaction.execute(
+                "UPDATE results
+                 SET status = 'candidate', revision_disposition = 'requires_revalidation'
+                 WHERE attempt_id = ?1 AND status != 'accepted'
+                   AND integrated_artifact_revision = (
+                       SELECT artifact_revision FROM commissions WHERE id = ?2
+                   )",
+                params![attempt_id, commission_id],
+            )?;
+            transaction.execute(
+                "UPDATE results
+                 SET status = 'superseded', revision_disposition = 'retained'
+                 WHERE attempt_id = ?1 AND status != 'accepted'
+                   AND integrated_artifact_revision IS NOT (
+                       SELECT artifact_revision FROM commissions WHERE id = ?2
+                   )",
+                params![attempt_id, commission_id],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE results
+                 SET status = 'superseded', revision_disposition = 'retained'
+                 WHERE attempt_id = ?1 AND status != 'accepted'",
+                [attempt_id],
+            )?;
+        }
+        let attempt_count = transaction.query_row(
+            "SELECT COUNT(*) FROM attempts
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             WHERE assignments.commission_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM worker_configuration_failures
+                   WHERE worker_configuration_failures.attempt_id = attempts.id
+               )",
+            [commission_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        let max_attempts = transaction.query_row(
+            "SELECT max_attempts FROM resource_ceilings WHERE commission_id = ?1",
+            [commission_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        let transient_equivalence_key = match error {
+            TyrionError::WorkerLeaseExpired { .. } => Some("worker_timed_out"),
+            TyrionError::WatchdogContained { signal } => Some(*signal),
+            _ => None,
+        };
+        let prior_equivalent_failures = transient_equivalence_key
+            .map(|equivalence_key| {
+                transaction.query_row(
+                    "SELECT COUNT(*) FROM attempt_recoveries
+                     WHERE assignment_id = ?1 AND equivalence_key = ?2",
+                    params![assignment_id, equivalence_key],
+                    |row| row.get::<_, u32>(0),
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let retry_available = attempt_count < max_attempts && prior_equivalent_failures == 0;
+        let replan_required = attempt_count < max_attempts && prior_equivalent_failures > 0;
+        let (
+            lease_status,
+            assignment_status,
+            blocker_code,
+            requirement,
+            classification,
+            equivalence_key,
+            action,
+            unavailable,
+        ) = match error {
+            _ if acknowledged_integrated => (
+                if matches!(error, TyrionError::WorkerLeaseExpired { .. }) {
+                    WorkerLeaseStatus::Expired
+                } else {
+                    WorkerLeaseStatus::Revoked
+                },
+                AssignmentStatus::VerificationFailed,
+                "integrated_revalidation".to_owned(),
+                "Revalidate the retained integrated Result against the current mandate before any further execution."
+                    .to_owned(),
+                "repairable_context",
+                "integrated_revalidation",
+                "block",
+                false,
+            ),
             TyrionError::WorkerLeaseExpired { .. } => (
                 WorkerLeaseStatus::Expired,
-                AssignmentStatus::VerificationFailed,
-                "worker_execution_failed".to_owned(),
-                error.to_string(),
+                if retry_available {
+                    AssignmentStatus::Ready
+                } else if replan_required {
+                    AssignmentStatus::AttentionRequired
+                } else {
+                    AssignmentStatus::ResourceBlocked
+                },
+                "worker_timed_out".to_owned(),
+                if retry_available {
+                    format!(
+                        "{error}. Retry the same Worker Configuration once after confirming the transient lease failure is contained."
+                    )
+                } else if replan_required {
+                    format!(
+                        "{error}. Revise the Assignment decomposition or provide a different eligible Worker Configuration after the second equivalent timeout."
+                    )
+                } else {
+                    format!(
+                        "{error}. Start a linked Commission with enough max_attempts and elapsed time to continue the timed-out Assignment."
+                    )
+                },
+                "transient",
+                "worker_timed_out",
+                if retry_available {
+                    "retry"
+                } else if replan_required {
+                    "replan"
+                } else {
+                    "block"
+                },
+                false,
+            ),
+            TyrionError::WatchdogContained { signal } => (
+                WorkerLeaseStatus::Revoked,
+                if retry_available {
+                    AssignmentStatus::Ready
+                } else if replan_required {
+                    AssignmentStatus::AttentionRequired
+                } else {
+                    AssignmentStatus::ResourceBlocked
+                },
+                format!("watchdog_{signal}"),
+                if retry_available {
+                    format!(
+                        "Retry once after correcting the Watchdog {signal} condition and confirming containment."
+                    )
+                } else if replan_required {
+                    format!(
+                        "Revise the Assignment decomposition or provide a different eligible Worker Configuration after the second equivalent Watchdog {signal} finding."
+                    )
+                } else {
+                    format!(
+                        "Resolve the Watchdog {signal} condition and provide a linked Commission with another Attempt."
+                    )
+                },
+                "transient",
+                *signal,
+                if retry_available {
+                    "retry"
+                } else if replan_required {
+                    "replan"
+                } else {
+                    "block"
+                },
                 false,
             ),
             TyrionError::StorageCeilingExceeded {
@@ -3062,6 +4305,9 @@ impl Store {
                 format!(
                     "Git artifacts require at least {required_bytes} bytes; start a new Commission with max_storage_bytes of {required_bytes} or more (current ceiling: {ceiling_bytes})."
                 ),
+                "resource",
+                "max_storage_bytes",
+                "block",
                 false,
             ),
             TyrionError::WorkerInterrupted => (
@@ -3070,6 +4316,9 @@ impl Store {
                 "worker_interrupted".to_owned(),
                 "Review the interrupted Assignment and explicitly retry, reroute, revise, or cancel it."
                     .to_owned(),
+                "interrupted",
+                "principal_interruption",
+                "await_principal",
                 false,
             ),
             TyrionError::WorkerConfigurationUnavailable { .. } => (
@@ -3077,6 +4326,9 @@ impl Store {
                 AssignmentStatus::Ready,
                 "worker_configuration_unavailable".to_owned(),
                 error.to_string(),
+                "poor_fit",
+                "worker_configuration_unavailable",
+                "reroute",
                 true,
             ),
             _ => (
@@ -3084,6 +4336,9 @@ impl Store {
                 AssignmentStatus::VerificationFailed,
                 "worker_execution_failed".to_owned(),
                 error.to_string(),
+                "authority",
+                "worker_execution_failed",
+                "block",
                 false,
             ),
         };
@@ -3114,13 +4369,11 @@ impl Store {
              WHERE attempt_id = ?1",
             params![
                 attempt_id,
-                if interrupted {
-                    AttemptStatus::Interrupted.as_str()
-                } else {
-                    AttemptStatus::Failed.as_str()
-                },
+                attempt_status.as_str(),
                 if interrupted {
                     "Worker interrupted"
+                } else if timed_out {
+                    "Worker contained after timeout"
                 } else {
                     "Worker failed"
                 },
@@ -3142,6 +4395,19 @@ impl Store {
                     requirement,
                     now,
                 ],
+            )?;
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: "worker_configuration_unavailable",
+                    classification,
+                    equivalence_key,
+                    action,
+                    requirement: &requirement,
+                },
             )?;
             record_event_with_payload(
                 &transaction,
@@ -3168,9 +4434,122 @@ impl Store {
                     now,
                 ],
             )?;
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: "interrupted",
+                    classification,
+                    equivalence_key,
+                    action,
+                    requirement: &requirement,
+                },
+            )?;
+        } else if action == "retry" {
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: blocker_code.as_str(),
+                    classification,
+                    equivalence_key,
+                    action,
+                    requirement: &requirement,
+                },
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::AssignmentReady,
+                mandate_revision,
+                &serde_json::json!({
+                    "assignment_id": assignment_id,
+                    "reason": "bounded_transient_retry",
+                    "prior_attempt_id": attempt_id,
+                }),
+            )?;
+        } else if action == "replan" {
+            let next_plan_revision = transaction.query_row(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM commission_plans
+                 WHERE commission_id = ?1",
+                [commission_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let snapshot = serde_json::json!({
+                "reason": "second_equivalent_failure",
+                "assignment_id": assignment_id,
+                "attempt_id": attempt_id,
+                "equivalence_key": equivalence_key,
+                "requirement": requirement,
+            });
+            transaction.execute(
+                "INSERT INTO commission_plans (
+                    commission_id, revision, source, reason, snapshot_json, created_at
+                 ) VALUES (?1, ?2, 'control_plane', 'second equivalent Attempt failure', ?3, ?4)",
+                params![
+                    commission_id,
+                    next_plan_revision,
+                    serde_json::to_string(&snapshot)?,
+                    now,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO attention_conditions (
+                    id, commission_id, assignment_id, code, requirement, status, created_at
+                 ) VALUES (?1, ?2, ?3, 'replan_required', ?4, 'open', ?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    commission_id,
+                    assignment_id,
+                    requirement,
+                    now,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO watchdog_findings (
+                    id, commission_id, assignment_id, attempt_id, signal, action, details, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'unhealthy_retry_pattern',
+                           'contain_attempt', ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    "A second equivalent failure made another same-configuration retry unsafe.",
+                    now,
+                ],
+            )?;
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: blocker_code.as_str(),
+                    classification,
+                    equivalence_key,
+                    action,
+                    requirement: &requirement,
+                },
+            )?;
+            record_event_with_payload(
+                &transaction,
+                commission_id,
+                EventKind::PlanRevised,
+                mandate_revision,
+                &serde_json::json!({
+                    "plan_revision": next_plan_revision,
+                    "reason": "second_equivalent_failure",
+                    "assignment_id": assignment_id,
+                }),
+            )?;
         } else {
             transaction.execute(
-                "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
+                "INSERT OR REPLACE INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     Uuid::new_v4().to_string(),
@@ -3180,6 +4559,19 @@ impl Store {
                     requirement,
                     now,
                 ],
+            )?;
+            record_attempt_recovery(
+                &transaction,
+                AttemptRecovery {
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    cause: blocker_code.as_str(),
+                    classification,
+                    equivalence_key,
+                    action,
+                    requirement: &requirement,
+                },
             )?;
             record_event(
                 &transaction,
@@ -3525,7 +4917,14 @@ fn route_ready_assignments(
         let unavailable_configuration_ids = {
             let mut statement = transaction.prepare(
                 "SELECT configuration_id FROM worker_configuration_failures
-                 WHERE assignment_id = ?1 ORDER BY configuration_id",
+                 WHERE assignment_id = ?1
+                 UNION
+                 SELECT attempts.worker_configuration
+                 FROM attempts
+                 JOIN attempt_recoveries ON attempt_recoveries.attempt_id = attempts.id
+                 WHERE attempts.assignment_id = ?1
+                   AND attempt_recoveries.action = 'replan'
+                 ORDER BY 1",
             )?;
             let rows = statement.query_map([&assignment_id], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<std::collections::HashSet<_>, _>>()?
@@ -3890,39 +5289,39 @@ fn competition(
 }
 
 fn load_authorized_paths(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     commission_id: &str,
 ) -> Result<Vec<String>, TyrionError> {
-    load_authority_scope(transaction, commission_id, AuthorityScopeType::Path)
+    load_authority_scope(connection, commission_id, AuthorityScopeType::Path)
 }
 
 fn load_authority(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     commission_id: &str,
 ) -> Result<AuthorityEnvelope, TyrionError> {
     Ok(AuthorityEnvelope {
         repositories: load_authority_scope(
-            transaction,
+            connection,
             commission_id,
             AuthorityScopeType::Repository,
         )?,
-        paths: load_authority_scope(transaction, commission_id, AuthorityScopeType::Path)?,
-        actions: load_authority_scope(transaction, commission_id, AuthorityScopeType::Action)?,
+        paths: load_authority_scope(connection, commission_id, AuthorityScopeType::Path)?,
+        actions: load_authority_scope(connection, commission_id, AuthorityScopeType::Action)?,
         destinations: load_authority_scope(
-            transaction,
+            connection,
             commission_id,
             AuthorityScopeType::Destination,
         )?,
-        effects: load_authority_scope(transaction, commission_id, AuthorityScopeType::Effect)?,
+        effects: load_authority_scope(connection, commission_id, AuthorityScopeType::Effect)?,
     })
 }
 
 fn load_authority_scope(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     commission_id: &str,
     scope_type: AuthorityScopeType,
 ) -> Result<Vec<String>, TyrionError> {
-    let mut statement = transaction.prepare(
+    let mut statement = connection.prepare(
         "SELECT value FROM authority_scopes
          WHERE commission_id = ?1 AND scope_type = ?2 ORDER BY position",
     )?;
@@ -3930,6 +5329,82 @@ fn load_authority_scope(
         row.get(0)
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn attempt_authority_is_current(
+    connection: &Connection,
+    commission_id: &str,
+    attempt_id: &str,
+    execution: &ExecutionSpec,
+) -> Result<bool, TyrionError> {
+    let authority = load_authority(connection, commission_id)?;
+    let required_action = match execution {
+        ExecutionSpec::Deterministic => worker::DETERMINISTIC_ACTION,
+        ExecutionSpec::CodexGit { .. } => worker::CODEX_GIT_ACTION,
+    };
+    if !authority
+        .actions
+        .iter()
+        .any(|action| action == required_action)
+    {
+        return Ok(false);
+    }
+    if let ExecutionSpec::CodexGit { repository, .. } = execution {
+        if !authority
+            .repositories
+            .iter()
+            .any(|authorized| authorized == repository)
+            || authority.paths.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    let declared_write_scopes_json = connection.query_row(
+        "SELECT assignment_metadata.write_scopes_json
+         FROM attempts
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+         WHERE attempts.id = ?1 AND assignments.commission_id = ?2",
+        params![attempt_id, commission_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let declared_write_scopes: Vec<String> = serde_json::from_str(&declared_write_scopes_json)?;
+    if declared_write_scopes.iter().any(|scope| {
+        !authority
+            .paths
+            .iter()
+            .any(|authorized| path_is_within_scope(scope, authorized))
+    }) {
+        return Ok(false);
+    }
+    let observed = {
+        let mut statement = connection.prepare(
+            "SELECT changed_paths_json, known_effects_json
+             FROM results WHERE attempt_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([attempt_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (changed_paths_json, known_effects_json) in observed {
+        let changed_paths: Vec<String> = serde_json::from_str(&changed_paths_json)?;
+        let known_effects: Vec<String> = serde_json::from_str(&known_effects_json)?;
+        if changed_paths.iter().any(|path| {
+            !authority
+                .paths
+                .iter()
+                .any(|authorized| path_is_within_scope(path, authorized))
+        }) || known_effects.iter().any(|effect| {
+            !authority
+                .effects
+                .iter()
+                .any(|authorized| authorized == effect)
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn load_comparison_candidates(
@@ -4544,7 +6019,7 @@ fn supersede_competing_candidates(
     reconciliation_result_id: &str,
 ) -> Result<(), TyrionError> {
     transaction.execute(
-        "UPDATE results SET status = ?4
+        "UPDATE results SET status = ?4, revision_disposition = 'superseded'
          WHERE id != ?3 AND status = ?5
            AND attempt_id IN (
                SELECT attempts.id FROM attempts
@@ -4561,6 +6036,20 @@ fn supersede_competing_candidates(
             ResultStatus::Superseded.as_str(),
             ResultStatus::Candidate.as_str(),
         ],
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET revision_disposition = 'superseded'
+         WHERE id IN (
+             SELECT results.attempt_id FROM results
+             JOIN attempts ON attempts.id = results.attempt_id
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             JOIN assignment_metadata ON assignment_metadata.assignment_id = assignments.id
+             WHERE assignments.commission_id = ?1
+               AND assignment_metadata.competition_group = ?2
+               AND assignment_metadata.purpose != 'reconciliation'
+               AND results.id != ?3
+         )",
+        params![commission_id, competition_group, reconciliation_result_id],
     )?;
     transaction.execute(
         "UPDATE assignments SET status = ?4
@@ -4817,7 +6306,7 @@ fn finish_verified_commission(
     let updated = transaction.execute(
         "UPDATE commissions
          SET status = ?2, revision = ?3, completed_at = ?4, artifact_revision = ?5
-         WHERE id = ?1 AND status = ?6 AND revision = ?7",
+         WHERE id = ?1 AND status IN (?6, ?7) AND revision = ?8",
         params![
             completion.commission_id,
             CommissionStatus::VerifiedComplete.as_str(),
@@ -4825,6 +6314,7 @@ fn finish_verified_commission(
             completed_at,
             completion.artifact_revision,
             CommissionStatus::Active.as_str(),
+            CommissionStatus::Paused.as_str(),
             completion.mandate_revision,
         ],
     )?;
@@ -5063,6 +6553,397 @@ fn finish_verification(
     Ok(())
 }
 
+fn attempt_continuation(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    ready: &ReadyAssignmentDispatch,
+    attempt_id: &str,
+) -> Result<AttemptContinuation, TyrionError> {
+    let execution: ExecutionSpec = serde_json::from_str(&ready.execution_json)?;
+    let (
+        commission_status,
+        commission_revision,
+        assignment_status,
+        assignment_plan_revision,
+        attempt_status,
+        cleanup_pending,
+    ) = transaction.query_row(
+        "SELECT commissions.status, commissions.revision,
+                assignments.status, assignments.plan_revision, attempts.status,
+                EXISTS(
+                    SELECT 1 FROM sandbox_cleanups WHERE attempt_id = attempts.id
+                )
+         FROM commissions
+         JOIN assignments ON assignments.commission_id = commissions.id
+         JOIN attempts ON attempts.assignment_id = assignments.id
+         WHERE commissions.id = ?1 AND assignments.id = ?2 AND attempts.id = ?3",
+        params![commission_id, ready.assignment_id, attempt_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        },
+    )?;
+    if commission_status == CommissionStatus::Cancelled.as_str()
+        || assignment_status == AssignmentStatus::Cancelled.as_str()
+        || attempt_status == AttemptStatus::Cancelled.as_str()
+    {
+        return Ok(AttemptContinuation::Cancelled);
+    }
+    let commission_dispatchable = commission_status == CommissionStatus::Active.as_str()
+        || commission_status == CommissionStatus::Paused.as_str();
+    let authority_valid =
+        attempt_authority_is_current(transaction, commission_id, attempt_id, &execution)?;
+    if commission_dispatchable
+        && commission_revision == ready.mandate_revision
+        && assignment_status == AssignmentStatus::Running.as_str()
+        && assignment_plan_revision == ready.plan_revision
+        && attempt_status == AttemptStatus::Running.as_str()
+        && !cleanup_pending
+        && authority_valid
+    {
+        Ok(AttemptContinuation::Current)
+    } else {
+        Ok(AttemptContinuation::Stale {
+            commission_revision,
+            attempt_running: attempt_status == AttemptStatus::Running.as_str() && !cleanup_pending,
+        })
+    }
+}
+
+fn retain_noncurrent_result(
+    transaction: &Transaction<'_>,
+    continuation: AttemptContinuation,
+    attempt_id: &str,
+    lease_id: &str,
+    result_id: &str,
+    integrated: bool,
+) -> Result<(), TyrionError> {
+    match continuation {
+        AttemptContinuation::Current => {}
+        AttemptContinuation::Cancelled => {
+            transaction.execute(
+                "UPDATE results
+                 SET status = 'superseded', revision_disposition = 'retained'
+                 WHERE id = ?1",
+                [result_id],
+            )?;
+        }
+        AttemptContinuation::Stale {
+            attempt_running, ..
+        } => {
+            let disposition = if integrated {
+                "requires_revalidation"
+            } else {
+                "stale"
+            };
+            transaction.execute(
+                "UPDATE results
+                 SET status = 'superseded', revision_disposition = ?2
+                 WHERE id = ?1",
+                params![result_id, disposition],
+            )?;
+            if attempt_running {
+                release_successful_attempt(
+                    transaction,
+                    SuccessfulAttemptRelease {
+                        attempt_id,
+                        lease_id,
+                    },
+                )?;
+            }
+            transaction.execute(
+                "UPDATE attempts SET revision_disposition = ?2 WHERE id = ?1",
+                params![attempt_id, disposition],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn recover_failed_verification(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    ready: &ReadyAssignmentDispatch,
+    attempt_id: &str,
+    lease_id: &str,
+    result_id: &str,
+) -> Result<(), TyrionError> {
+    release_successful_attempt(
+        transaction,
+        SuccessfulAttemptRelease {
+            attempt_id,
+            lease_id,
+        },
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET revision_disposition = 'retained' WHERE id = ?1",
+        [attempt_id],
+    )?;
+    transaction.execute(
+        "UPDATE results SET status = 'superseded', revision_disposition = 'superseded'
+         WHERE id = ?1",
+        [result_id],
+    )?;
+    let equivalence_key = format!("verification_failure:{}", ready.logical_id);
+    let equivalent_failures = transaction.query_row(
+        "SELECT COUNT(*) FROM attempt_recoveries
+         WHERE commission_id = ?1 AND equivalence_key = ?2",
+        params![commission_id, equivalence_key],
+        |row| row.get::<_, u32>(0),
+    )?;
+    let (attempt_count, max_attempts) = transaction.query_row(
+        "SELECT (
+            SELECT COUNT(*) FROM attempts
+            JOIN assignments ON assignments.id = attempts.assignment_id
+            WHERE assignments.commission_id = ?1
+         ), max_attempts
+         FROM resource_ceilings WHERE commission_id = ?1",
+        [commission_id],
+        |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+    )?;
+    if attempt_count >= max_attempts {
+        let requirement =
+            "Start a linked Commission with a higher max_attempts ceiling and the retained failed Evidence.";
+        transaction.execute(
+            "UPDATE results SET status = 'candidate', revision_disposition = 'retained'
+             WHERE id = ?1",
+            [result_id],
+        )?;
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![
+                ready.assignment_id,
+                AssignmentStatus::VerificationFailed.as_str()
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO blockers (
+                id, commission_id, assignment_id, code, requirement, created_at
+             ) VALUES (?1, ?2, ?3, 'max_attempts', ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                commission_id,
+                ready.assignment_id,
+                requirement,
+                unix_timestamp()?,
+            ],
+        )?;
+        record_attempt_recovery(
+            transaction,
+            AttemptRecovery {
+                commission_id,
+                assignment_id: &ready.assignment_id,
+                attempt_id,
+                cause: "verification_failure",
+                classification: "repairable_context",
+                equivalence_key: &equivalence_key,
+                action: "block",
+                requirement,
+            },
+        )?;
+        record_event(
+            transaction,
+            commission_id,
+            EventKind::AssignmentBlocked,
+            ready.mandate_revision,
+        )?;
+        return Ok(());
+    }
+    if equivalent_failures == 0 {
+        transaction.execute(
+            "UPDATE assignments SET status = ?2 WHERE id = ?1",
+            params![ready.assignment_id, AssignmentStatus::Ready.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE criteria SET status = 'uncertain'
+             WHERE commission_id = ?1 AND criterion_id IN (
+                 SELECT criterion_id FROM planned_assignment_criteria
+                 WHERE commission_id = ?1 AND assignment_logical_id = ?2
+             )",
+            params![commission_id, ready.logical_id],
+        )?;
+        record_attempt_recovery(
+            transaction,
+            AttemptRecovery {
+                commission_id,
+                assignment_id: &ready.assignment_id,
+                attempt_id,
+                cause: "verification_failure",
+                classification: "repairable_context",
+                equivalence_key: &equivalence_key,
+                action: "retry",
+                requirement: "Retry the same Worker Configuration once with the retained failed Evidence as repair context.",
+            },
+        )?;
+        record_event_with_payload(
+            transaction,
+            commission_id,
+            EventKind::AssignmentReady,
+            ready.mandate_revision,
+            &serde_json::json!({
+                "assignment_id": ready.assignment_id,
+                "reason": "bounded_same_configuration_retry",
+                "prior_attempt_id": attempt_id,
+            }),
+        )?;
+        return Ok(());
+    }
+
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![ready.assignment_id, AssignmentStatus::Superseded.as_str()],
+    )?;
+    let next_plan_revision = transaction.query_row(
+        "SELECT COALESCE(MAX(revision), 0) + 1 FROM commission_plans WHERE commission_id = ?1",
+        [commission_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let recovery_logical_id = format!("{}-recovery-{next_plan_revision}", ready.logical_id);
+    let mut requirements: WorkerRequirements = transaction.query_row(
+        "SELECT worker_requirements_json FROM planned_assignments
+         WHERE commission_id = ?1 AND logical_id = ?2",
+        params![commission_id, ready.logical_id],
+        |row| {
+            let encoded = row.get::<_, String>(0)?;
+            serde_json::from_str(&encoded).map_err(|error| invalid_json_column(0, error))
+        },
+    )?;
+    let failed_configuration = transaction.query_row(
+        "SELECT worker_configuration FROM attempts WHERE id = ?1",
+        [attempt_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    if !requirements
+        .exclude_configurations
+        .contains(&failed_configuration)
+    {
+        requirements
+            .exclude_configurations
+            .push(failed_configuration.clone());
+    }
+    transaction.execute(
+        "INSERT INTO planned_assignments (
+            commission_id, logical_id, position, goal, purpose,
+            read_scopes_json, write_scopes_json, concurrency_slots,
+            max_storage_bytes, max_model_spend_cents, max_paid_service_spend_cents,
+            worker_requirements_json, competition_group, competition_uncertainty,
+            competition_rule, created_plan_revision
+         )
+         SELECT commission_id, ?3, position, goal, purpose,
+                read_scopes_json, write_scopes_json, concurrency_slots,
+                max_storage_bytes, max_model_spend_cents, max_paid_service_spend_cents,
+                ?4, competition_group, competition_uncertainty, competition_rule, ?5
+         FROM planned_assignments WHERE commission_id = ?1 AND logical_id = ?2",
+        params![
+            commission_id,
+            ready.logical_id,
+            recovery_logical_id,
+            serde_json::to_string(&requirements)?,
+            next_plan_revision,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO planned_assignment_dependencies (
+            commission_id, assignment_logical_id, dependency_logical_id, position
+         )
+         SELECT commission_id, ?3, dependency_logical_id, position
+         FROM planned_assignment_dependencies
+         WHERE commission_id = ?1 AND assignment_logical_id = ?2",
+        params![commission_id, ready.logical_id, recovery_logical_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO planned_assignment_criteria (
+            commission_id, assignment_logical_id, criterion_id, position
+         )
+         SELECT commission_id, ?3, criterion_id, position
+         FROM planned_assignment_criteria
+         WHERE commission_id = ?1 AND assignment_logical_id = ?2",
+        params![commission_id, ready.logical_id, recovery_logical_id],
+    )?;
+    transaction.execute(
+        "UPDATE planned_assignment_dependencies
+         SET dependency_logical_id = ?3
+         WHERE commission_id = ?1 AND dependency_logical_id = ?2",
+        params![commission_id, ready.logical_id, recovery_logical_id],
+    )?;
+    let replacement_assignment_id = insert_ready_assignment(
+        transaction,
+        commission_id,
+        &recovery_logical_id,
+        next_plan_revision,
+        ready.mandate_revision,
+        ready.legacy,
+        unix_timestamp()?,
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO watchdog_findings (
+            id, commission_id, assignment_id, attempt_id, signal, action, details, created_at
+         ) VALUES (?1, ?2, ?3, ?4, 'repeated_verification_failure',
+                   'contain_attempt', ?5, ?6)",
+        params![
+            Uuid::new_v4().to_string(),
+            commission_id,
+            ready.assignment_id,
+            attempt_id,
+            "A second equivalent verification failure requires a revised plan rather than another blind retry.",
+            unix_timestamp()?,
+        ],
+    )?;
+    let requirement = format!(
+        "Provide an eligible Worker Configuration other than {failed_configuration}, or revise the Assignment decomposition before resuming."
+    );
+    let snapshot = serde_json::json!({
+        "reason": "second_equivalent_failure",
+        "superseded_assignment_id": ready.assignment_id,
+        "replacement_assignment_id": replacement_assignment_id,
+        "failed_configuration": failed_configuration,
+        "requirement": requirement,
+    });
+    transaction.execute(
+        "INSERT INTO commission_plans (
+            commission_id, revision, source, reason, snapshot_json, created_at
+         ) VALUES (?1, ?2, 'control_plane', 'second equivalent verification failure', ?3, ?4)",
+        params![
+            commission_id,
+            next_plan_revision,
+            serde_json::to_string(&snapshot)?,
+            unix_timestamp()?,
+        ],
+    )?;
+    record_attempt_recovery(
+        transaction,
+        AttemptRecovery {
+            commission_id,
+            assignment_id: &ready.assignment_id,
+            attempt_id,
+            cause: "verification_failure",
+            classification: "repairable_context",
+            equivalence_key: &equivalence_key,
+            action: "replan",
+            requirement: &requirement,
+        },
+    )?;
+    record_event_with_payload(
+        transaction,
+        commission_id,
+        EventKind::PlanRevised,
+        ready.mandate_revision,
+        &serde_json::json!({
+            "plan_revision": next_plan_revision,
+            "reason": "second_equivalent_failure",
+            "superseded_assignment_id": ready.assignment_id,
+            "replacement_assignment_id": replacement_assignment_id,
+        }),
+    )?;
+    Ok(())
+}
+
 fn release_successful_attempt(
     transaction: &Transaction<'_>,
     release: SuccessfulAttemptRelease<'_>,
@@ -5128,6 +7009,50 @@ fn block_ready_assignment(
         mandate_revision,
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn record_attempt_recovery(
+    transaction: &Transaction<'_>,
+    recovery: AttemptRecovery<'_>,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO attempt_recoveries (
+            id, commission_id, assignment_id, attempt_id, cause, classification,
+            equivalence_key, action, requirement, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            Uuid::new_v4().to_string(),
+            recovery.commission_id,
+            recovery.assignment_id,
+            recovery.attempt_id,
+            recovery.cause,
+            recovery.classification,
+            recovery.equivalence_key,
+            recovery.action,
+            recovery.requirement,
+            unix_timestamp()?,
+        ],
+    )?;
+    record_event_with_payload(
+        transaction,
+        recovery.commission_id,
+        EventKind::RecoveryDecided,
+        transaction.query_row(
+            "SELECT revision FROM commissions WHERE id = ?1",
+            [recovery.commission_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        &serde_json::json!({
+            "assignment_id": recovery.assignment_id,
+            "attempt_id": recovery.attempt_id,
+            "cause": recovery.cause,
+            "classification": recovery.classification,
+            "equivalence_key": recovery.equivalence_key,
+            "action": recovery.action,
+            "requirement": recovery.requirement,
+        }),
+    )?;
     Ok(())
 }
 

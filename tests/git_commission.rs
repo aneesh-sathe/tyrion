@@ -20,8 +20,17 @@ struct RunningDaemon {
 
 impl RunningDaemon {
     fn start(data_dir: &Path, worker_config: &Path, _fake_state: &Path) -> Self {
+        Self::start_with_arguments(data_dir, worker_config, &[])
+    }
+
+    fn start_with_arguments(
+        data_dir: &Path,
+        worker_config: &Path,
+        extra_arguments: &[&str],
+    ) -> Self {
         let socket_path = data_dir.join("tyrion.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_tyriond"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tyriond"));
+        command
             .args([
                 "--data-dir",
                 path_text(data_dir),
@@ -30,8 +39,8 @@ impl RunningDaemon {
                 "--codex-worker-config",
                 path_text(worker_config),
             ])
-            .spawn()
-            .expect("daemon should start");
+            .args(extra_arguments);
+        let child = command.spawn().expect("daemon should start");
         let mut daemon = Self { child, socket_path };
         daemon.wait_until_ready();
         daemon
@@ -252,6 +261,123 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert!(!log.lines().any(|line| {
         line.contains("sandbox upload") && line.contains(path_text(&principal_checkout))
     }));
+}
+
+#[test]
+fn restart_restores_unacknowledged_integration_before_retry() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let fake_state = temp.path().join("fake-openshell");
+    fs::create_dir(&fake_state).unwrap();
+    let fake_openshell = write_executable(
+        &temp.path().join("openshell"),
+        include_str!("fixtures/fake_openshell.sh"),
+    );
+    let fake_codex = write_executable(
+        &temp.path().join("codex"),
+        include_str!("fixtures/fake_codex.sh"),
+    );
+    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let first = RunningDaemon::start_with_arguments(
+        &data_dir,
+        &runtime,
+        &["--fault-hold-worker-after-external-integration"],
+    );
+    let attachment_token = connect_full_entry(&first);
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    set_proposal_ceiling(&proposal_path, "max_attempts", 2);
+    let commission_id = create_and_accept(&first, &attachment_token, &proposal_path);
+    let integration_repository = data_dir
+        .join("integrations")
+        .join(&commission_id)
+        .join("repository");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if integration_repository.exists() {
+            let integration_revision = Command::new("git")
+                .arg("-C")
+                .arg(&integration_repository)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            if integration_revision.status.success()
+                && String::from_utf8_lossy(&integration_revision.stdout).trim() != base_revision
+            {
+                let inspected = run_cli(
+                    &first.socket_path,
+                    &[
+                        "--attachment-token",
+                        &attachment_token,
+                        "commission",
+                        "inspect",
+                        &commission_id,
+                    ],
+                );
+                assert!(inspected["results"][0]["integrated_artifact_revision"].is_null());
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "Integration was not mutated");
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(first);
+
+    let second =
+        RunningDaemon::start_with_arguments(&data_dir, &runtime, &["--fault-defer-ready-dispatch"]);
+    assert_eq!(
+        git_output(&integration_repository, &["rev-parse", "HEAD"]).trim(),
+        base_revision
+    );
+    let recovered = run_cli(
+        &second.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "commission",
+            "inspect",
+            &commission_id,
+        ],
+    );
+    assert_eq!(recovered["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered["attempts"][0]["status"], "failed");
+    assert_eq!(
+        recovered["restart_recoveries"][0]["cleanup_confirmed"],
+        true
+    );
+    assert_eq!(
+        recovered["restart_recoveries"][0]["proofs"]["acknowledged_state"],
+        false
+    );
+    drop(second);
+
+    let third = RunningDaemon::start(&data_dir, &runtime, &fake_state);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completed = loop {
+        let inspected = run_cli(
+            &third.socket_path,
+            &[
+                "--attachment-token",
+                &attachment_token,
+                "commission",
+                "inspect",
+                &commission_id,
+            ],
+        );
+        if inspected["commission"]["status"] == "verified_complete" {
+            break inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovered Commission did not complete: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(completed["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
 }
 
 #[test]
@@ -1244,6 +1370,58 @@ fn slow_worker_does_not_block_the_control_plane_listener() {
     );
     assert_eq!(inspected["commission"]["status"], "active");
     wait_for_failed_attempt(&daemon, &attachment_token, &commission_id);
+}
+
+#[test]
+fn watchdog_deletes_a_stalled_candidate_verification_sandbox() {
+    let fixture = FailedFixture::new("hold-candidate-verification");
+    set_proposal_ceiling(&fixture.proposal_path, "max_attempts", 2);
+    let daemon = RunningDaemon::start_with_arguments(
+        &fixture.data_dir,
+        &fixture.runtime,
+        &["--watchdog-stall-milliseconds", "1500"],
+    );
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &fixture.proposal_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let contained = loop {
+        let inspected = run_cli(
+            &daemon.socket_path,
+            &[
+                "--attachment-token",
+                &attachment_token,
+                "commission",
+                "inspect",
+                &commission_id,
+            ],
+        );
+        if inspected["commission"]["status"] == "verified_complete" {
+            break inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Watchdog did not contain candidate verification: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(contained["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(contained["attempts"][0]["status"], "timed_out");
+    assert_eq!(contained["attempts"][0]["cleanup_pending"], false);
+    assert_eq!(contained["attempts"][1]["status"], "succeeded");
+    assert_eq!(contained["results"][0]["status"], "superseded");
+    assert!(contained["results"][0]["integrated_artifact_revision"].is_null());
+    assert!(contained["watchdog"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["signal"] == "stall"));
+    let remaining_sandboxes = fs::read_dir(fixture.fake_state.join("sandboxes"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(remaining_sandboxes.is_empty());
+    let log = fs::read_to_string(fixture.fake_state.join("commands.log")).unwrap();
+    assert!(log.contains("descendant-terminated"));
 }
 
 #[test]

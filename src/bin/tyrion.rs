@@ -120,6 +120,27 @@ enum CommissionCommand {
         #[arg(long)]
         idempotency_key: String,
     },
+    Pause {
+        commission_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Resume {
+        commission_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Cancel {
+        commission_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
     RecordEvidence {
         commission_id: String,
         #[arg(long)]
@@ -272,6 +293,51 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     },
             } => (
                 Command::AcceptCommission {
+                    commission_id: commission_id.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::Pause {
+                        commission_id,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::PauseCommission {
+                    commission_id: commission_id.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::Resume {
+                        commission_id,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ResumeCommission {
+                    commission_id: commission_id.clone(),
+                },
+                Some(idempotency_key.clone()),
+                Some(*expected_revision),
+                None,
+            ),
+            TopLevelCommand::Commission {
+                command:
+                    CommissionCommand::Cancel {
+                        commission_id,
+                        expected_revision,
+                        idempotency_key,
+                    },
+            } => (
+                Command::CancelCommission {
                     commission_id: commission_id.clone(),
                 },
                 Some(idempotency_key.clone()),

@@ -9,7 +9,9 @@ pub(super) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS commissions (
     id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('proposed', 'active', 'verified_complete')),
+    status TEXT NOT NULL CHECK (status IN (
+        'proposed', 'active', 'paused', 'cancelled', 'verified_complete'
+    )),
     revision INTEGER NOT NULL,
     control_revision INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
@@ -139,7 +141,7 @@ CREATE TABLE IF NOT EXISTS assignments (
     plan_revision INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN (
         'ready', 'running', 'accepted', 'superseded', 'verification_pending', 'verification_failed',
-        'resource_blocked', 'attention_required'
+        'resource_blocked', 'attention_required', 'cancelled'
     )),
     created_at INTEGER NOT NULL,
     UNIQUE (id, commission_id)
@@ -172,12 +174,17 @@ CREATE TABLE IF NOT EXISTS attempts (
     id TEXT PRIMARY KEY,
     assignment_id TEXT NOT NULL REFERENCES assignments(id),
     worker_configuration TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
+    status TEXT NOT NULL CHECK (status IN (
+        'running', 'succeeded', 'failed', 'interrupted', 'timed_out', 'cancelled'
+    )),
     started_at INTEGER NOT NULL,
     completed_at INTEGER,
     started_at_ms INTEGER NOT NULL,
     execution_completed_at_ms INTEGER,
-    completed_at_ms INTEGER
+    completed_at_ms INTEGER,
+    revision_disposition TEXT NOT NULL DEFAULT 'current' CHECK (revision_disposition IN (
+        'current', 'retained', 'superseded', 'stale', 'requires_revalidation'
+    ))
 );
 
 CREATE TABLE IF NOT EXISTS assignment_routes (
@@ -207,7 +214,9 @@ CREATE TABLE IF NOT EXISTS workers (
     handle TEXT NOT NULL,
     configuration_json TEXT NOT NULL,
     routing_rationale_json TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
+    status TEXT NOT NULL CHECK (status IN (
+        'running', 'succeeded', 'failed', 'interrupted', 'timed_out', 'cancelled'
+    )),
     native_session_id TEXT,
     latest_activity TEXT NOT NULL,
     activity_at_ms INTEGER NOT NULL,
@@ -264,6 +273,56 @@ CREATE TABLE IF NOT EXISTS worker_configuration_failures (
     UNIQUE (assignment_id, configuration_id)
 );
 
+CREATE TABLE IF NOT EXISTS attempt_recoveries (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),
+    cause TEXT NOT NULL,
+    classification TEXT NOT NULL CHECK (classification IN (
+        'transient', 'repairable_context', 'poor_fit', 'resource', 'authority',
+        'interrupted', 'cancelled'
+    )),
+    equivalence_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN (
+        'retry', 'reroute', 'replan', 'block', 'await_principal', 'cancel'
+    )),
+    requirement TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS restart_recoveries (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    decision TEXT NOT NULL CHECK (
+        decision IN ('reattach', 'expire_and_retry', 'expire_and_replan', 'expire_and_block')
+    ),
+    process_identity INTEGER NOT NULL CHECK (process_identity IN (0, 1)),
+    native_session_identity INTEGER NOT NULL CHECK (native_session_identity IN (0, 1)),
+    acknowledged_state INTEGER NOT NULL CHECK (acknowledged_state IN (0, 1)),
+    lease_validity INTEGER NOT NULL CHECK (lease_validity IN (0, 1)),
+    current_authority INTEGER NOT NULL CHECK (current_authority IN (0, 1)),
+    containment INTEGER NOT NULL CHECK (containment IN (0, 1)),
+    cleanup_confirmed INTEGER NOT NULL CHECK (cleanup_confirmed IN (0, 1)),
+    requirement TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watchdog_findings (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    signal TEXT NOT NULL CHECK (signal IN (
+        'stall', 'unhealthy_retry_pattern', 'repeated_verification_failure',
+        'abnormal_resource_use', 'lost_liveness', 'invalid_authority'
+    )),
+    action TEXT NOT NULL CHECK (action = 'contain_attempt'),
+    details TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (attempt_id, signal)
+);
+
 CREATE TABLE IF NOT EXISTS results (
     id TEXT PRIMARY KEY,
     attempt_id TEXT NOT NULL REFERENCES attempts(id),
@@ -279,7 +338,10 @@ CREATE TABLE IF NOT EXISTS results (
     artifacts_json TEXT NOT NULL DEFAULT '[]',
     verification_outcomes_json TEXT NOT NULL DEFAULT '[]',
     known_effects_json TEXT NOT NULL DEFAULT '[]',
-    integrated_artifact_revision TEXT
+    integrated_artifact_revision TEXT,
+    revision_disposition TEXT NOT NULL DEFAULT 'current' CHECK (revision_disposition IN (
+        'current', 'retained', 'superseded', 'stale', 'requires_revalidation'
+    ))
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -409,7 +471,9 @@ CREATE TABLE IF NOT EXISTS events (
         'evidence_recorded',
         'commission_verified_complete', 'assignment_blocked',
         'attachment_joined', 'active_attachment_changed',
-        'worker_steered', 'worker_interrupted', 'worker_activity'
+        'worker_steered', 'worker_interrupted', 'worker_activity',
+        'commission_paused', 'commission_resumed', 'commission_cancelled',
+        'recovery_decided', 'attempt_contained', 'restart_reconciled'
     )),
     commission_revision INTEGER NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -486,6 +550,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             [],
         )?;
     }
+    upgrade_commissions(connection)?;
     if !column_exists(
         connection,
         "planned_assignments",
@@ -499,8 +564,10 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     upgrade_criteria(connection)?;
     backfill_criterion_versions(connection)?;
     upgrade_assignments(connection)?;
+    add_attempt_disposition(connection)?;
     upgrade_attempts(connection)?;
     add_attempt_timing_columns(connection)?;
+    upgrade_workers(connection)?;
     upgrade_evidence(connection)?;
     connection.execute_batch(
         r#"
@@ -530,6 +597,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             || !schema.contains("commission_amended")
             || !schema.contains("useful_concurrency_observed")
             || !schema.contains("worker_steered")
+            || !schema.contains("commission_paused")
     });
     if needs_event_upgrade {
         let payload_projection = if events_schema
@@ -555,7 +623,9 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
                     'evidence_recorded',
                     'commission_verified_complete', 'assignment_blocked',
                     'attachment_joined', 'active_attachment_changed',
-                    'worker_steered', 'worker_interrupted', 'worker_activity'
+                    'worker_steered', 'worker_interrupted', 'worker_activity',
+                    'commission_paused', 'commission_resumed', 'commission_cancelled',
+                    'recovery_decided', 'attempt_contained', 'restart_reconciled'
                 )),
                 commission_revision INTEGER NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{{}}',
@@ -574,7 +644,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
     backfill_planned_assignments(connection)?;
     backfill_assignment_metadata(connection)?;
     upgrade_worker_commands(connection)?;
-    connection.pragma_update(None, "user_version", 10)?;
+    connection.pragma_update(None, "user_version", 11)?;
     Ok(())
 }
 
@@ -590,17 +660,24 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let attempts_schema = table_schema(connection, "attempts")?;
     let evidence_schema = table_schema(connection, "evidence")?;
     let results_schema = table_schema(connection, "results")?;
-    Ok(user_version < 10
+    let commissions_schema = table_schema(connection, "commissions")?;
+    let workers_schema = table_schema(connection, "workers")?;
+    Ok(user_version < 11
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
         || !column_exists(connection, "commissions", "worker_requirements_json")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
-        || results_schema.is_some_and(|schema| !schema.contains("'superseded'"))
+        || results_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.contains("'superseded'"))
         || !table_exists(connection, "worker_leases")?
         || !table_exists(connection, "sandbox_cleanups")?
         || !table_exists(connection, "worker_configuration_failures")?
+        || !table_exists(connection, "attempt_recoveries")?
+        || !table_exists(connection, "restart_recoveries")?
+        || !table_exists(connection, "watchdog_findings")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
@@ -623,14 +700,31 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
         || !table_exists(connection, "resource_reservations")?
         || !column_exists(connection, "attempts", "started_at_ms")?
         || !column_exists(connection, "attempts", "execution_completed_at_ms")?
+        || !column_exists(connection, "attempts", "revision_disposition")?
+        || !column_exists(connection, "results", "revision_disposition")?
+        || attempts_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.contains("'requires_revalidation'"))
+        || results_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.contains("'requires_revalidation'"))
+        || commissions_schema
+            .is_some_and(|schema| !schema.contains("'paused'") || !schema.contains("'cancelled'"))
         || criteria_schema.is_some_and(|schema| !schema.contains("required_evidence"))
         || assignments_schema.is_some_and(|schema| {
             !schema.contains("'verification_pending'")
                 || !schema.contains("'superseded'")
                 || !schema.contains("'attention_required'")
+                || !schema.contains("'cancelled'")
         })
         || attempts_schema.is_some_and(|schema| {
-            !schema.contains("'failed'") || !schema.contains("'interrupted'")
+            !schema.contains("'failed'")
+                || !schema.contains("'interrupted'")
+                || !schema.contains("'timed_out'")
+                || !schema.contains("'cancelled'")
+        })
+        || workers_schema.is_some_and(|schema| {
+            !schema.contains("'timed_out'") || !schema.contains("'cancelled'")
         })
         || evidence_schema.is_some_and(|schema| !schema.contains("verification_attempt_id"))
         || events_schema.is_some_and(|schema| {
@@ -640,6 +734,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
                 || !schema.contains("commission_amended")
                 || !schema.contains("useful_concurrency_observed")
                 || !schema.contains("worker_steered")
+                || !schema.contains("commission_paused")
         }))
 }
 
@@ -647,7 +742,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v10", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v11", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -674,7 +769,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 10
+    if user_version != 11
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -684,6 +779,9 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !table_exists(connection, "worker_leases")?
         || !table_exists(connection, "sandbox_cleanups")?
         || !table_exists(connection, "worker_configuration_failures")?
+        || !table_exists(connection, "attempt_recoveries")?
+        || !table_exists(connection, "restart_recoveries")?
+        || !table_exists(connection, "watchdog_findings")?
         || !table_exists(connection, "criterion_versions")?
         || !table_exists(connection, "verification_gates")?
         || !table_exists(connection, "verification_recoveries")?
@@ -704,6 +802,8 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !table_exists(connection, "resource_reservations")?
         || !column_exists(connection, "attempts", "started_at_ms")?
         || !column_exists(connection, "attempts", "execution_completed_at_ms")?
+        || !column_exists(connection, "attempts", "revision_disposition")?
+        || !column_exists(connection, "results", "revision_disposition")?
     {
         return Err(TyrionError::InvalidRequest(
             "schema migration verification failed".into(),
@@ -733,6 +833,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !events_schema.contains("commission_amended")
         || !events_schema.contains("useful_concurrency_observed")
         || !events_schema.contains("worker_steered")
+        || !events_schema.contains("commission_paused")
     {
         return Err(TyrionError::InvalidRequest(
             "events schema migration verification failed".into(),
@@ -743,9 +844,14 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !assignments_schema.contains("'verification_pending'")
         || !assignments_schema.contains("'superseded'")
         || !assignments_schema.contains("'attention_required'")
+        || !assignments_schema.contains("'cancelled'")
         || !attempts_schema.contains("'failed'")
         || !attempts_schema.contains("'interrupted'")
+        || !attempts_schema.contains("'timed_out'")
+        || !attempts_schema.contains("'cancelled'")
+        || !attempts_schema.contains("'requires_revalidation'")
         || !results_schema.contains("'superseded'")
+        || !results_schema.contains("'requires_revalidation'")
         || !evidence_schema.contains("verification_attempt_id")
     {
         return Err(TyrionError::InvalidRequest(
@@ -832,6 +938,43 @@ fn backfill_criterion_versions(connection: &Connection) -> Result<(), TyrionErro
     Ok(())
 }
 
+fn upgrade_commissions(connection: &Connection) -> Result<(), TyrionError> {
+    let Some(schema) = table_schema(connection, "commissions")? else {
+        return Ok(());
+    };
+    if schema.contains("'paused'") && schema.contains("'cancelled'") {
+        return Ok(());
+    }
+    connection.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        CREATE TABLE commissions_v11 (
+            id TEXT PRIMARY KEY,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN (
+                'proposed', 'active', 'paused', 'cancelled', 'verified_complete'
+            )),
+            revision INTEGER NOT NULL,
+            control_revision INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            accepted_at INTEGER,
+            completed_at INTEGER,
+            artifact_revision TEXT,
+            execution_json TEXT NOT NULL DEFAULT '{"kind":"deterministic"}',
+            worker_requirements_json TEXT NOT NULL DEFAULT '{}',
+            plan_json TEXT
+        );
+        INSERT INTO commissions_v11 SELECT * FROM commissions;
+        DROP TABLE commissions;
+        ALTER TABLE commissions_v11 RENAME TO commissions;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
     let Some(schema) = table_schema(connection, "assignments")? else {
         return Ok(());
@@ -839,6 +982,7 @@ fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
     if schema.contains("'verification_pending'")
         && schema.contains("'superseded'")
         && schema.contains("'attention_required'")
+        && schema.contains("'cancelled'")
     {
         return Ok(());
     }
@@ -852,7 +996,7 @@ fn upgrade_assignments(connection: &Connection) -> Result<(), TyrionError> {
             plan_revision INTEGER NOT NULL,
             status TEXT NOT NULL CHECK (status IN (
                 'ready', 'running', 'accepted', 'superseded', 'verification_pending',
-                'verification_failed', 'resource_blocked', 'attention_required'
+                'verification_failed', 'resource_blocked', 'attention_required', 'cancelled'
             )),
             created_at INTEGER NOT NULL,
             UNIQUE (id, commission_id)
@@ -871,7 +1015,12 @@ fn upgrade_attempts(connection: &Connection) -> Result<(), TyrionError> {
     let Some(schema) = table_schema(connection, "attempts")? else {
         return Ok(());
     };
-    if schema.contains("'failed'") && schema.contains("'interrupted'") {
+    if schema.contains("'failed'")
+        && schema.contains("'interrupted'")
+        && schema.contains("'timed_out'")
+        && schema.contains("'cancelled'")
+        && schema.contains("revision_disposition")
+    {
         return Ok(());
     }
     connection.execute_batch(
@@ -882,22 +1031,75 @@ fn upgrade_attempts(connection: &Connection) -> Result<(), TyrionError> {
             id TEXT PRIMARY KEY,
             assignment_id TEXT NOT NULL REFERENCES assignments(id),
             worker_configuration TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
+            status TEXT NOT NULL CHECK (status IN (
+                'running', 'succeeded', 'failed', 'interrupted', 'timed_out', 'cancelled'
+            )),
             started_at INTEGER NOT NULL,
             completed_at INTEGER,
             started_at_ms INTEGER NOT NULL,
             execution_completed_at_ms INTEGER,
-            completed_at_ms INTEGER
+            completed_at_ms INTEGER,
+            revision_disposition TEXT NOT NULL DEFAULT 'current' CHECK (revision_disposition IN (
+                'current', 'retained', 'superseded', 'stale', 'requires_revalidation'
+            ))
         );
         INSERT INTO attempts_v5 (
             id, assignment_id, worker_configuration, status, started_at, completed_at,
-            started_at_ms, execution_completed_at_ms, completed_at_ms
+            started_at_ms, execution_completed_at_ms, completed_at_ms, revision_disposition
         )
         SELECT id, assignment_id, worker_configuration, status, started_at, completed_at,
-               started_at_ms, execution_completed_at_ms, completed_at_ms
+               started_at_ms, execution_completed_at_ms, completed_at_ms, revision_disposition
         FROM attempts;
         DROP TABLE attempts;
         ALTER TABLE attempts_v5 RENAME TO attempts;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_attempt_disposition(connection: &Connection) -> Result<(), TyrionError> {
+    if !column_exists(connection, "attempts", "revision_disposition")? {
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN revision_disposition TEXT NOT NULL DEFAULT 'current'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn upgrade_workers(connection: &Connection) -> Result<(), TyrionError> {
+    let Some(schema) = table_schema(connection, "workers")? else {
+        return Ok(());
+    };
+    if schema.contains("'timed_out'") && schema.contains("'cancelled'") {
+        return Ok(());
+    }
+    connection.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        CREATE TABLE workers_v11 (
+            id TEXT PRIMARY KEY,
+            commission_id TEXT NOT NULL REFERENCES commissions(id),
+            assignment_id TEXT NOT NULL REFERENCES assignments(id),
+            attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),
+            handle TEXT NOT NULL,
+            configuration_json TEXT NOT NULL,
+            routing_rationale_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN (
+                'running', 'succeeded', 'failed', 'interrupted', 'timed_out', 'cancelled'
+            )),
+            native_session_id TEXT,
+            latest_activity TEXT NOT NULL,
+            activity_at_ms INTEGER NOT NULL,
+            usage_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE (commission_id, handle)
+        );
+        INSERT INTO workers_v11 SELECT * FROM workers;
+        DROP TABLE workers;
+        ALTER TABLE workers_v11 RENAME TO workers;
         COMMIT;
         PRAGMA foreign_keys = ON;
         "#,
@@ -1082,6 +1284,7 @@ fn add_result_columns(connection: &Connection) -> Result<(), TyrionError> {
         ("verification_outcomes_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("known_effects_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("integrated_artifact_revision", "TEXT"),
+        ("revision_disposition", "TEXT NOT NULL DEFAULT 'current'"),
     ];
     for (name, definition) in columns {
         if !column_exists(connection, "results", name)? {
@@ -1098,7 +1301,7 @@ fn upgrade_results(connection: &Connection) -> Result<(), TyrionError> {
     let Some(schema) = table_schema(connection, "results")? else {
         return Ok(());
     };
-    if schema.contains("'superseded'") {
+    if schema.contains("'superseded'") && schema.contains("'requires_revalidation'") {
         return Ok(());
     }
     connection.execute_batch(
@@ -1120,18 +1323,21 @@ fn upgrade_results(connection: &Connection) -> Result<(), TyrionError> {
             artifacts_json TEXT NOT NULL DEFAULT '[]',
             verification_outcomes_json TEXT NOT NULL DEFAULT '[]',
             known_effects_json TEXT NOT NULL DEFAULT '[]',
-            integrated_artifact_revision TEXT
+            integrated_artifact_revision TEXT,
+            revision_disposition TEXT NOT NULL DEFAULT 'current' CHECK (revision_disposition IN (
+                'current', 'retained', 'superseded', 'stale', 'requires_revalidation'
+            ))
         );
         INSERT INTO results_v5 (
             id, attempt_id, output, artifact_revision, status, created_at,
-            mandate_revision, base_revision, candidate_commits_json,
+            mandate_revision, plan_revision, base_revision, candidate_commits_json,
             changed_paths_json, artifacts_json, verification_outcomes_json,
-            known_effects_json, integrated_artifact_revision
+            known_effects_json, integrated_artifact_revision, revision_disposition
         )
         SELECT id, attempt_id, output, artifact_revision, status, created_at,
-               mandate_revision, base_revision, candidate_commits_json,
+               mandate_revision, plan_revision, base_revision, candidate_commits_json,
                changed_paths_json, artifacts_json, verification_outcomes_json,
-               known_effects_json, integrated_artifact_revision
+               known_effects_json, integrated_artifact_revision, revision_disposition
         FROM results;
         DROP TABLE results;
         ALTER TABLE results_v5 RENAME TO results;
@@ -1321,5 +1527,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(timing, (10, 20, 10001, 15002, 20003));
+    }
+
+    #[test]
+    fn version_ten_results_gain_checked_dispositions_without_losing_plan_revision() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let database_path = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                DROP TABLE results;
+                CREATE TABLE results (
+                    id TEXT PRIMARY KEY,
+                    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+                    output TEXT NOT NULL,
+                    artifact_revision TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('candidate', 'accepted', 'superseded')),
+                    created_at INTEGER NOT NULL,
+                    mandate_revision INTEGER,
+                    plan_revision INTEGER,
+                    base_revision TEXT,
+                    candidate_commits_json TEXT NOT NULL DEFAULT '[]',
+                    changed_paths_json TEXT NOT NULL DEFAULT '[]',
+                    artifacts_json TEXT NOT NULL DEFAULT '[]',
+                    verification_outcomes_json TEXT NOT NULL DEFAULT '[]',
+                    known_effects_json TEXT NOT NULL DEFAULT '[]',
+                    integrated_artifact_revision TEXT
+                );
+                INSERT INTO commissions (id, goal, status, revision, created_at)
+                VALUES ('commission-v10', 'migration fixture', 'active', 1, 1);
+                INSERT INTO assignments (id, commission_id, plan_revision, status, created_at)
+                VALUES ('assignment-v10', 'commission-v10', 7, 'running', 1);
+                INSERT INTO attempts (
+                    id, assignment_id, worker_configuration, status, started_at,
+                    started_at_ms, revision_disposition
+                ) VALUES (
+                    'attempt-v10', 'assignment-v10', 'legacy-worker', 'succeeded', 1, 1000, 'current'
+                );
+                INSERT INTO results (
+                    id, attempt_id, output, artifact_revision, status, created_at,
+                    mandate_revision, plan_revision
+                ) VALUES (
+                    'result-v10', 'attempt-v10', 'result', 'sha256:fixture',
+                    'superseded', 2, 3, 7
+                );
+                PRAGMA user_version = 10;
+                PRAGMA foreign_keys = ON;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(super::super::Store::open(&database_path).unwrap());
+        let connection = Connection::open(database_path).unwrap();
+        let (plan_revision, disposition) = connection
+            .query_row(
+                "SELECT plan_revision, revision_disposition FROM results WHERE id = 'result-v10'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plan_revision, 7);
+        assert_eq!(disposition, "current");
+        let invalid = connection.execute(
+            "UPDATE results SET revision_disposition = 'invalid' WHERE id = 'result-v10'",
+            [],
+        );
+        assert!(invalid.is_err());
     }
 }

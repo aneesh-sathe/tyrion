@@ -61,6 +61,8 @@ pub enum TyrionError {
     WorkerLeaseExpired { operation: &'static str },
     #[error("Worker was interrupted by the Principal")]
     WorkerInterrupted,
+    #[error("Watchdog contained the Attempt after detecting {signal}")]
+    WatchdogContained { signal: &'static str },
     #[error("Worker Configuration {configuration_id} is unavailable: {message}")]
     WorkerConfigurationUnavailable {
         configuration_id: String,
@@ -99,6 +101,7 @@ impl TyrionError {
             Self::ControlDenied(_) => ErrorCode::ControlDenied,
             Self::WorkerLeaseExpired { .. }
             | Self::WorkerInterrupted
+            | Self::WatchdogContained { .. }
             | Self::WorkerConfigurationUnavailable { .. }
             | Self::StorageCeilingExceeded { .. }
             | Self::IntegrationFailure { .. } => ErrorCode::InvalidRequest,

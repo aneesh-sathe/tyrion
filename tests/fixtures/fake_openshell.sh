@@ -137,6 +137,11 @@ case "$operation" in
             printf '%s\n' 'simulated integrated verification failure' >&2
             exit 7
         fi
+        if [[ -e $state/hold-candidate-verification && $name == tyrion-c-* && -n $workdir ]]; then
+            printf '%s\n' "$$" >"$root/verification-descendant.pid"
+            sleep 300
+            exit 91
+        fi
         exec env \
             TYRION_WORKSPACE_ROOT="$root" \
             CODEX_AUTH_ACCESS_TOKEN=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN \
@@ -147,6 +152,9 @@ case "$operation" in
         ;;
     delete)
         name=${1:-}
+        if [[ $name == tyrion-c-* && -f $state/sandboxes/$name/verification-descendant.pid ]]; then
+            rm -f "$state/hold-candidate-verification"
+        fi
         for descendant in "$state/sandboxes/$name"/*descendant.pid; do
             [[ -f $descendant ]] || continue
             kill "$(cat "$descendant")" 2>/dev/null || true

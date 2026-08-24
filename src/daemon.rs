@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::protocol::{Command, Request, Response, PROTOCOL_VERSION};
 use crate::store::Store;
-use crate::worker::WorkerRuntime;
+use crate::worker::{WorkerRuntime, WorkerRuntimeOptions};
 use crate::TyrionError;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -21,7 +21,7 @@ pub fn run_daemon(data_dir: &Path, socket_path: &Path) -> Result<(), TyrionError
     run_daemon_with_options(data_dir, socket_path, DaemonOptions::default())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DaemonOptions {
     pub defer_ready_dispatch: bool,
     pub corrupt_worker_artifact_revision: bool,
@@ -29,7 +29,29 @@ pub struct DaemonOptions {
     pub codex_worker_config: Option<PathBuf>,
     pub worker_catalog: Option<PathBuf>,
     pub hold_worker_for_control: bool,
+    pub hold_worker_before_integration: bool,
+    pub hold_worker_after_integration: bool,
+    pub hold_worker_after_external_integration: bool,
     pub skip_sandbox_cleanup: bool,
+    pub watchdog_stall_milliseconds: u64,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            defer_ready_dispatch: false,
+            corrupt_worker_artifact_revision: false,
+            incorrect_first_worker_result: false,
+            codex_worker_config: None,
+            worker_catalog: None,
+            hold_worker_for_control: false,
+            hold_worker_before_integration: false,
+            hold_worker_after_integration: false,
+            hold_worker_after_external_integration: false,
+            skip_sandbox_cleanup: false,
+            watchdog_stall_milliseconds: 30_000,
+        }
+    }
 }
 
 pub fn run_daemon_with_options(
@@ -49,17 +71,30 @@ pub fn run_daemon_with_options(
         data_dir,
         options.codex_worker_config.as_deref(),
         options.worker_catalog.as_deref(),
-        options.corrupt_worker_artifact_revision,
-        options.incorrect_first_worker_result,
-        options.hold_worker_for_control,
+        WorkerRuntimeOptions {
+            corrupt_artifact_revision: options.corrupt_worker_artifact_revision,
+            incorrect_first_result: options.incorrect_first_worker_result,
+            hold_for_control: options.hold_worker_for_control,
+            hold_before_integration: options.hold_worker_before_integration,
+            hold_after_integration: options.hold_worker_after_integration,
+            hold_after_external_integration: options.hold_worker_after_external_integration,
+        },
     )?);
     let pending_cleanups = store.recover_stranded_attempts()?;
     if !options.skip_sandbox_cleanup {
-        for attempt_id in pending_cleanups {
-            match worker.cleanup_stranded_attempt(&attempt_id) {
-                Ok(()) => store.complete_sandbox_cleanup(&attempt_id)?,
+        for cleanup in pending_cleanups {
+            match worker.cleanup_stranded_attempt(
+                &cleanup.attempt_id,
+                &cleanup.commission_id,
+                &cleanup.execution,
+                cleanup.artifact_revision.as_deref(),
+            ) {
+                Ok(()) => store.complete_sandbox_cleanup(&cleanup.attempt_id)?,
                 Err(error) => {
-                    eprintln!("sandbox cleanup for Attempt {attempt_id} remains pending: {error}")
+                    eprintln!(
+                        "containment cleanup for Attempt {} remains pending: {error}",
+                        cleanup.attempt_id
+                    )
                 }
             }
         }
@@ -67,6 +102,11 @@ pub fn run_daemon_with_options(
     if !options.defer_ready_dispatch {
         resume_ready_assignments(&mut store, &database_path, &worker)?;
     }
+    spawn_watchdog(
+        database_path.clone(),
+        Arc::clone(&worker),
+        options.watchdog_stall_milliseconds,
+    )?;
 
     for stream in listener.incoming() {
         match stream {
@@ -74,6 +114,44 @@ pub fn run_daemon_with_options(
             Err(error) => eprintln!("failed to accept local connection: {error}"),
         }
     }
+    Ok(())
+}
+
+fn spawn_watchdog(
+    database_path: PathBuf,
+    worker: Arc<WorkerRuntime>,
+    stall_milliseconds: u64,
+) -> Result<(), TyrionError> {
+    thread::Builder::new()
+        .name("commission-watchdog".into())
+        .spawn(move || {
+            let mut store = match Store::open(&database_path) {
+                Ok(store) => store,
+                Err(error) => {
+                    eprintln!("Commission Watchdog could not open durable state: {error}");
+                    return;
+                }
+            };
+            loop {
+                match store.watchdog_sweep(&worker, stall_milliseconds) {
+                    Ok(commission_ids) => {
+                        for commission_id in commission_ids {
+                            if let Err(error) = spawn_ready_assignment(
+                                database_path.clone(),
+                                Arc::clone(&worker),
+                                commission_id.clone(),
+                            ) {
+                                eprintln!(
+                                    "Commission Watchdog could not redispatch {commission_id}: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("Commission Watchdog sweep failed: {error}"),
+                }
+                thread::sleep(std::time::Duration::from_millis(25));
+            }
+        })?;
     Ok(())
 }
 
@@ -271,6 +349,16 @@ fn dispatch(
             data: store.accept_commission(request, commission_id, worker)?,
             follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
         }),
+        Command::PauseCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
+            store.pause_commission(request, commission_id)?,
+        )),
+        Command::ResumeCommission { commission_id } => Ok(DispatchOutcome {
+            data: store.resume_commission(request, commission_id)?,
+            follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
+        }),
+        Command::CancelCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
+            store.cancel_commission(request, commission_id, worker)?,
+        )),
         Command::RecordVerificationEvidence {
             commission_id,
             evidence,

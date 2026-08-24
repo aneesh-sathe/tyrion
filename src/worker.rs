@@ -29,13 +29,38 @@ pub(crate) struct WorkerRuntime {
     incorrect_first_result: bool,
     incorrect_result_commissions: Mutex<std::collections::HashSet<String>>,
     controls: Mutex<std::collections::HashMap<String, Arc<WorkerControl>>>,
+    integration_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     hold_for_control: bool,
+    hold_before_integration: bool,
+    hold_after_integration: bool,
+    hold_after_external_integration: bool,
+}
+
+pub(crate) struct WorkerRuntimeOptions {
+    pub(crate) corrupt_artifact_revision: bool,
+    pub(crate) incorrect_first_result: bool,
+    pub(crate) hold_for_control: bool,
+    pub(crate) hold_before_integration: bool,
+    pub(crate) hold_after_integration: bool,
+    pub(crate) hold_after_external_integration: bool,
+}
+
+pub(crate) struct AttemptControlScope<'a> {
+    runtime: &'a WorkerRuntime,
+    attempt_id: String,
+}
+
+impl Drop for AttemptControlScope<'_> {
+    fn drop(&mut self) {
+        let _ = self.runtime.end_attempt(&self.attempt_id);
+    }
 }
 
 pub(super) struct WorkerControl {
     mandate_revision: i64,
     interrupted: AtomicBool,
     interrupt_reason: Mutex<Option<(String, String)>>,
+    watchdog_signal: Mutex<Option<&'static str>>,
     clarifications: Mutex<Vec<(String, String)>>,
     delivered_commands: Mutex<std::collections::HashSet<String>>,
     changed: Condvar,
@@ -339,9 +364,7 @@ impl WorkerRuntime {
         data_dir: &Path,
         codex_worker_config: Option<&Path>,
         worker_catalog: Option<&Path>,
-        corrupt_artifact_revision: bool,
-        incorrect_first_result: bool,
-        hold_for_control: bool,
+        options: WorkerRuntimeOptions,
     ) -> Result<Self, TyrionError> {
         let contained_codex = codex_worker_config
             .map(|path| contained_codex::ContainedCodexRuntime::load(path, data_dir))
@@ -362,11 +385,15 @@ impl WorkerRuntime {
         Ok(Self {
             contained_codex,
             catalog,
-            corrupt_artifact_revision,
-            incorrect_first_result,
+            corrupt_artifact_revision: options.corrupt_artifact_revision,
+            incorrect_first_result: options.incorrect_first_result,
             incorrect_result_commissions: Mutex::new(std::collections::HashSet::new()),
             controls: Mutex::new(std::collections::HashMap::new()),
-            hold_for_control,
+            integration_locks: Mutex::new(std::collections::HashMap::new()),
+            hold_for_control: options.hold_for_control,
+            hold_before_integration: options.hold_before_integration,
+            hold_after_integration: options.hold_after_integration,
+            hold_after_external_integration: options.hold_after_external_integration,
         })
     }
 
@@ -384,6 +411,7 @@ impl WorkerRuntime {
                 mandate_revision,
                 interrupted: AtomicBool::new(false),
                 interrupt_reason: Mutex::new(None),
+                watchdog_signal: Mutex::new(None),
                 clarifications: Mutex::new(Vec::new()),
                 delivered_commands: Mutex::new(std::collections::HashSet::new()),
                 changed: Condvar::new(),
@@ -394,6 +422,29 @@ impl WorkerRuntime {
             }),
         );
         Ok(())
+    }
+
+    pub(crate) fn commission_integration_lock(
+        &self,
+        commission_id: &str,
+    ) -> Result<Arc<Mutex<()>>, TyrionError> {
+        let mut locks = self.integration_locks.lock().map_err(|_| {
+            TyrionError::InvalidRequest(
+                "Commission Integration lock registry is unavailable".into(),
+            )
+        })?;
+        Ok(Arc::clone(
+            locks
+                .entry(commission_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
+    pub(crate) fn attempt_control_scope(&self, attempt_id: &str) -> AttemptControlScope<'_> {
+        AttemptControlScope {
+            runtime: self,
+            attempt_id: attempt_id.to_owned(),
+        }
     }
 
     pub(crate) fn steer(
@@ -494,6 +545,41 @@ impl WorkerRuntime {
         Ok(())
     }
 
+    pub(crate) fn cancel_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
+        let command_id = format!("commission-cancel-{attempt_id}");
+        self.interrupt(
+            attempt_id,
+            &command_id,
+            "Commission cancelled by the Principal",
+        )
+    }
+
+    pub(crate) fn watchdog_contain(
+        &self,
+        attempt_id: &str,
+        signal: &'static str,
+    ) -> Result<(), TyrionError> {
+        let control = self.control(attempt_id)?;
+        *control.watchdog_signal.lock().map_err(|_| {
+            TyrionError::InvalidRequest("Watchdog signal registry is unavailable".into())
+        })? = Some(signal);
+        let command_id = format!("watchdog-{signal}-{attempt_id}");
+        if control.adapter_detached.load(Ordering::SeqCst) {
+            *control.interrupt_reason.lock().map_err(|_| {
+                TyrionError::InvalidRequest("Worker interruption channel is unavailable".into())
+            })? = Some((command_id, format!("Watchdog contained {signal}")));
+            control.interrupted.store(true, Ordering::SeqCst);
+            control.changed.notify_all();
+            Ok(())
+        } else {
+            self.interrupt(
+                attempt_id,
+                &command_id,
+                &format!("Watchdog contained {signal}"),
+            )
+        }
+    }
+
     pub(crate) fn end_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
         self.controls
             .lock()
@@ -504,9 +590,28 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    pub(crate) fn cleanup_stranded_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
-        if let Some(runtime) = self.contained_codex.as_ref() {
-            runtime.cleanup_stranded_attempt(attempt_id)?;
+    pub(crate) fn cleanup_stranded_attempt(
+        &self,
+        attempt_id: &str,
+        commission_id: &str,
+        execution: &ExecutionSpec,
+        artifact_revision: Option<&str>,
+    ) -> Result<(), TyrionError> {
+        let Some(runtime) = self.contained_codex.as_ref() else {
+            return if matches!(execution, ExecutionSpec::Deterministic) {
+                Ok(())
+            } else {
+                Err(TyrionError::InvalidRequest(
+                    "codex_git containment cleanup requires the pinned contained runtime".into(),
+                ))
+            };
+        };
+        runtime.cleanup_stranded_attempt(attempt_id)?;
+        if let ExecutionSpec::CodexGit { base_revision, .. } = execution {
+            runtime.restore_integration_repository(
+                commission_id,
+                artifact_revision.unwrap_or(base_revision),
+            )?;
         }
         Ok(())
     }
@@ -808,7 +913,14 @@ impl WorkerRuntime {
         })();
         let interrupted = control.interrupted.load(Ordering::SeqCst);
         if interrupted {
-            Err(TyrionError::WorkerInterrupted)
+            let watchdog_signal = *control.watchdog_signal.lock().map_err(|_| {
+                TyrionError::InvalidRequest("Watchdog signal registry is unavailable".into())
+            })?;
+            if let Some(signal) = watchdog_signal {
+                Err(TyrionError::WatchdogContained { signal })
+            } else {
+                Err(TyrionError::WorkerInterrupted)
+            }
         } else {
             result
         }
@@ -859,6 +971,24 @@ impl WorkerRuntime {
                     state: IntegratedState::CodexGit(integrated.state),
                 })
             }
+        }
+    }
+
+    pub(crate) fn wait_before_integration(&self) {
+        if self.hold_before_integration {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    pub(crate) fn wait_after_integration(&self) {
+        if self.hold_after_integration {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    pub(crate) fn wait_after_external_integration(&self) {
+        if self.hold_after_external_integration {
+            std::thread::sleep(Duration::from_secs(2));
         }
     }
 

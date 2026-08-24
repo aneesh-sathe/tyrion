@@ -4,6 +4,8 @@ use serde::Serialize;
 pub(crate) enum CommissionStatus {
     Proposed,
     Active,
+    Paused,
+    Cancelled,
     VerifiedComplete,
 }
 
@@ -12,6 +14,8 @@ impl CommissionStatus {
         match self {
             Self::Proposed => "proposed",
             Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Cancelled => "cancelled",
             Self::VerifiedComplete => "verified_complete",
         }
     }
@@ -44,6 +48,7 @@ pub(crate) enum AssignmentStatus {
     VerificationFailed,
     ResourceBlocked,
     AttentionRequired,
+    Cancelled,
 }
 
 impl AssignmentStatus {
@@ -57,6 +62,7 @@ impl AssignmentStatus {
             Self::VerificationFailed => "verification_failed",
             Self::ResourceBlocked => "resource_blocked",
             Self::AttentionRequired => "attention_required",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -67,6 +73,8 @@ pub(crate) enum AttemptStatus {
     Succeeded,
     Failed,
     Interrupted,
+    TimedOut,
+    Cancelled,
 }
 
 impl AttemptStatus {
@@ -76,6 +84,8 @@ impl AttemptStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -145,6 +155,12 @@ pub(crate) enum EventKind {
     WorkerSteered,
     WorkerInterrupted,
     WorkerActivity,
+    CommissionPaused,
+    CommissionResumed,
+    CommissionCancelled,
+    RecoveryDecided,
+    AttemptContained,
+    RestartReconciled,
 }
 
 impl EventKind {
@@ -170,6 +186,12 @@ impl EventKind {
             Self::WorkerSteered => "worker_steered",
             Self::WorkerInterrupted => "worker_interrupted",
             Self::WorkerActivity => "worker_activity",
+            Self::CommissionPaused => "commission_paused",
+            Self::CommissionResumed => "commission_resumed",
+            Self::CommissionCancelled => "commission_cancelled",
+            Self::RecoveryDecided => "recovery_decided",
+            Self::AttemptContained => "attempt_contained",
+            Self::RestartReconciled => "restart_reconciled",
         }
     }
 }

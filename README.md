@@ -37,6 +37,12 @@ Tyrion is a durable local Control Plane for software-building Commissions. The w
 - Complete Worker Configuration routing across Codex and Claude without Entry Session affinity
 - Hard capability, authority, tool, Skill, context, Assignment, and resource eligibility gates
 - Stable Commission-local Worker Handles with inspection, steering, and interruption
+- Cause-derived recovery with one bounded same-configuration retry, immediate poor-fit rerouting, and replanning after a second equivalent failure
+- Revision dispositions that retain superseded, stale, and revalidation-required Attempts and Results without allowing stale Integration
+- A daemon Watchdog that contains the narrowest stalled, unhealthy, over-budget, non-live, or unauthorized Attempt
+- Fail-closed restart reconciliation with explicit identity, acknowledgement, lease, authority, and containment proofs
+- Durable pause, resume, and Principal cancellation with lease and reservation revocation
+- Actionable resumable Blockers containing criteria, Evidence, artifacts, failed approaches, resource use, and the exact next requirement
 - Structured Codex app-server and Claude Agent SDK lifecycle contract validation
 - Approximately equal replacement or a durable Attention Condition when a preferred configuration is unavailable
 - A criterion-linked Verified Completion briefing
@@ -232,6 +238,30 @@ target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --capability worker_interruption \
   --last-event-sequence LAST_EVENT_SEQUENCE
 ```
+
+Pause stops new dispatch without changing the accepted mandate or discarding resumable work. Resume restarts safe frontier dispatch. Principal cancellation is terminal for that Commission: it revokes active Worker Leases and resource reservations while retaining history, integrated artifacts, and already-made effects.
+
+```sh
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  commission pause COMMISSION_ID \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key pause-1
+
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  commission resume COMMISSION_ID \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key resume-1
+
+target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  commission cancel COMMISSION_ID \
+  --expected-revision CURRENT_REVISION \
+  --idempotency-key cancel-1
+```
+
+Commission inspection exposes `recovery_history`, `restart_recoveries`, `watchdog`, and a derived `recovery` briefing. When no useful safe frontier remains, `recovery.resumable_blocker` names passed and unresolved criteria, retained artifacts and Evidence, failed approaches, cumulative resource use, and the exact requirement for progress.
 
 Inspection returns every Worker Handle, exact configuration, routing rationale, Assignment, elapsed time, latest meaningful activity, usage, and currently available controls. The Active Attachment can clarify or stop a running Worker without changing the Commission mandate revision:
 

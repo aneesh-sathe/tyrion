@@ -22,7 +22,15 @@ struct Arguments {
     #[arg(long, hide = true)]
     fault_hold_worker_for_control: bool,
     #[arg(long, hide = true)]
+    fault_hold_worker_before_integration: bool,
+    #[arg(long, hide = true)]
+    fault_hold_worker_after_integration: bool,
+    #[arg(long, hide = true)]
+    fault_hold_worker_after_external_integration: bool,
+    #[arg(long, hide = true)]
     fault_skip_sandbox_cleanup: bool,
+    #[arg(long, default_value_t = 30_000, hide = true)]
+    watchdog_stall_milliseconds: u64,
 }
 
 fn main() {
@@ -34,7 +42,12 @@ fn main() {
         codex_worker_config: arguments.codex_worker_config,
         worker_catalog: arguments.worker_catalog,
         hold_worker_for_control: arguments.fault_hold_worker_for_control,
+        hold_worker_before_integration: arguments.fault_hold_worker_before_integration,
+        hold_worker_after_integration: arguments.fault_hold_worker_after_integration,
+        hold_worker_after_external_integration: arguments
+            .fault_hold_worker_after_external_integration,
         skip_sandbox_cleanup: arguments.fault_skip_sandbox_cleanup,
+        watchdog_stall_milliseconds: arguments.watchdog_stall_milliseconds,
     };
     if let Err(error) =
         tyrion::run_daemon_with_options(&arguments.data_dir, &arguments.socket, options)

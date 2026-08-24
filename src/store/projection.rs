@@ -318,12 +318,16 @@ pub(super) fn inspect_commission(
                 resource_reservations.storage_bytes,
                 resource_reservations.model_spend_cents,
                 resource_reservations.paid_service_spend_cents,
-                resource_reservations.status
+                resource_reservations.status, attempts.revision_disposition,
+                EXISTS(
+                    SELECT 1 FROM sandbox_cleanups
+                    WHERE sandbox_cleanups.attempt_id = attempts.id
+                )
          FROM attempts
          JOIN assignments ON assignments.id = attempts.assignment_id
          LEFT JOIN worker_leases ON worker_leases.attempt_id = attempts.id
          LEFT JOIN resource_reservations ON resource_reservations.attempt_id = attempts.id
-         WHERE assignments.commission_id = ?1 ORDER BY attempts.started_at, attempts.id",
+         WHERE assignments.commission_id = ?1 ORDER BY attempts.started_at_ms, attempts.id",
         commission_id,
         |row| {
             let lease_id = row.get::<_, Option<String>>(9)?;
@@ -355,6 +359,8 @@ pub(super) fn inspect_commission(
                     "paid_service_spend_cents": row.get::<_, Option<u64>>(17)?,
                     "status": row.get::<_, Option<String>>(18)?,
                 },
+                "revision_disposition": row.get::<_, String>(19)?,
+                "cleanup_pending": row.get::<_, bool>(20)?,
             }))
         },
     )?;
@@ -437,7 +443,7 @@ pub(super) fn inspect_commission(
                 results.plan_revision, results.base_revision, results.candidate_commits_json,
                 results.changed_paths_json, results.artifacts_json,
                 results.verification_outcomes_json, results.known_effects_json,
-                results.integrated_artifact_revision
+                results.integrated_artifact_revision, results.revision_disposition
          FROM results
          JOIN attempts ON attempts.id = results.attempt_id
          JOIN assignments ON assignments.id = attempts.assignment_id
@@ -460,6 +466,7 @@ pub(super) fn inspect_commission(
                 "verification_outcomes": json_column(row, 12)?,
                 "known_effects": json_column(row, 13)?,
                 "integrated_artifact_revision": row.get::<_, Option<String>>(14)?,
+                "revision_disposition": row.get::<_, String>(15)?,
             }))
         },
     )?;
@@ -535,6 +542,70 @@ pub(super) fn inspect_commission(
                 "status": row.get::<_, String>(4)?,
                 "created_at": row.get::<_, i64>(5)?,
                 "resolved_at": row.get::<_, Option<i64>>(6)?,
+            }))
+        },
+    )?;
+    let recovery_history = query_values(
+        connection,
+        "SELECT id, assignment_id, attempt_id, cause, classification,
+                equivalence_key, action, requirement, created_at
+         FROM attempt_recoveries WHERE commission_id = ?1 ORDER BY created_at, rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "assignment_id": row.get::<_, String>(1)?,
+                "attempt_id": row.get::<_, String>(2)?,
+                "cause": row.get::<_, String>(3)?,
+                "classification": row.get::<_, String>(4)?,
+                "equivalence_key": row.get::<_, String>(5)?,
+                "action": row.get::<_, String>(6)?,
+                "requirement": row.get::<_, String>(7)?,
+                "created_at": row.get::<_, i64>(8)?,
+            }))
+        },
+    )?;
+    let restart_recoveries = query_values(
+        connection,
+        "SELECT attempt_id, decision, process_identity, native_session_identity,
+                acknowledged_state, lease_validity, current_authority, containment,
+                cleanup_confirmed, requirement, created_at
+         FROM restart_recoveries WHERE commission_id = ?1 ORDER BY created_at, rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "attempt_id": row.get::<_, String>(0)?,
+                "decision": row.get::<_, String>(1)?,
+                "proofs": {
+                    "process_identity": row.get::<_, bool>(2)?,
+                    "native_session_identity": row.get::<_, bool>(3)?,
+                    "acknowledged_state": row.get::<_, bool>(4)?,
+                    "lease_validity": row.get::<_, bool>(5)?,
+                    "current_authority": row.get::<_, bool>(6)?,
+                    "containment": row.get::<_, bool>(7)?,
+                },
+                "cleanup_confirmed": row.get::<_, bool>(8)?,
+                "requirement": row.get::<_, String>(9)?,
+                "created_at": row.get::<_, i64>(10)?,
+            }))
+        },
+    )?;
+    let watchdog_findings = query_values(
+        connection,
+        "SELECT id, assignment_id, attempt_id, signal, action, details, created_at
+         FROM watchdog_findings WHERE commission_id = ?1 ORDER BY created_at, rowid",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "scope": {
+                    "assignment_id": row.get::<_, String>(1)?,
+                    "attempt_id": row.get::<_, String>(2)?,
+                },
+                "signal": row.get::<_, String>(3)?,
+                "action": row.get::<_, String>(4)?,
+                "details": row.get::<_, String>(5)?,
+                "created_at": row.get::<_, i64>(6)?,
             }))
         },
     )?;
@@ -621,6 +692,11 @@ pub(super) fn inspect_commission(
         .iter()
         .filter(|assignment| assignment["status"] == "ready")
         .filter(|assignment| assignment["route"]["status"] != "attention_required")
+        .filter(|assignment| {
+            !attempts.iter().any(|attempt| {
+                attempt["assignment_id"] == assignment["id"] && attempt["cleanup_pending"] == true
+            })
+        })
         .map(|assignment| {
             let resources = &assignment["resources"];
             Work {
@@ -788,6 +864,102 @@ pub(super) fn inspect_commission(
         })
     };
 
+    let passed_criteria = criteria
+        .iter()
+        .filter(|criterion| criterion["status"] == "passed")
+        .filter_map(|criterion| criterion["id"].as_str())
+        .collect::<Vec<_>>();
+    let unresolved_criterion_ids = criteria
+        .iter()
+        .filter(|criterion| criterion["status"] != "passed")
+        .filter_map(|criterion| criterion["id"].as_str())
+        .collect::<Vec<_>>();
+    let running_attempt = attempts
+        .iter()
+        .any(|attempt| attempt["status"] == "running");
+    let exact_next_requirement = blockers
+        .last()
+        .and_then(|blocker| blocker["requirement"].as_str())
+        .or_else(|| {
+            attention_conditions
+                .iter()
+                .rev()
+                .find(|condition| condition["status"] == "open")
+                .and_then(|condition| condition["requirement"].as_str())
+        })
+        .or_else(|| {
+            restart_recoveries
+                .iter()
+                .rev()
+                .find(|recovery| recovery["cleanup_confirmed"] == false)
+                .and_then(|recovery| recovery["requirement"].as_str())
+        })
+        .unwrap_or_else(|| {
+            verification["reason"]
+                .as_str()
+                .unwrap_or("Provide sufficient current Evidence to resolve the remaining criteria.")
+        });
+    let no_useful_frontier = execution_frontier.is_empty() && !running_attempt;
+    let recovery_state = match commission["status"].as_str() {
+        Some("verified_complete") => "recovered",
+        Some("paused") => "paused",
+        Some("cancelled") => "cancelled",
+        _ if unresolved_criteria > 0 && no_useful_frontier => "blocked",
+        _ => "running",
+    };
+    let retained_artifacts = results
+        .iter()
+        .map(|result| {
+            json!({
+                "result_id": result["id"],
+                "artifact_revision": result["artifact_revision"],
+                "integrated_artifact_revision": result["integrated_artifact_revision"],
+                "artifacts": result["artifacts"],
+                "disposition": result["revision_disposition"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let resumable_blocker = (recovery_state == "blocked").then(|| {
+        json!({
+            "passed_criteria": passed_criteria,
+            "unresolved_criteria": unresolved_criterion_ids,
+            "retained_artifacts": retained_artifacts,
+            "evidence": evidence,
+            "failed_approaches": recovery_history,
+            "resource_use": {
+                "attempts": attempts.len(),
+                "reserved_model_spend_cents": reserved_model_spend,
+                "reserved_paid_service_spend_cents": reserved_paid_spend,
+                "active_concurrency_slots": reserved_concurrency,
+                "active_storage_bytes": reserved_storage,
+            },
+            "exact_next_requirement": exact_next_requirement,
+        })
+    });
+    let recovery = json!({
+        "state": recovery_state,
+        "resumable": recovery_state == "paused" || recovery_state == "blocked",
+        "resumable_blocker": resumable_blocker,
+        "cancellation": (recovery_state == "cancelled").then(|| json!({
+            "authority_grants_revoked": true,
+            "rollback_claimed": false,
+            "integrated_artifact_revision": commission["artifact_revision"],
+            "retained_results": results.len(),
+            "retained_evidence": evidence.len(),
+        })),
+    });
+    let watchdog = json!({
+        "monitored_signals": [
+            "stall",
+            "unhealthy_retry_pattern",
+            "repeated_verification_failure",
+            "abnormal_resource_use",
+            "lost_liveness",
+            "invalid_authority",
+        ],
+        "findings": watchdog_findings,
+    });
+
     Ok(json!({
         "commission": commission,
         "criteria": criteria,
@@ -807,6 +979,10 @@ pub(super) fn inspect_commission(
         "events": events,
         "blockers": blockers,
         "attention_conditions": attention_conditions,
+        "recovery_history": recovery_history,
+        "restart_recoveries": restart_recoveries,
+        "recovery": recovery,
+        "watchdog": watchdog,
         "attachments": attachments,
         "activity_journal": activity_journal,
         "verification": verification,
