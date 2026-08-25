@@ -25,36 +25,64 @@ CREATE TABLE IF NOT EXISTS commissions (
     commission_constraints_json TEXT NOT NULL DEFAULT '[]'
 );
 
+CREATE TABLE IF NOT EXISTS projects (
+    project_id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_identities (
+    project_id TEXT NOT NULL REFERENCES projects(project_id),
+    repository_device INTEGER NOT NULL,
+    repository_inode INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, repository_device, repository_inode),
+    UNIQUE (repository_device, repository_inode)
+);
+
+CREATE TABLE IF NOT EXISTS project_aliases (
+    project_id TEXT NOT NULL,
+    repository_device INTEGER NOT NULL,
+    repository_inode INTEGER NOT NULL,
+    canonical_repository TEXT NOT NULL UNIQUE,
+    observed_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, canonical_repository),
+    FOREIGN KEY (project_id, repository_device, repository_inode)
+        REFERENCES project_identities(project_id, repository_device, repository_inode)
+);
+
 CREATE TABLE IF NOT EXISTS profile_claims (
     id TEXT PRIMARY KEY,
-    version INTEGER NOT NULL CHECK (version > 0),
-    statement TEXT NOT NULL,
-    estimated_tokens INTEGER NOT NULL CHECK (estimated_tokens > 0),
+    current_version INTEGER NOT NULL CHECK (current_version > 0),
     strength TEXT NOT NULL CHECK (strength = 'hard'),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
-    scope_id TEXT,
+    scope_id TEXT REFERENCES projects(project_id),
     applicability TEXT NOT NULL CHECK (applicability = 'software_building'),
-    provenance_commission_id TEXT NOT NULL REFERENCES commissions(id),
-    provenance_attachment_id TEXT NOT NULL REFERENCES attachments(id),
     confidence_category TEXT NOT NULL CHECK (confidence_category = 'explicit'),
     confidence_basis_points INTEGER NOT NULL CHECK (confidence_basis_points = 10000),
-    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state = 'active'),
+    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('active', 'suppressed')),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     CHECK (
         (scope_kind = 'principal' AND scope_id IS NULL)
         OR (scope_kind = 'project' AND scope_id IS NOT NULL)
-    )
+    ),
+    FOREIGN KEY (id, current_version)
+        REFERENCES profile_claim_versions(claim_id, version)
 );
 
-CREATE TRIGGER IF NOT EXISTS profile_claims_are_immutable_update
-BEFORE UPDATE ON profile_claims
-BEGIN
-    SELECT RAISE(ABORT, 'Profile Claim versions are immutable');
-END;
+CREATE TABLE IF NOT EXISTS profile_claim_versions (
+    claim_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    statement TEXT NOT NULL,
+    token_upper_bound INTEGER NOT NULL CHECK (token_upper_bound > 0),
+    provenance_commission_id TEXT NOT NULL REFERENCES commissions(id),
+    provenance_attachment_id TEXT NOT NULL REFERENCES attachments(id),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (claim_id, version)
+);
 
-CREATE TRIGGER IF NOT EXISTS profile_claims_are_immutable_delete
-BEFORE DELETE ON profile_claims
+CREATE TRIGGER IF NOT EXISTS profile_claim_versions_are_immutable_update
+BEFORE UPDATE ON profile_claim_versions
 BEGIN
     SELECT RAISE(ABORT, 'Profile Claim versions are immutable');
 END;
@@ -233,13 +261,15 @@ CREATE TABLE IF NOT EXISTS attempt_context_packets (
 
 CREATE TABLE IF NOT EXISTS attempt_profile_claims (
     attempt_id TEXT NOT NULL REFERENCES attempts(id),
-    claim_id TEXT NOT NULL REFERENCES profile_claims(id),
+    claim_id TEXT NOT NULL,
     claim_version INTEGER NOT NULL,
     position INTEGER NOT NULL,
     result_id TEXT REFERENCES results(id),
     outcome TEXT CHECK (outcome IN ('accepted', 'edited', 'rejected', 'contradicted')),
     recorded_at INTEGER,
-    PRIMARY KEY (attempt_id, claim_id)
+    PRIMARY KEY (attempt_id, claim_id),
+    FOREIGN KEY (claim_id, claim_version)
+        REFERENCES profile_claim_versions(claim_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS assignment_routes (
@@ -991,7 +1021,11 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
         || !column_exists(connection, "commissions", "worker_requirements_json")?
         || !column_exists(connection, "commissions", "project_id")?
         || !column_exists(connection, "commissions", "commission_constraints_json")?
+        || !table_exists(connection, "projects")?
+        || !table_exists(connection, "project_identities")?
+        || !table_exists(connection, "project_aliases")?
         || !table_exists(connection, "profile_claims")?
+        || !table_exists(connection, "profile_claim_versions")?
         || !table_exists(connection, "attempt_context_packets")?
         || !table_exists(connection, "attempt_profile_claims")?
         || !column_exists(connection, "attachments", "session_token_hash")?
@@ -1133,7 +1167,11 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !column_exists(connection, "commissions", "worker_requirements_json")?
         || !column_exists(connection, "commissions", "project_id")?
         || !column_exists(connection, "commissions", "commission_constraints_json")?
+        || !table_exists(connection, "projects")?
+        || !table_exists(connection, "project_identities")?
+        || !table_exists(connection, "project_aliases")?
         || !table_exists(connection, "profile_claims")?
+        || !table_exists(connection, "profile_claim_versions")?
         || !table_exists(connection, "attempt_context_packets")?
         || !table_exists(connection, "attempt_profile_claims")?
         || !column_exists(connection, "attachments", "session_token_hash")?
@@ -2055,9 +2093,12 @@ mod tests {
                 VALUES ('commission-v15', 'migration fixture', 'active', 1, 1);
                 DROP TABLE attempt_profile_claims;
                 DROP TABLE attempt_context_packets;
-                DROP TRIGGER profile_claims_are_immutable_update;
-                DROP TRIGGER profile_claims_are_immutable_delete;
+                DROP TRIGGER profile_claim_versions_are_immutable_update;
+                DROP TABLE profile_claim_versions;
                 DROP TABLE profile_claims;
+                DROP TABLE project_aliases;
+                DROP TABLE project_identities;
+                DROP TABLE projects;
                 ALTER TABLE commissions DROP COLUMN project_id;
                 ALTER TABLE commissions DROP COLUMN commission_constraints_json;
                 PRAGMA user_version = 14;
@@ -2070,6 +2111,10 @@ mod tests {
         let connection = Connection::open(database_path).unwrap();
         verify(&connection).unwrap();
         assert!(table_exists(&connection, "profile_claims").unwrap());
+        assert!(table_exists(&connection, "profile_claim_versions").unwrap());
+        assert!(table_exists(&connection, "projects").unwrap());
+        assert!(table_exists(&connection, "project_identities").unwrap());
+        assert!(table_exists(&connection, "project_aliases").unwrap());
         assert!(table_exists(&connection, "attempt_context_packets").unwrap());
         assert!(table_exists(&connection, "attempt_profile_claims").unwrap());
         let preserved = connection

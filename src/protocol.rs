@@ -613,6 +613,14 @@ pub enum Command {
         commission_id: String,
         preference: ReusablePreference,
     },
+    ReviseProfileClaim {
+        commission_id: String,
+        claim_id: String,
+        expected_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmation_digest: Option<String>,
+        preference: ReusablePreference,
+    },
     InspectProfileClaim {
         claim_id: String,
     },

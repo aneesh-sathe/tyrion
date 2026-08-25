@@ -128,12 +128,14 @@ fn principal_creates_one_durable_atomic_project_preference() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
+    let project = create_project(temp.path(), "tyrion");
     let mut daemon = RunningDaemon::start(&data_dir);
     let attachment_token = connect_full_entry(&daemon, "learning-source");
     let proposal_path = temp.path().join("source-proposal.json");
     write_proposal(
         &proposal_path,
         "project-tyrion",
+        &project,
         &["Use a compact response for this Commission only."],
     );
     let created = run_cli(
@@ -186,6 +188,7 @@ fn principal_creates_one_durable_atomic_project_preference() {
         json!({"category": "explicit", "basis_points": 10_000})
     );
     assert_eq!(claim["lifecycle"], json!({"state": "active"}));
+    assert_eq!(claim["token_accounting"], "utf8_byte_upper_bound");
     assert!(claim["created_at"].as_i64().unwrap() > 0);
     assert_eq!(claim["updated_at"], claim["created_at"]);
     assert_eq!(
@@ -222,6 +225,8 @@ fn later_assignment_receives_bounded_advisory_preference_and_records_outcome() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
+    let project = create_project(temp.path(), "tyrion");
+    let unrelated_project = create_project(temp.path(), "unrelated");
     let mut daemon = RunningDaemon::start(&data_dir);
     let attachment_token = connect_full_entry(&daemon, "learning-loop");
 
@@ -229,6 +234,7 @@ fn later_assignment_receives_bounded_advisory_preference_and_records_outcome() {
     write_proposal_with_goal(
         &source_path,
         "project-tyrion",
+        &project,
         "return the source greeting",
         &["Use a compact response for this Commission only."],
     );
@@ -264,6 +270,7 @@ fn later_assignment_receives_bounded_advisory_preference_and_records_outcome() {
     write_proposal_with_goal(
         &later_path,
         "project-tyrion",
+        &project,
         "return the later greeting",
         &["Return the exact accepted greeting."],
     );
@@ -284,6 +291,7 @@ fn later_assignment_receives_bounded_advisory_preference_and_records_outcome() {
     write_proposal_with_goal(
         &unrelated_path,
         "project-unrelated",
+        &unrelated_project,
         "return the unrelated greeting",
         &[],
     );
@@ -379,6 +387,7 @@ fn later_assignment_receives_bounded_advisory_preference_and_records_outcome() {
     );
     let budget = &packet["advisory"]["budget"];
     assert_eq!(budget["target_tokens"], 2_000);
+    assert_eq!(budget["accounting"], "utf8_byte_upper_bound");
     assert!(budget["tokens_used"].as_u64().unwrap() <= budget["hard_max_tokens"].as_u64().unwrap());
     assert_eq!(later_completed["credential_grants"], json!([]));
     assert_eq!(later_completed["approval_gates"], json!([]));
@@ -400,6 +409,26 @@ fn later_assignment_receives_bounded_advisory_preference_and_records_outcome() {
     assert_eq!(affected[0]["outcome"], "accepted");
     assert!(affected[0]["result_id"].is_string());
     assert!(affected[0]["recorded_at"].as_i64().unwrap() > 0);
+    assert_eq!(
+        later_completed["results"][0]["profile_claim_outcomes"],
+        json!([{
+            "claim_id": claim_id,
+            "claim_version": 1,
+            "outcome": "accepted",
+            "recorded_at": affected[0]["recorded_at"],
+        }])
+    );
+    assert_eq!(
+        later_completed["briefing"]["learning_receipts"],
+        json!([{
+            "kind": "profile_claim_applied",
+            "claim_id": claim_id,
+            "claim_version": 1,
+            "attempt_id": later_completed["attempts"][0]["id"],
+            "result_id": later_completed["results"][0]["id"],
+            "outcome": "accepted",
+        }])
+    );
 
     let profile = run_principal_cli(
         &daemon,
@@ -430,11 +459,12 @@ fn unsuccessful_preference_application_is_retained_in_completion_receipt() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
+    let project = create_project(temp.path(), "tyrion");
     let mut daemon = RunningDaemon::start(&data_dir);
     let attachment_token = connect_full_entry(&daemon, "learning-rework");
 
     let source_path = temp.path().join("rework-source.json");
-    write_proposal(&source_path, "project-tyrion", &[]);
+    write_proposal(&source_path, "project-tyrion", &project, &[]);
     let source = create_proposal(
         &daemon,
         &attachment_token,
@@ -458,7 +488,7 @@ fn unsuccessful_preference_application_is_retained_in_completion_receipt() {
     let claim_id = remembered["claim"]["id"].as_str().unwrap().to_owned();
 
     let later_path = temp.path().join("rework-later.json");
-    write_model_proposal(&later_path, "project-tyrion");
+    write_model_proposal(&later_path, "project-tyrion", &project);
     let later = create_proposal(
         &daemon,
         &attachment_token,
@@ -513,14 +543,24 @@ fn unsuccessful_preference_application_is_retained_in_completion_receipt() {
     let completed = wait_for_status(&daemon, &attachment_token, later_id, "verified_complete");
     assert_eq!(
         completed["briefing"]["learning_receipts"],
-        json!([{
-            "kind": "profile_claim_applied_unsuccessfully",
-            "claim_id": claim_id,
-            "claim_version": 1,
-            "attempt_id": completed["attempts"][0]["id"],
-            "result_id": first_result,
-            "outcome": "edited",
-        }])
+        json!([
+            {
+                "kind": "profile_claim_applied_unsuccessfully",
+                "claim_id": claim_id,
+                "claim_version": 1,
+                "attempt_id": completed["attempts"][0]["id"],
+                "result_id": first_result,
+                "outcome": "edited",
+            },
+            {
+                "kind": "profile_claim_applied",
+                "claim_id": claim_id,
+                "claim_version": 1,
+                "attempt_id": completed["attempts"][1]["id"],
+                "result_id": second_result,
+                "outcome": "accepted",
+            }
+        ])
     );
 
     let inspected = run_principal_cli(&daemon, None, &["principal", "inspect-claim", &claim_id]);
@@ -533,16 +573,333 @@ fn unsuccessful_preference_application_is_retained_in_completion_receipt() {
     assert_eq!(outcomes, ["edited", "accepted"]);
 }
 
-fn write_proposal(path: &Path, project_id: &str, constraints: &[&str]) {
+#[test]
+fn recovered_verifier_failure_accepts_the_same_influenced_result() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let project = create_project(temp.path(), "tyrion");
+    let mut daemon = RunningDaemon::start(&data_dir);
+    let attachment_token = connect_full_entry(&daemon, "learning-verifier-recovery");
+
+    let source_path = temp.path().join("verifier-source.json");
+    write_proposal(&source_path, "project-tyrion", &project, &[]);
+    let source = create_proposal(
+        &daemon,
+        &attachment_token,
+        &source_path,
+        "create-verifier-source",
+    );
+    let source_id = source["commission"]["id"].as_str().unwrap();
+    let remembered = run_principal_cli(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "principal",
+            "remember-preference",
+            source_id,
+            "--statement",
+            "Prefer behavior-first tests at public seams.",
+            "--idempotency-key",
+            "remember-verifier-preference",
+        ],
+    );
+    let claim_id = remembered["claim"]["id"].as_str().unwrap().to_owned();
+
+    let later_path = temp.path().join("verifier-later.json");
+    write_model_proposal(&later_path, "project-tyrion", &project);
+    let later = create_proposal(
+        &daemon,
+        &attachment_token,
+        &later_path,
+        "create-verifier-later",
+    );
+    let later_id = later["commission"]["id"].as_str().unwrap();
+    accept_commission(
+        &daemon,
+        &attachment_token,
+        later_id,
+        "accept-verifier-later",
+    );
+    daemon.restart_with_dispatch();
+    let pending = wait_for_assignment_status(
+        &daemon,
+        &attachment_token,
+        later_id,
+        "verification_pending",
+        1,
+    );
+    let result_id = pending["results"][0]["id"].as_str().unwrap();
+    let evidence_path = temp.path().join("verifier-evidence.json");
+    write_model_evidence(&evidence_path, result_id, "failed", Some("verifier"));
+    let failed = record_evidence(
+        &daemon,
+        &attachment_token,
+        later_id,
+        &evidence_path,
+        "record-verifier-failure",
+    );
+    assert_eq!(
+        failed["results"][0]["profile_claim_outcomes"][0]["outcome"],
+        "rejected"
+    );
+
+    write_model_evidence(&evidence_path, result_id, "passed", None);
+    record_evidence(
+        &daemon,
+        &attachment_token,
+        later_id,
+        &evidence_path,
+        "record-verifier-recovery",
+    );
+    let completed = wait_for_status(&daemon, &attachment_token, later_id, "verified_complete");
+    assert_eq!(
+        completed["results"][0]["profile_claim_outcomes"][0]["outcome"],
+        "accepted"
+    );
+    assert_eq!(
+        completed["briefing"]["learning_receipts"],
+        json!([{
+            "kind": "profile_claim_applied",
+            "claim_id": claim_id,
+            "claim_version": 1,
+            "attempt_id": completed["attempts"][0]["id"],
+            "result_id": result_id,
+            "outcome": "accepted",
+        }])
+    );
+
+    let cancelled_path = temp.path().join("cancelled-later.json");
+    write_model_proposal(&cancelled_path, "project-tyrion", &project);
+    let cancellation = create_proposal(
+        &daemon,
+        &attachment_token,
+        &cancelled_path,
+        "create-cancelled-later",
+    );
+    let cancellation_id = cancellation["commission"]["id"].as_str().unwrap();
+    accept_commission(
+        &daemon,
+        &attachment_token,
+        cancellation_id,
+        "accept-cancelled-later",
+    );
+    let pending = wait_for_assignment_status(
+        &daemon,
+        &attachment_token,
+        cancellation_id,
+        "verification_pending",
+        1,
+    );
+    let cancelled_result_id = pending["results"][0]["id"].clone();
+    let cancelled = run_cli(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "commission",
+            "cancel",
+            cancellation_id,
+            "--expected-revision",
+            "1",
+            "--idempotency-key",
+            "cancel-influenced-result",
+        ],
+    );
+    assert_eq!(
+        cancelled["results"][0]["profile_claim_outcomes"],
+        json!([{
+            "claim_id": claim_id,
+            "claim_version": 1,
+            "outcome": "rejected",
+            "recorded_at": cancelled["results"][0]["profile_claim_outcomes"][0]["recorded_at"],
+        }])
+    );
+    assert_eq!(cancelled["results"][0]["id"], cancelled_result_id);
+}
+
+#[test]
+fn project_identity_atomicity_and_claim_changes_are_enforced() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let project = create_project(temp.path(), "tyrion");
+    let impostor = create_project(temp.path(), "impostor");
+    let mut daemon = RunningDaemon::start(&data_dir);
+    let attachment_token = connect_full_entry(&daemon, "learning-controls");
+
+    let source_path = temp.path().join("controls-source.json");
+    write_proposal(&source_path, "project-tyrion", &project, &[]);
+    let source = create_proposal(
+        &daemon,
+        &attachment_token,
+        &source_path,
+        "create-controls-source",
+    );
+    let source_id = source["commission"]["id"].as_str().unwrap();
+
+    let compound = run_principal_cli_output(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "principal",
+            "remember-preference",
+            source_id,
+            "--statement",
+            "Prefer public tests while minimizing private helpers.",
+            "--idempotency-key",
+            "reject-compound-preference",
+        ],
+    );
+    assert!(!compound.status.success());
+    assert!(String::from_utf8_lossy(&compound.stderr).contains("one atomic sentence"));
+
+    let oversized_statement = "x".repeat(81);
+    let oversized = run_principal_cli_output(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "principal",
+            "remember-preference",
+            source_id,
+            "--statement",
+            &oversized_statement,
+            "--idempotency-key",
+            "reject-oversized-preference",
+        ],
+    );
+    assert!(!oversized.status.success());
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("conservative UTF-8 accounting"));
+
+    let remembered = run_principal_cli(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "principal",
+            "remember-preference",
+            source_id,
+            "--statement",
+            "Prefer behavior-first tests at public seams.",
+            "--idempotency-key",
+            "remember-controls-preference",
+        ],
+    );
+    let claim_id = remembered["claim"]["id"].as_str().unwrap();
+    let preview = run_principal_cli(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "principal",
+            "revise-preference",
+            source_id,
+            claim_id,
+            "--statement",
+            "Prefer end-to-end tests at public seams.",
+            "--expected-version",
+            "1",
+            "--idempotency-key",
+            "preview-controls-preference",
+        ],
+    );
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["expected_version"], 1);
+    assert_eq!(
+        preview["diff"]["statement"],
+        json!({
+            "before": "Prefer behavior-first tests at public seams.",
+            "after": "Prefer end-to-end tests at public seams.",
+        })
+    );
+    let confirmation_digest = preview["confirmation_digest"].as_str().unwrap();
+    let revised = run_principal_cli(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "principal",
+            "revise-preference",
+            source_id,
+            claim_id,
+            "--statement",
+            "Prefer end-to-end tests at public seams.",
+            "--expected-version",
+            "1",
+            "--confirmation-digest",
+            confirmation_digest,
+            "--idempotency-key",
+            "revise-controls-preference",
+        ],
+    );
+    assert_eq!(revised["applied"], true);
+    assert_eq!(revised["claim"]["version"], 2);
+    assert_eq!(revised["learning_receipt"]["kind"], "profile_claim_changed");
+    assert_eq!(revised["learning_receipt"]["previous_version"], 1);
+    assert_eq!(revised["learning_receipt"]["claim_version"], 2);
+
+    let inspected = run_principal_cli(&daemon, None, &["principal", "inspect-claim", claim_id]);
+    assert_eq!(inspected["claim"]["version"], 2);
+    assert_eq!(inspected["versions"].as_array().unwrap().len(), 2);
+
+    let impostor_path = temp.path().join("impostor-proposal.json");
+    write_proposal(&impostor_path, "project-tyrion", &impostor, &[]);
+    let output = run_cli_output(
+        &daemon,
+        Some(&attachment_token),
+        &[
+            "proposal",
+            "create",
+            "--file",
+            path_text(&impostor_path),
+            "--idempotency-key",
+            "reject-project-impostor",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("different repository identity"));
+
+    accept_commission(
+        &daemon,
+        &attachment_token,
+        source_id,
+        "accept-controls-source",
+    );
+    daemon.restart_with_dispatch();
+    let completed = wait_for_status(&daemon, &attachment_token, source_id, "verified_complete");
+    assert_eq!(
+        completed["briefing"]["learning_receipts"],
+        json!([
+            {
+                "kind": "profile_claim_created",
+                "claim_id": claim_id,
+                "claim_version": 1,
+                "scope": {"kind": "project", "project_id": "project-tyrion"},
+            },
+            {
+                "kind": "profile_claim_changed",
+                "claim_id": claim_id,
+                "previous_version": 1,
+                "claim_version": 2,
+                "scope": {"kind": "project", "project_id": "project-tyrion"},
+            }
+        ])
+    );
+}
+
+fn write_proposal(path: &Path, project_id: &str, project: &Path, constraints: &[&str]) {
     write_proposal_with_goal(
         path,
         project_id,
+        project,
         "return a deterministic greeting",
         constraints,
     );
 }
 
-fn write_proposal_with_goal(path: &Path, project_id: &str, goal: &str, constraints: &[&str]) {
+fn write_proposal_with_goal(
+    path: &Path,
+    project_id: &str,
+    project: &Path,
+    goal: &str,
+    constraints: &[&str],
+) {
     let proposal = json!({
         "project_id": project_id,
         "goal": goal,
@@ -556,7 +913,7 @@ fn write_proposal_with_goal(path: &Path, project_id: &str, goal: &str, constrain
             "verifier": {"kind": "exact_match", "expected": goal}
         }],
         "authority": {
-            "repositories": [],
+            "repositories": [path_text(project)],
             "paths": [],
             "actions": ["deterministic.echo"],
             "destinations": [],
@@ -575,7 +932,7 @@ fn write_proposal_with_goal(path: &Path, project_id: &str, goal: &str, constrain
     fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
 }
 
-fn write_model_proposal(path: &Path, project_id: &str) {
+fn write_model_proposal(path: &Path, project_id: &str, project: &Path) {
     let proposal = json!({
         "project_id": project_id,
         "goal": "return a model-reviewed greeting",
@@ -590,7 +947,7 @@ fn write_model_proposal(path: &Path, project_id: &str) {
             "verifier": {"kind": "prompt", "prompt": "Review the exact greeting."}
         }],
         "authority": {
-            "repositories": [],
+            "repositories": [path_text(project)],
             "paths": [],
             "actions": ["deterministic.echo"],
             "destinations": [],
@@ -805,13 +1162,21 @@ fn connect_full_entry(daemon: &RunningDaemon, label: &str) -> String {
 }
 
 fn run_cli(daemon: &RunningDaemon, attachment_token: Option<&str>, arguments: &[&str]) -> Value {
+    successful_json(run_cli_output(daemon, attachment_token, arguments))
+}
+
+fn run_cli_output(
+    daemon: &RunningDaemon,
+    attachment_token: Option<&str>,
+    arguments: &[&str],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tyrion"));
     command.args(["--socket", path_text(&daemon.socket_path)]);
     if let Some(attachment_token) = attachment_token {
         command.args(["--attachment-token", attachment_token]);
     }
     command.args(arguments);
-    successful_json(command.output().expect("CLI should run"))
+    command.output().expect("CLI should run")
 }
 
 fn run_principal_cli(
@@ -819,6 +1184,18 @@ fn run_principal_cli(
     attachment_token: Option<&str>,
     arguments: &[&str],
 ) -> Value {
+    successful_json(run_principal_cli_output(
+        daemon,
+        attachment_token,
+        arguments,
+    ))
+}
+
+fn run_principal_cli_output(
+    daemon: &RunningDaemon,
+    attachment_token: Option<&str>,
+    arguments: &[&str],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tyrion"));
     command
         .args(["--socket", path_text(&daemon.socket_path)])
@@ -834,7 +1211,7 @@ fn run_principal_cli(
         .spawn()
         .expect("Principal CLI should run");
     writeln!(child.stdin.as_mut().unwrap(), "{}", daemon.principal_token).unwrap();
-    successful_json(child.wait_with_output().unwrap())
+    child.wait_with_output().unwrap()
 }
 
 fn successful_json(output: Output) -> Value {
@@ -867,4 +1244,10 @@ fn daemon_responds(socket_path: &Path) -> bool {
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("test path should be UTF-8")
+}
+
+fn create_project(root: &Path, name: &str) -> PathBuf {
+    let project = root.join(name);
+    fs::create_dir(&project).unwrap();
+    project
 }

@@ -256,6 +256,18 @@ enum PrincipalCommand {
         #[arg(long)]
         idempotency_key: String,
     },
+    RevisePreference {
+        commission_id: String,
+        claim_id: String,
+        #[arg(long)]
+        statement: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        confirmation_digest: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
     InspectClaim {
         claim_id: String,
     },
@@ -742,6 +754,30 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
             } => (
                 Command::CreateProfileClaim {
                     commission_id: commission_id.clone(),
+                    preference: ReusablePreference {
+                        statement: statement.clone(),
+                    },
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::RevisePreference {
+                        commission_id,
+                        claim_id,
+                        statement,
+                        expected_version,
+                        confirmation_digest,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ReviseProfileClaim {
+                    commission_id: commission_id.clone(),
+                    claim_id: claim_id.clone(),
+                    expected_version: *expected_version,
+                    confirmation_digest: confirmation_digest.clone(),
                     preference: ReusablePreference {
                         statement: statement.clone(),
                     },

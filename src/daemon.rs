@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::credential::CredentialRuntime;
 use crate::protocol::{Command, Request, Response, PROTOCOL_VERSION};
 use crate::store::{
-    EffectExecutionContext, EffectExecutionOptions, EffectReconciliationContext, Store,
+    EffectExecutionContext, EffectExecutionOptions, EffectReconciliationContext,
+    ProfileClaimRevisionRequest, Store,
 };
 use crate::worker::{WorkerRuntime, WorkerRuntimeOptions};
 use crate::TyrionError;
@@ -487,6 +488,25 @@ fn dispatch(
             preference,
         } => Ok(DispatchOutcome::without_follow_up(
             store.create_profile_claim(request, commission_id, preference, principal_token_hash)?,
+        )),
+        Command::ReviseProfileClaim {
+            commission_id,
+            claim_id,
+            expected_version,
+            confirmation_digest,
+            preference,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.revise_profile_claim(
+                request,
+                ProfileClaimRevisionRequest {
+                    commission_id,
+                    claim_id,
+                    expected_version: *expected_version,
+                    confirmation_digest: confirmation_digest.as_deref(),
+                    preference,
+                },
+                principal_token_hash,
+            )?,
         )),
         Command::InspectProfileClaim { claim_id } => Ok(DispatchOutcome::without_follow_up(
             store.inspect_profile_claim(request, claim_id, principal_token_hash)?,

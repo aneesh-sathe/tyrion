@@ -158,7 +158,7 @@ Create `proposal.json`:
     }
   ],
   "authority": {
-    "repositories": [],
+    "repositories": ["."],
     "paths": [],
     "actions": ["deterministic.echo"],
     "destinations": [],
@@ -384,7 +384,7 @@ Reusing an idempotency key with the identical mutation returns its original resp
 
 ## Reusable Principal preferences
 
-A reusable software-building preference requires both the Active Attachment credential for its source Commission and the independent Principal control credential. Tyrion creates one atomic hard Profile Claim. If the source proposal names a `project_id`, the claim receives that narrow project scope. Otherwise it receives Principal scope. `commission_constraints` remain binding only within their Commission and never become Profile Claims automatically.
+A reusable software-building preference requires both the Active Attachment credential for its source Commission and the independent Principal control credential. Tyrion creates one atomic hard Profile Claim. If the source proposal names a `project_id`, its Authority Envelope must include repository Evidence. Tyrion binds each canonical repository device and inode before giving the claim narrow project scope. A later proposal can add repositories or worktrees only when it also presents an already-bound identity as an anchor; moves on the same filesystem can add a verified path alias. Without a `project_id`, the claim receives Principal scope. `commission_constraints` remain binding only within their Commission and never become Profile Claims automatically.
 
 ```sh
 printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
@@ -399,6 +399,31 @@ printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
 The response includes the complete versioned claim and a compact `profile_claim_created` Learning Receipt. The Principal can later inspect the claim, its provenance, and every affected Attempt, or inspect the active claims applicable to a project:
 
 ```sh
+PREVIEW=$(printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  --principal-token-stdin \
+  principal revise-preference COMMISSION_ID CLAIM_ID \
+  --statement "Prefer end-to-end tests at public seams." \
+  --expected-version 1 \
+  --idempotency-key preview-behavior-first-tests)
+
+DIGEST=$(printf '%s' "$PREVIEW" | jq -r .confirmation_digest)
+
+printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  --principal-token-stdin \
+  principal revise-preference COMMISSION_ID CLAIM_ID \
+  --statement "Prefer end-to-end tests at public seams." \
+  --expected-version 1 \
+  --confirmation-digest "$DIGEST" \
+  --idempotency-key revise-behavior-first-tests
+```
+
+Without a confirmation digest, revision returns the exact diff and its digest without changing the claim. Confirming that digest against the expected current version appends an immutable claim version and returns a `profile_claim_changed` receipt. The claim head retains its lifecycle independently, so later Principal-only suppression and forgetting controls do not require rewriting historical versions.
+
+```sh
 printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
   target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
   --principal-token-stdin principal inspect-claim CLAIM_ID
@@ -409,11 +434,11 @@ printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
   --project-id project-tyrion
 ```
 
-Retrieval is deterministic. It selects only active software-building claims whose Principal or project scope applies, excludes claims created from the current Commission, and injects whole claim versions in project-first creation order. Advisory memory targets 2,000 tokens and is capped at the smaller of 15,000 tokens or 8 percent of the selected Worker Configuration's context capacity. Principal and Project Profiles also enforce their independent active claim and token limits.
+Retrieval is deterministic. It selects only active software-building claims whose Principal or verified project scope applies, excludes claim versions created from the current Commission, and injects whole current versions in project-first creation order. Advisory memory targets 2,000 tokens and is capped at the smaller of 15,000 tokens or 8 percent of the selected Worker Configuration's context capacity. Tyrion uses the serialized UTF-8 byte length as a conservative cross-tokenizer upper bound, including all injected claim metadata. Principal and Project Profiles also enforce their independent active claim and token limits.
 
 Every Attempt persists its exact `worker_context_packet`. Current Principal instructions, Commission constraints, Acceptance Criteria, Authority Envelope, resource ceilings, and current repository Evidence appear as binding sources ahead of advisory Profile Claims. A claim cannot affect routing eligibility, Approval Gates, credentials, or resource ceilings. Structured adapters receive the same packet in `tyrion.assignment.launch`.
 
-Claim inspection records each influenced Result as `accepted`, `edited`, `rejected`, or `contradicted`. Verified Completion includes compact Learning Receipts for claims created by that Commission and for unsuccessful applications retained during rework. Use the same stable `project_id` only for Commissions known to belong to the same project.
+Each influenced Result projects its claim version outcome as `accepted`, `edited`, `rejected`, or `contradicted`. A rejected Result changes to `edited` only after a replacement Result is produced for the same Assignment. Verified Completion includes compact Learning Receipts for claims created or changed by that Commission and for both successful and unsuccessful applications.
 
 ## Verify
 

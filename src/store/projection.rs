@@ -765,16 +765,52 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let result_profile_claim_outcomes = query_values(
+        connection,
+        "SELECT attempt_profile_claims.result_id,
+                attempt_profile_claims.claim_id,
+                attempt_profile_claims.claim_version,
+                attempt_profile_claims.outcome,
+                attempt_profile_claims.recorded_at
+         FROM attempt_profile_claims
+         JOIN attempts ON attempts.id = attempt_profile_claims.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE assignments.commission_id = ?1
+           AND attempt_profile_claims.result_id IS NOT NULL
+           AND attempt_profile_claims.outcome IS NOT NULL
+         ORDER BY attempt_profile_claims.result_id, attempt_profile_claims.position",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "result_id": row.get::<_, String>(0)?,
+                "claim_id": row.get::<_, String>(1)?,
+                "claim_version": row.get::<_, i64>(2)?,
+                "outcome": row.get::<_, String>(3)?,
+                "recorded_at": row.get::<_, i64>(4)?,
+            }))
+        },
+    )?;
     for result in &mut results {
-        let result_id = result["id"].as_str();
+        let result_id = result["id"].as_str().map(str::to_owned);
         result["skill_executions"] = Value::Array(
             result_skill_executions
                 .iter()
-                .filter(|skill| skill["result_id"].as_str() == result_id)
+                .filter(|skill| skill["result_id"].as_str() == result_id.as_deref())
                 .map(|skill| {
                     let mut skill = skill.clone();
                     skill.as_object_mut().unwrap().remove("result_id");
                     skill
+                })
+                .collect(),
+        );
+        result["profile_claim_outcomes"] = Value::Array(
+            result_profile_claim_outcomes
+                .iter()
+                .filter(|claim| claim["result_id"].as_str() == result_id.as_deref())
+                .map(|claim| {
+                    let mut claim = claim.clone();
+                    claim.as_object_mut().unwrap().remove("result_id");
+                    claim
                 })
                 .collect(),
         );
@@ -1522,10 +1558,13 @@ fn completion_briefing(
     )?;
     let mut learning_receipts = query_values(
         connection,
-        "SELECT id, version, scope_kind, scope_id
-         FROM profile_claims
-         WHERE provenance_commission_id = ?1
-         ORDER BY created_at, id",
+        "SELECT profile_claim_versions.claim_id, profile_claim_versions.version,
+                profile_claims.scope_kind, profile_claims.scope_id
+         FROM profile_claim_versions
+         JOIN profile_claims ON profile_claims.id = profile_claim_versions.claim_id
+         WHERE profile_claim_versions.provenance_commission_id = ?1
+         ORDER BY profile_claim_versions.created_at,
+                  profile_claim_versions.claim_id, profile_claim_versions.version",
         commission_id,
         |row| {
             let scope_kind = row.get::<_, String>(2)?;
@@ -1535,12 +1574,21 @@ fn completion_briefing(
             } else {
                 json!({"kind": scope_kind})
             };
-            Ok(json!({
-                "kind": "profile_claim_created",
+            let version = row.get::<_, i64>(1)?;
+            let mut receipt = json!({
+                "kind": if version == 1 {
+                    "profile_claim_created"
+                } else {
+                    "profile_claim_changed"
+                },
                 "claim_id": row.get::<_, String>(0)?,
-                "claim_version": row.get::<_, i64>(1)?,
+                "claim_version": version,
                 "scope": scope,
-            }))
+            });
+            if version > 1 {
+                receipt["previous_version"] = json!(version - 1);
+            }
+            Ok(receipt)
         },
     )?;
     learning_receipts.extend(query_values(
@@ -1553,17 +1601,22 @@ fn completion_briefing(
          JOIN attempts ON attempts.id = attempt_profile_claims.attempt_id
          JOIN assignments ON assignments.id = attempts.assignment_id
          WHERE assignments.commission_id = ?1
-           AND attempt_profile_claims.outcome IN ('edited', 'rejected', 'contradicted')
+           AND attempt_profile_claims.outcome IS NOT NULL
          ORDER BY attempts.started_at_ms, attempts.id, attempt_profile_claims.position",
         commission_id,
         |row| {
+            let outcome = row.get::<_, String>(4)?;
             Ok(json!({
-                "kind": "profile_claim_applied_unsuccessfully",
+                "kind": if outcome == "accepted" {
+                    "profile_claim_applied"
+                } else {
+                    "profile_claim_applied_unsuccessfully"
+                },
                 "claim_id": row.get::<_, String>(0)?,
                 "claim_version": row.get::<_, i64>(1)?,
                 "attempt_id": row.get::<_, String>(2)?,
                 "result_id": row.get::<_, Option<String>>(3)?,
-                "outcome": row.get::<_, String>(4)?,
+                "outcome": outcome,
             }))
         },
     )?);
@@ -1576,6 +1629,155 @@ fn completion_briefing(
         "criteria": criteria,
         "learning_receipts": learning_receipts,
     })))
+}
+
+pub(super) fn profile_claim(connection: &Connection, claim_id: &str) -> Result<Value, TyrionError> {
+    connection
+        .query_row(
+            "SELECT profile_claims.id, profile_claims.current_version,
+                    profile_claim_versions.statement,
+                    profile_claim_versions.token_upper_bound,
+                    profile_claims.strength, profile_claims.scope_kind,
+                    profile_claims.scope_id, profile_claims.applicability,
+                    profile_claim_versions.provenance_commission_id,
+                    profile_claim_versions.provenance_attachment_id,
+                    profile_claims.confidence_category,
+                    profile_claims.confidence_basis_points,
+                    profile_claims.lifecycle_state, profile_claims.created_at,
+                    profile_claims.updated_at
+             FROM profile_claims
+             JOIN profile_claim_versions
+               ON profile_claim_versions.claim_id = profile_claims.id
+              AND profile_claim_versions.version = profile_claims.current_version
+             WHERE profile_claims.id = ?1",
+            [claim_id],
+            |row| {
+                let scope_kind = row.get::<_, String>(5)?;
+                let scope_id = row.get::<_, Option<String>>(6)?;
+                let scope = if scope_kind == "project" {
+                    json!({
+                        "kind": scope_kind,
+                        "project_id": scope_id,
+                    })
+                } else {
+                    json!({"kind": scope_kind})
+                };
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "version": row.get::<_, i64>(1)?,
+                    "statement": row.get::<_, String>(2)?,
+                    "token_upper_bound": row.get::<_, u64>(3)?,
+                    "token_accounting": "utf8_byte_upper_bound",
+                    "strength": row.get::<_, String>(4)?,
+                    "scope": scope,
+                    "applicability": {
+                        "work_kind": row.get::<_, String>(7)?,
+                    },
+                    "provenance": {
+                        "kind": "explicit_principal_statement",
+                        "commission_id": row.get::<_, String>(8)?,
+                        "attachment_id": row.get::<_, String>(9)?,
+                    },
+                    "confidence": {
+                        "category": row.get::<_, String>(10)?,
+                        "basis_points": row.get::<_, u64>(11)?,
+                    },
+                    "lifecycle": {
+                        "state": row.get::<_, String>(12)?,
+                    },
+                    "created_at": row.get::<_, i64>(13)?,
+                    "updated_at": row.get::<_, i64>(14)?,
+                }))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| TyrionError::NotFound(claim_id.to_owned()))
+}
+
+pub(super) fn inspect_profile(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<Value, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM profile_claims
+         WHERE lifecycle_state = 'active'
+           AND (scope_kind = 'principal' OR (scope_kind = 'project' AND scope_id = ?1))
+         ORDER BY CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END, created_at, id",
+    )?;
+    let claim_ids = statement
+        .query_map([project_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let claims = claim_ids
+        .iter()
+        .map(|claim_id| profile_claim(connection, claim_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "project_id": project_id,
+        "claims": claims,
+    }))
+}
+
+pub(super) fn profile_claim_versions(
+    connection: &Connection,
+    claim_id: &str,
+) -> Result<Vec<Value>, TyrionError> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM profile_claims WHERE id = ?1)",
+        [claim_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(TyrionError::NotFound(claim_id.to_owned()));
+    }
+    let mut statement = connection.prepare(
+        "SELECT version, statement, token_upper_bound,
+                provenance_commission_id, provenance_attachment_id, created_at
+         FROM profile_claim_versions WHERE claim_id = ?1 ORDER BY version",
+    )?;
+    let rows = statement.query_map([claim_id], |row| {
+        Ok(json!({
+            "version": row.get::<_, i64>(0)?,
+            "statement": row.get::<_, String>(1)?,
+            "token_upper_bound": row.get::<_, u64>(2)?,
+            "token_accounting": "utf8_byte_upper_bound",
+            "provenance": {
+                "kind": "explicit_principal_statement",
+                "commission_id": row.get::<_, String>(3)?,
+                "attachment_id": row.get::<_, String>(4)?,
+            },
+            "created_at": row.get::<_, i64>(5)?,
+        }))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+pub(super) fn affected_attempts(
+    connection: &Connection,
+    claim_id: &str,
+) -> Result<Vec<Value>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT attempt_profile_claims.claim_version,
+                attempts.id, assignments.id, assignments.commission_id,
+                attempt_profile_claims.result_id, attempt_profile_claims.outcome,
+                attempt_profile_claims.recorded_at
+         FROM attempt_profile_claims
+         JOIN attempts ON attempts.id = attempt_profile_claims.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE attempt_profile_claims.claim_id = ?1
+         ORDER BY attempts.started_at_ms, attempts.id",
+    )?;
+    let rows = statement.query_map([claim_id], |row| {
+        Ok(json!({
+            "claim_version": row.get::<_, i64>(0)?,
+            "attempt_id": row.get::<_, String>(1)?,
+            "assignment_id": row.get::<_, String>(2)?,
+            "commission_id": row.get::<_, String>(3)?,
+            "result_id": row.get::<_, Option<String>>(4)?,
+            "outcome": row.get::<_, Option<String>>(5)?,
+            "recorded_at": row.get::<_, Option<i64>>(6)?,
+        }))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 fn scope_values(
