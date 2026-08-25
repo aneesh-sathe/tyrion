@@ -1924,6 +1924,9 @@ fn wait_for_live_adapter_telemetry(
             && inspected["workers"][0]["native_session_id"]
                 .as_str()
                 .is_some_and(|session| !session.is_empty())
+            && inspected["workers"][0]["latest_meaningful_activity"]
+                .as_str()
+                .is_some_and(|activity| activity.ends_with("started"))
         {
             return inspected;
         }

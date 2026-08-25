@@ -97,6 +97,25 @@ pub(crate) enum ResultStatus {
     Superseded,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileClaimOutcome {
+    Accepted,
+    Edited,
+    Rejected,
+    Contradicted,
+}
+
+impl ProfileClaimOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Edited => "edited",
+            Self::Rejected => "rejected",
+            Self::Contradicted => "contradicted",
+        }
+    }
+}
+
 impl ResultStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {

@@ -80,6 +80,7 @@ pub(super) fn execute(
                 },
                 "lease_expires_at": assignment.lease_expires_at,
                 "worker_configuration": configuration,
+                "worker_context_packet": assignment.worker_context_packet,
                 "skill_defaults": assignment.skill_defaults,
                 "configuration_fingerprint": configuration_fingerprint,
                 "git_artifacts": git_attempt.map(StructuredGitAttempt::launch_payload),

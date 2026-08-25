@@ -20,8 +20,44 @@ CREATE TABLE IF NOT EXISTS commissions (
     artifact_revision TEXT,
     execution_json TEXT NOT NULL DEFAULT '{"kind":"deterministic"}',
     worker_requirements_json TEXT NOT NULL DEFAULT '{}',
-    plan_json TEXT
+    plan_json TEXT,
+    project_id TEXT,
+    commission_constraints_json TEXT NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE IF NOT EXISTS profile_claims (
+    id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL CHECK (version > 0),
+    statement TEXT NOT NULL,
+    estimated_tokens INTEGER NOT NULL CHECK (estimated_tokens > 0),
+    strength TEXT NOT NULL CHECK (strength = 'hard'),
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
+    scope_id TEXT,
+    applicability TEXT NOT NULL CHECK (applicability = 'software_building'),
+    provenance_commission_id TEXT NOT NULL REFERENCES commissions(id),
+    provenance_attachment_id TEXT NOT NULL REFERENCES attachments(id),
+    confidence_category TEXT NOT NULL CHECK (confidence_category = 'explicit'),
+    confidence_basis_points INTEGER NOT NULL CHECK (confidence_basis_points = 10000),
+    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state = 'active'),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (
+        (scope_kind = 'principal' AND scope_id IS NULL)
+        OR (scope_kind = 'project' AND scope_id IS NOT NULL)
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS profile_claims_are_immutable_update
+BEFORE UPDATE ON profile_claims
+BEGIN
+    SELECT RAISE(ABORT, 'Profile Claim versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS profile_claims_are_immutable_delete
+BEFORE DELETE ON profile_claims
+BEGIN
+    SELECT RAISE(ABORT, 'Profile Claim versions are immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS criteria (
     commission_id TEXT NOT NULL REFERENCES commissions(id),
@@ -185,6 +221,25 @@ CREATE TABLE IF NOT EXISTS attempts (
     revision_disposition TEXT NOT NULL DEFAULT 'current' CHECK (revision_disposition IN (
         'current', 'retained', 'superseded', 'stale', 'requires_revalidation'
     ))
+);
+
+CREATE TABLE IF NOT EXISTS attempt_context_packets (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    packet_json TEXT NOT NULL,
+    advisory_token_budget INTEGER NOT NULL,
+    advisory_tokens_used INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attempt_profile_claims (
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    claim_id TEXT NOT NULL REFERENCES profile_claims(id),
+    claim_version INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    result_id TEXT REFERENCES results(id),
+    outcome TEXT CHECK (outcome IN ('accepted', 'edited', 'rejected', 'contradicted')),
+    recorded_at INTEGER,
+    PRIMARY KEY (attempt_id, claim_id)
 );
 
 CREATE TABLE IF NOT EXISTS assignment_routes (
@@ -729,6 +784,15 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
         )?;
     }
     upgrade_commissions(connection)?;
+    if !column_exists(connection, "commissions", "project_id")? {
+        connection.execute("ALTER TABLE commissions ADD COLUMN project_id TEXT", [])?;
+    }
+    if !column_exists(connection, "commissions", "commission_constraints_json")? {
+        connection.execute(
+            "ALTER TABLE commissions ADD COLUMN commission_constraints_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     if !column_exists(
         connection,
         "planned_assignments",
@@ -902,7 +966,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
         );
         "#,
     )?;
-    connection.pragma_update(None, "user_version", 14)?;
+    connection.pragma_update(None, "user_version", 15)?;
     Ok(())
 }
 
@@ -920,11 +984,16 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 14
+    Ok(user_version < 15
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
         || !column_exists(connection, "commissions", "worker_requirements_json")?
+        || !column_exists(connection, "commissions", "project_id")?
+        || !column_exists(connection, "commissions", "commission_constraints_json")?
+        || !table_exists(connection, "profile_claims")?
+        || !table_exists(connection, "attempt_context_packets")?
+        || !table_exists(connection, "attempt_profile_claims")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || results_schema
@@ -1030,7 +1099,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v14", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v15", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -1057,11 +1126,16 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 14
+    if user_version != 15
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
         || !column_exists(connection, "commissions", "worker_requirements_json")?
+        || !column_exists(connection, "commissions", "project_id")?
+        || !column_exists(connection, "commissions", "commission_constraints_json")?
+        || !table_exists(connection, "profile_claims")?
+        || !table_exists(connection, "attempt_context_packets")?
+        || !table_exists(connection, "attempt_profile_claims")?
         || !column_exists(connection, "attachments", "session_token_hash")?
         || !column_exists(connection, "results", "integrated_artifact_revision")?
         || !table_exists(connection, "worker_leases")?
@@ -1966,5 +2040,52 @@ mod tests {
             [],
         );
         assert!(update.is_err());
+    }
+
+    #[test]
+    fn version_fifteen_adds_learning_records_without_losing_commissions() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let database_path = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO commissions (id, goal, status, revision, created_at)
+                VALUES ('commission-v15', 'migration fixture', 'active', 1, 1);
+                DROP TABLE attempt_profile_claims;
+                DROP TABLE attempt_context_packets;
+                DROP TRIGGER profile_claims_are_immutable_update;
+                DROP TRIGGER profile_claims_are_immutable_delete;
+                DROP TABLE profile_claims;
+                ALTER TABLE commissions DROP COLUMN project_id;
+                ALTER TABLE commissions DROP COLUMN commission_constraints_json;
+                PRAGMA user_version = 14;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(super::super::Store::open(&database_path).unwrap());
+        let connection = Connection::open(database_path).unwrap();
+        verify(&connection).unwrap();
+        assert!(table_exists(&connection, "profile_claims").unwrap());
+        assert!(table_exists(&connection, "attempt_context_packets").unwrap());
+        assert!(table_exists(&connection, "attempt_profile_claims").unwrap());
+        let preserved = connection
+            .query_row(
+                "SELECT goal, project_id, commission_constraints_json
+                 FROM commissions WHERE id = 'commission-v15'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, ("migration fixture".into(), None, "[]".into()));
     }
 }

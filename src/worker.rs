@@ -245,6 +245,7 @@ pub(crate) struct AssignmentContext {
     pub goal: String,
     pub execution: ExecutionSpec,
     pub selected_configuration: serde_json::Value,
+    pub worker_context_packet: serde_json::Value,
     pub skill_defaults: Vec<AssignmentSkillDefault>,
     pub criteria: Vec<CriterionDefinition>,
     pub authority: AuthorityEnvelope,

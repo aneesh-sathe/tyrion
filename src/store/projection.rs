@@ -15,7 +15,8 @@ pub(super) fn inspect_commission(
     let commission = connection
         .query_row(
             "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at,
-                    artifact_revision, execution_json, plan_json, worker_requirements_json
+                    artifact_revision, execution_json, plan_json, worker_requirements_json,
+                    project_id, commission_constraints_json
              FROM commissions WHERE id = ?1",
             [commission_id],
             |row| {
@@ -39,6 +40,8 @@ pub(super) fn inspect_commission(
                             Box::new(error),
                         ))?,
                     "worker_requirements": json_column(row, 10)?,
+                    "project_id": row.get::<_, Option<String>>(11)?,
+                    "constraints": json_column(row, 12)?,
                 }))
             },
         )
@@ -350,7 +353,7 @@ pub(super) fn inspect_commission(
                 .collect(),
         );
     }
-    let attempts = query_values(
+    let mut attempts = query_values(
         connection,
         "SELECT attempts.id, attempts.assignment_id, attempts.worker_configuration,
                 attempts.status, attempts.started_at, attempts.completed_at,
@@ -408,6 +411,31 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let context_packets = query_values(
+        connection,
+        "SELECT attempt_context_packets.attempt_id,
+                attempt_context_packets.packet_json
+         FROM attempt_context_packets
+         JOIN attempts ON attempts.id = attempt_context_packets.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE assignments.commission_id = ?1
+         ORDER BY attempts.started_at_ms, attempts.id",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "attempt_id": row.get::<_, String>(0)?,
+                "packet": json_column(row, 1)?,
+            }))
+        },
+    )?;
+    for attempt in &mut attempts {
+        let attempt_id = attempt["id"].as_str();
+        attempt["worker_context_packet"] = context_packets
+            .iter()
+            .find(|packet| packet["attempt_id"].as_str() == attempt_id)
+            .map(|packet| packet["packet"].clone())
+            .unwrap_or(Value::Null);
+    }
     let now_ms = current_time_millis()?;
     let workers = query_values(
         connection,
@@ -1492,6 +1520,53 @@ fn completion_briefing(
         [commission_id],
         |row| row.get::<_, i64>(0),
     )?;
+    let mut learning_receipts = query_values(
+        connection,
+        "SELECT id, version, scope_kind, scope_id
+         FROM profile_claims
+         WHERE provenance_commission_id = ?1
+         ORDER BY created_at, id",
+        commission_id,
+        |row| {
+            let scope_kind = row.get::<_, String>(2)?;
+            let scope_id = row.get::<_, Option<String>>(3)?;
+            let scope = if scope_kind == "project" {
+                json!({"kind": scope_kind, "project_id": scope_id})
+            } else {
+                json!({"kind": scope_kind})
+            };
+            Ok(json!({
+                "kind": "profile_claim_created",
+                "claim_id": row.get::<_, String>(0)?,
+                "claim_version": row.get::<_, i64>(1)?,
+                "scope": scope,
+            }))
+        },
+    )?;
+    learning_receipts.extend(query_values(
+        connection,
+        "SELECT attempt_profile_claims.claim_id,
+                attempt_profile_claims.claim_version,
+                attempts.id, attempt_profile_claims.result_id,
+                attempt_profile_claims.outcome
+         FROM attempt_profile_claims
+         JOIN attempts ON attempts.id = attempt_profile_claims.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE assignments.commission_id = ?1
+           AND attempt_profile_claims.outcome IN ('edited', 'rejected', 'contradicted')
+         ORDER BY attempts.started_at_ms, attempts.id, attempt_profile_claims.position",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "kind": "profile_claim_applied_unsuccessfully",
+                "claim_id": row.get::<_, String>(0)?,
+                "claim_version": row.get::<_, i64>(1)?,
+                "attempt_id": row.get::<_, String>(2)?,
+                "result_id": row.get::<_, Option<String>>(3)?,
+                "outcome": row.get::<_, String>(4)?,
+            }))
+        },
+    )?);
     Ok(Some(json!({
         "title": "Verified Completion",
         "summary": summary,
@@ -1499,6 +1574,7 @@ fn completion_briefing(
         "completion_revision": completion_revision,
         "artifact_revision": artifact_revision,
         "criteria": criteria,
+        "learning_receipts": learning_receipts,
     })))
 }
 

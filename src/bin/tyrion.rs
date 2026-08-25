@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use tyrion::protocol::{
     AdapterIdentity, AttachmentHandshake, Command, CommissionAmendment, CommissionProposal,
     CommissionReplayCursor, CredentialGrantRequest, OperationReconciliationOutcome,
-    OperationRequest, Request, VerificationAmendment, VerificationEvidenceSubmission,
-    PROTOCOL_VERSION,
+    OperationRequest, Request, ReusablePreference, VerificationAmendment,
+    VerificationEvidenceSubmission, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -249,6 +249,20 @@ enum OperationCommand {
 
 #[derive(Debug, Subcommand)]
 enum PrincipalCommand {
+    RememberPreference {
+        commission_id: String,
+        #[arg(long)]
+        statement: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    InspectClaim {
+        claim_id: String,
+    },
+    InspectProfile {
+        #[arg(long)]
+        project_id: Option<String>,
+    },
     GrantCredential {
         commission_id: String,
         #[arg(long)]
@@ -718,6 +732,44 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     None,
                 )
             }
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::RememberPreference {
+                        commission_id,
+                        statement,
+                        idempotency_key,
+                    },
+            } => (
+                Command::CreateProfileClaim {
+                    commission_id: commission_id.clone(),
+                    preference: ReusablePreference {
+                        statement: statement.clone(),
+                    },
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command: PrincipalCommand::InspectClaim { claim_id },
+            } => (
+                Command::InspectProfileClaim {
+                    claim_id: claim_id.clone(),
+                },
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command: PrincipalCommand::InspectProfile { project_id },
+            } => (
+                Command::InspectProfile {
+                    project_id: project_id.clone(),
+                },
+                None,
+                None,
+                None,
+            ),
             TopLevelCommand::Principal {
                 command:
                     PrincipalCommand::GrantCredential {

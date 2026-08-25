@@ -9,7 +9,11 @@ pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CommissionProposal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub goal: String,
+    #[serde(default)]
+    pub commission_constraints: Vec<String>,
     #[serde(default)]
     pub execution: ExecutionSpec,
     #[serde(default)]
@@ -21,6 +25,12 @@ pub struct CommissionProposal {
     pub resource_ceilings: ResourceCeilings,
     #[serde(default)]
     pub known_uncertainties: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReusablePreference {
+    pub statement: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -599,6 +609,16 @@ pub enum Command {
         commission_id: String,
         worker_handle: String,
     },
+    CreateProfileClaim {
+        commission_id: String,
+        preference: ReusablePreference,
+    },
+    InspectProfileClaim {
+        claim_id: String,
+    },
+    InspectProfile {
+        project_id: Option<String>,
+    },
 }
 
 impl Command {
@@ -610,6 +630,8 @@ impl Command {
                 | Self::InspectCommissionAmendment { .. }
                 | Self::ResumeAttachment { .. }
                 | Self::ReplayEvents { .. }
+                | Self::InspectProfileClaim { .. }
+                | Self::InspectProfile { .. }
         )
     }
 }

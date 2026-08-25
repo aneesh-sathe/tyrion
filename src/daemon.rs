@@ -482,6 +482,18 @@ fn dispatch(
             data: store.accept_commission(request, commission_id, worker)?,
             follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),
         }),
+        Command::CreateProfileClaim {
+            commission_id,
+            preference,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.create_profile_claim(request, commission_id, preference, principal_token_hash)?,
+        )),
+        Command::InspectProfileClaim { claim_id } => Ok(DispatchOutcome::without_follow_up(
+            store.inspect_profile_claim(request, claim_id, principal_token_hash)?,
+        )),
+        Command::InspectProfile { project_id } => Ok(DispatchOutcome::without_follow_up(
+            store.inspect_profile(request, project_id.as_deref(), principal_token_hash)?,
+        )),
         Command::PauseCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
             store.pause_commission(request, commission_id)?,
         )),

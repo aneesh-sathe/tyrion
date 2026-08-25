@@ -79,6 +79,10 @@
 - When bumping `PROTOCOL_VERSION`, advance the incompatible-handshake fixture and assert the offered version against the current required version in that order.
 - Persist contract-validated Skill invocations from terminal telemetry before handling success, failure, or interruption so the first observed version survives rerouting.
 - Schema v14 adds immutable Assignment Skill defaults, per-Result Skill execution facts, and scoped non-causal Skill associations with Evidence, confidence, and recency.
+- Schema v15 adds explicit hard Profile Claims, bounded per-Attempt Worker Context Packets, exact claim-version application records, Result outcomes, and Learning Receipts.
+- A reusable preference requires both independent Principal authentication and the source Commission's Active Attachment. Derive project scope from `project_id` when present, exclude the source Commission from retrieval, and never turn `commission_constraints` into memory.
+- Worker Context Packets order current Principal instructions, Commission constraints, Acceptance Criteria, Authority, ceilings, and repository Evidence ahead of advisory claims. Memory never changes routing, Approval Gates, credentials, or ceilings.
+- Run `cargo test --test learning` for explicit preference creation, restart durability, scoped retrieval, packet budgets and precedence, outcome provenance, authority isolation, and Learning Receipts.
 - Codex hashes the package returned by native Skill discovery before typed invocation. Claude retains native setting-source discovery, resolves personal before project package paths for identity checks, exposes all native Skills plus the Skill tool, and hashes Worker-selected ToolUse invocations against the configured inventory. Both delegate the native package unchanged and emit typed Required Skill failures.
 - A Required Skill failure is Assignment-local unavailability: preserve the exact default across reroute, use only an approximately equal eligible configuration, and never infer a global ban.
 - Run `cargo test --test cross_harness_routing` and `cargo test --test production_adapters` for version pinning, provenance, native delegation, Result facts, associations, and Required Skill failure recovery.
@@ -106,4 +110,5 @@
 - Run `cargo test --test credentialed_effects` for brokered delivery, one-shot isolation and cleanup, leak absence, and no-replay reconciliation coverage on macOS.
 - Run `cargo test --test cross_harness_routing` for hard gates, ranking visibility, Entry Session neutrality, cross-harness Assignment routing, approximately equal fallback, Attention Conditions, stable Handles, steering, and interruption.
 - Synchronize structured-control failure tests on an explicit fixture signal after stdin closes. Fixed sleeps can let the adapter finish and reject the command before the durable outbox record exists.
+- A structured adapter session ID is published by `tyrion.adapter.ready` before the harness start event. Tests asserting started activity must wait for both signals instead of treating session identity as lifecycle readiness.
 - After verified issue-backed work is committed and pushed, close the completed issue and confirm its final state.
