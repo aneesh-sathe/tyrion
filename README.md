@@ -384,7 +384,7 @@ Reusing an idempotency key with the identical mutation returns its original resp
 
 ## Reusable Principal preferences
 
-A reusable software-building preference requires both the Active Attachment credential for its source Commission and the independent Principal control credential. Tyrion creates one atomic hard Profile Claim. If the source proposal names a `project_id`, its Authority Envelope must include repository Evidence. Tyrion binds each canonical repository device and inode before giving the claim narrow project scope. A later proposal can add repositories or worktrees only when it also presents an already-bound identity as an anchor; moves on the same filesystem can add a verified path alias. Without a `project_id`, the claim receives Principal scope. `commission_constraints` remain binding only within their Commission and never become Profile Claims automatically.
+A reusable software-building preference requires both the Active Attachment credential for its source Commission and the independent Principal control credential. An explicit `remember-preference` creates one atomic hard Profile Claim. If the source proposal names a `project_id`, its Authority Envelope must include repository Evidence. Tyrion binds each canonical repository device and inode before giving the claim narrow project scope. A later proposal can add repositories or worktrees only when it also presents an already-bound identity as an anchor; moves on the same filesystem can add a verified path alias. Without a `project_id`, the claim receives Principal scope. `commission_constraints` remain binding only within their Commission and never become Profile Claims automatically.
 
 ```sh
 printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
@@ -397,6 +397,27 @@ printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
 ```
 
 The response includes the complete versioned claim and a compact `profile_claim_created` Learning Receipt. The Principal can later inspect the claim, its provenance, and every affected Attempt, or inspect the active claims applicable to a project:
+
+Eligible Result outcomes can also create inferred soft candidates. One strong observation creates a project candidate. Two independent Commissions can promote it only when at least one observation is a Principal edit or an explained rejection. An unedited acceptance alone can neither originate nor promote a claim. Support spanning at least three Commissions and two projects creates a Principal-scope candidate, but only explicit Principal confirmation activates it. Material contradiction deactivates applicable soft claims, and soft claims without non-weak support for 180 days visibly decay back to candidate state. Lifecycle transitions and immutable observations remain inspectable.
+
+```sh
+printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  --principal-token-stdin \
+  principal observe-preference COMMISSION_ID \
+  --statement "Prefer behavior-first tests at public seams." \
+  --outcome principal-edit \
+  --idempotency-key observe-behavior-first-tests
+
+printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
+  target/debug/tyrion --socket .scratch/tyrion-data/tyrion.sock \
+  --attachment-token ATTACHMENT_SESSION_TOKEN \
+  --principal-token-stdin \
+  principal confirm-preference COMMISSION_ID CLAIM_ID \
+  --expected-version 1 \
+  --idempotency-key confirm-behavior-first-tests
+```
 
 ```sh
 PREVIEW=$(printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
@@ -421,7 +442,7 @@ printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
   --idempotency-key revise-behavior-first-tests
 ```
 
-Without a confirmation digest, revision returns the exact diff and its digest without changing the claim. Confirming that digest against the expected current version appends an immutable claim version and returns a `profile_claim_changed` receipt. The claim head retains its lifecycle independently, so later Principal-only suppression and forgetting controls do not require rewriting historical versions.
+Without a confirmation digest, revision returns the exact diff and its digest without changing the claim. Confirming that digest against the expected current version appends an immutable superseding claim version and returns a `profile_claim_changed` receipt. An explicit correction can resolve a contradicted claim while retaining the contradiction in lifecycle history. Suppression deactivates the claim without deleting history. Forgetting first previews its exact cascade and confirmation digest, then atomically removes the claim, its versions, dedicated observations and excerpts, Attempt links, indexes, and caches. The resulting deletion receipt contains identifiers and counts but no forgotten content. `prevent-preference` adds a scoped Learning Boundary that blocks later inference, confirmation, active import, and reactivation for the same statement.
 
 ```sh
 printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
@@ -434,7 +455,11 @@ printf '%s\n' "$TYRION_PRINCIPAL_CONTROL_TOKEN" | \
   --project-id project-tyrion
 ```
 
-Retrieval is deterministic. It selects only active software-building claims whose Principal or verified project scope applies, excludes claim versions created from the current Commission, and injects whole current versions in project-first creation order. Advisory memory targets 2,000 tokens and is capped at the smaller of 15,000 tokens or 8 percent of the selected Worker Configuration's context capacity. Tyrion uses the serialized UTF-8 byte length as a conservative cross-tokenizer upper bound, including all injected claim metadata. Principal and Project Profiles also enforce their independent active claim and token limits.
+Retrieval is deterministic. It selects only active software-building claims whose Principal or verified project scope applies, excludes claim versions created from the current Commission, and merges them in scope, strength, and creation order. Admission demotes or evicts lower-priority soft memory before rejecting a hard claim, and never truncates a claim. Advisory memory targets 2,000 tokens and is capped at the smaller of 15,000 tokens or 8 percent of the selected Worker Configuration's context capacity. Tyrion uses the serialized UTF-8 byte length as a conservative cross-tokenizer upper bound, including all injected claim metadata. Principal and Project Profiles also enforce their independent active claim and token limits.
+
+`export-memory` produces a versioned, checksummed JSON bundle plus a readable Markdown summary for either Principal or project scope. It includes claim versions, lifecycle and observation history, transitive Commission provenance, Learning Boundaries, and content-free deletion receipts. It excludes credentials, session material, and raw secrets. `import-memory` validates a strict field whitelist, checksum, complete audit histories, scope, and prohibited fields before restoring the bundle with its original provenance. Imported source project identifiers remain provenance and never establish local repository identity.
+
+Temporary raw transcript and unaccepted artifact material receives a 30-day terminal retention deadline unless it is pinned, supports Evidence or a claim, or its effect remains uncertain. Active material never expires. Structured Commission Records and Evidence are retained after temporary content expires.
 
 Every Attempt persists its exact `worker_context_packet`. Current Principal instructions, Commission constraints, Acceptance Criteria, Authority Envelope, resource ceilings, and current repository Evidence appear as binding sources ahead of advisory Profile Claims. A claim cannot affect routing eligibility, Approval Gates, credentials, or resource ceilings. Structured adapters receive the same packet in `tyrion.assignment.launch`.
 

@@ -21,6 +21,7 @@ mod structured_process;
 
 pub const DETERMINISTIC_ACTION: &str = "deterministic.echo";
 pub const CODEX_GIT_ACTION: &str = "codex.git_change";
+const MAX_RAW_ADAPTER_EVENT_BYTES: usize = 64 * 1024;
 
 pub(crate) struct WorkerRuntime {
     contained_codex: Option<contained_codex::ContainedCodexRuntime>,
@@ -79,6 +80,10 @@ struct LiveWorkerTelemetry {
     output_tokens: u64,
     usage_reported: bool,
     skill_versions: Vec<SkillVersion>,
+    raw_adapter_events: Vec<serde_json::Value>,
+    raw_adapter_event_bytes: usize,
+    raw_adapter_event_limit: usize,
+    raw_adapter_events_truncated: bool,
 }
 
 impl WorkerControl {
@@ -155,6 +160,19 @@ impl WorkerControl {
         let mut telemetry = self.telemetry.lock().map_err(|_| {
             TyrionError::InvalidRequest("Worker telemetry channel is unavailable".into())
         })?;
+        let event_bytes = serde_json::to_vec(event)?.len();
+        if telemetry
+            .raw_adapter_event_bytes
+            .saturating_add(event_bytes)
+            <= telemetry.raw_adapter_event_limit
+        {
+            telemetry.raw_adapter_events.push(event.clone());
+            telemetry.raw_adapter_event_bytes = telemetry
+                .raw_adapter_event_bytes
+                .saturating_add(event_bytes);
+        } else {
+            telemetry.raw_adapter_events_truncated = true;
+        }
         let mut meaningful_activity = None;
         if event["type"] == "tyrion.adapter.ready" {
             telemetry.native_session_id = event["native_session_id"].as_str().map(str::to_owned);
@@ -479,6 +497,7 @@ impl WorkerRuntime {
         &self,
         attempt_id: &str,
         mandate_revision: i64,
+        max_storage_bytes: u64,
     ) -> Result<(), TyrionError> {
         let mut controls = self.controls.lock().map_err(|_| {
             TyrionError::InvalidRequest("Worker control registry is unavailable".into())
@@ -496,7 +515,12 @@ impl WorkerRuntime {
                 adapter_input: Mutex::new(None),
                 adapter_was_attached: AtomicBool::new(false),
                 adapter_detached: AtomicBool::new(false),
-                telemetry: Mutex::new(LiveWorkerTelemetry::default()),
+                telemetry: Mutex::new(LiveWorkerTelemetry {
+                    raw_adapter_event_limit: usize::try_from(max_storage_bytes)
+                        .unwrap_or(usize::MAX)
+                        .min(MAX_RAW_ADAPTER_EVENT_BYTES),
+                    ..LiveWorkerTelemetry::default()
+                }),
             }),
         );
         Ok(())
@@ -727,6 +751,8 @@ impl WorkerRuntime {
                 serde_json::json!({})
             },
             "skill_versions": telemetry.skill_versions,
+            "raw_adapter_events": telemetry.raw_adapter_events,
+            "raw_adapter_events_truncated": telemetry.raw_adapter_events_truncated,
         }))
     }
 

@@ -43,6 +43,8 @@ struct Arguments {
     fault_hold_effect_before_commit_milliseconds: u64,
     #[arg(long, default_value_t = 30_000, hide = true)]
     watchdog_stall_milliseconds: u64,
+    #[arg(long, hide = true)]
+    fault_memory_now_epoch: Option<i64>,
 }
 
 fn main() {
@@ -68,6 +70,7 @@ fn main() {
         hold_effect_before_commit_milliseconds: arguments
             .fault_hold_effect_before_commit_milliseconds,
         watchdog_stall_milliseconds: arguments.watchdog_stall_milliseconds,
+        memory_now_epoch_seconds: arguments.fault_memory_now_epoch,
     };
     if let Err(error) =
         tyrion::run_daemon_with_options(&arguments.data_dir, &arguments.socket, options)

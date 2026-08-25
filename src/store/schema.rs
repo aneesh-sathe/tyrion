@@ -53,13 +53,20 @@ CREATE TABLE IF NOT EXISTS project_aliases (
 CREATE TABLE IF NOT EXISTS profile_claims (
     id TEXT PRIMARY KEY,
     current_version INTEGER NOT NULL CHECK (current_version > 0),
-    strength TEXT NOT NULL CHECK (strength = 'hard'),
+    strength TEXT NOT NULL CHECK (strength IN ('hard', 'soft')),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
     scope_id TEXT REFERENCES projects(project_id),
     applicability TEXT NOT NULL CHECK (applicability = 'software_building'),
-    confidence_category TEXT NOT NULL CHECK (confidence_category = 'explicit'),
-    confidence_basis_points INTEGER NOT NULL CHECK (confidence_basis_points = 10000),
-    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('active', 'suppressed')),
+    confidence_category TEXT NOT NULL CHECK (confidence_category IN ('explicit', 'inferred')),
+    confidence_basis_points INTEGER NOT NULL CHECK (
+        confidence_basis_points >= 0 AND confidence_basis_points <= 10000
+    ),
+    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN (
+        'candidate', 'active', 'suppressed', 'contradicted'
+    )),
+    statement_fingerprint TEXT NOT NULL,
+    last_nonweak_support_at INTEGER,
+    lifecycle_changed_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     CHECK (
@@ -823,6 +830,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             [],
         )?;
     }
+    upgrade_profile_claims_for_inference(connection)?;
     if !column_exists(
         connection,
         "planned_assignments",
@@ -996,8 +1004,252 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
         );
         "#,
     )?;
-    connection.pragma_update(None, "user_version", 15)?;
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS learning_observations (
+            id TEXT PRIMARY KEY,
+            commission_id TEXT NOT NULL REFERENCES commissions(id),
+            project_id TEXT NOT NULL,
+            attachment_id TEXT NOT NULL REFERENCES attachments(id),
+            claim_id TEXT REFERENCES profile_claims(id) ON DELETE SET NULL,
+            statement TEXT NOT NULL,
+            statement_fingerprint TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN (
+                'principal_edit', 'explained_rejection',
+                'unedited_acceptance', 'contradiction'
+            )),
+            explanation TEXT,
+            strength TEXT NOT NULL CHECK (strength IN ('strong', 'weak', 'contradiction')),
+            observed_at INTEGER NOT NULL,
+            UNIQUE (commission_id, statement_fingerprint)
+        );
+        CREATE TABLE IF NOT EXISTS profile_claim_lifecycle (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_id TEXT NOT NULL REFERENCES profile_claims(id) ON DELETE CASCADE,
+            from_state TEXT,
+            to_state TEXT NOT NULL CHECK (to_state IN (
+                'candidate', 'active', 'suppressed', 'contradicted'
+            )),
+            reason TEXT NOT NULL,
+            observation_id TEXT REFERENCES learning_observations(id),
+            changed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS profile_claim_observations (
+            claim_id TEXT NOT NULL REFERENCES profile_claims(id) ON DELETE CASCADE,
+            observation_id TEXT NOT NULL REFERENCES learning_observations(id) ON DELETE CASCADE,
+            PRIMARY KEY (claim_id, observation_id)
+        );
+        CREATE TABLE IF NOT EXISTS profile_claim_indexes (
+            claim_id TEXT PRIMARY KEY REFERENCES profile_claims(id) ON DELETE CASCADE,
+            statement_fingerprint TEXT NOT NULL,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS profile_claim_caches (
+            claim_id TEXT PRIMARY KEY REFERENCES profile_claims(id) ON DELETE CASCADE,
+            cached_projection_json TEXT NOT NULL,
+            cached_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS learning_boundaries (
+            id TEXT PRIMARY KEY,
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
+            scope_id TEXT REFERENCES projects(project_id),
+            statement_fingerprint TEXT NOT NULL,
+            provenance_commission_id TEXT NOT NULL REFERENCES commissions(id),
+            provenance_attachment_id TEXT NOT NULL REFERENCES attachments(id),
+            created_at INTEGER NOT NULL,
+            CHECK (
+                (scope_kind = 'principal' AND scope_id IS NULL)
+                OR (scope_kind = 'project' AND scope_id IS NOT NULL)
+            ),
+            UNIQUE (scope_kind, scope_id, statement_fingerprint)
+        );
+        CREATE TRIGGER IF NOT EXISTS learning_boundaries_principal_unique_insert
+        BEFORE INSERT ON learning_boundaries
+        WHEN NEW.scope_kind = 'principal' AND EXISTS (
+            SELECT 1 FROM learning_boundaries
+            WHERE scope_kind = 'principal'
+              AND statement_fingerprint = NEW.statement_fingerprint
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Principal Learning Boundary already exists');
+        END;
+        CREATE TRIGGER IF NOT EXISTS learning_boundaries_principal_unique_update
+        BEFORE UPDATE OF scope_kind, statement_fingerprint ON learning_boundaries
+        WHEN NEW.scope_kind = 'principal' AND EXISTS (
+            SELECT 1 FROM learning_boundaries
+            WHERE scope_kind = 'principal'
+              AND statement_fingerprint = NEW.statement_fingerprint
+              AND id != OLD.id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Principal Learning Boundary already exists');
+        END;
+        CREATE TABLE IF NOT EXISTS memory_deletion_receipts (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
+            scope_id TEXT,
+            cascade_json TEXT NOT NULL,
+            remaining_related_claims_json TEXT NOT NULL,
+            deleted_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS imported_commission_records (
+            record_id TEXT PRIMARY KEY,
+            project_id TEXT,
+            record_json TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            imported_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS imported_profile_claim_attempts (
+            claim_id TEXT NOT NULL REFERENCES profile_claims(id) ON DELETE CASCADE,
+            attempt_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            imported_at INTEGER NOT NULL,
+            PRIMARY KEY (claim_id, attempt_id)
+        );
+        CREATE TABLE IF NOT EXISTS memory_import_provenance (
+            entity_kind TEXT NOT NULL CHECK (entity_kind IN ('claim_version', 'observation')),
+            entity_id TEXT NOT NULL,
+            entity_version INTEGER NOT NULL DEFAULT 0,
+            provenance_json TEXT NOT NULL,
+            PRIMARY KEY (entity_kind, entity_id, entity_version)
+        );
+        CREATE TABLE IF NOT EXISTS temporary_memory_materials (
+            id TEXT PRIMARY KEY,
+            commission_id TEXT NOT NULL REFERENCES commissions(id),
+            attempt_id TEXT REFERENCES attempts(id),
+            result_id TEXT REFERENCES results(id),
+            kind TEXT NOT NULL CHECK (kind IN ('raw_worker_transcript', 'unaccepted_artifact')),
+            content_json TEXT,
+            pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+            retained_by_evidence INTEGER NOT NULL DEFAULT 0 CHECK (retained_by_evidence IN (0, 1)),
+            retained_by_claim INTEGER NOT NULL DEFAULT 0 CHECK (retained_by_claim IN (0, 1)),
+            retained_for_uncertain_effect INTEGER NOT NULL DEFAULT 0 CHECK (
+                retained_for_uncertain_effect IN (0, 1)
+            ),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            expired_at INTEGER
+        );
+        INSERT INTO profile_claim_lifecycle (
+            claim_id, from_state, to_state, reason, changed_at
+        )
+        SELECT id, NULL, lifecycle_state, 'legacy_profile_migration', updated_at
+        FROM profile_claims
+        WHERE NOT EXISTS (
+            SELECT 1 FROM profile_claim_lifecycle
+            WHERE profile_claim_lifecycle.claim_id = profile_claims.id
+        );
+        INSERT OR IGNORE INTO profile_claim_observations (claim_id, observation_id)
+        SELECT claim_id, id FROM learning_observations WHERE claim_id IS NOT NULL;
+        INSERT OR IGNORE INTO profile_claim_indexes (
+            claim_id, statement_fingerprint, indexed_at
+        )
+        SELECT id, statement_fingerprint, updated_at FROM profile_claims;
+        INSERT OR IGNORE INTO profile_claim_caches (
+            claim_id, cached_projection_json, cached_at
+        )
+        SELECT id, '{}', updated_at FROM profile_claims;
+        "#,
+    )?;
+    connection.pragma_update(None, "user_version", 16)?;
     Ok(())
+}
+
+fn upgrade_profile_claims_for_inference(connection: &Connection) -> Result<(), TyrionError> {
+    if !table_exists(connection, "profile_claims")? {
+        return Ok(());
+    }
+    if !column_exists(connection, "profile_claims", "statement_fingerprint")? {
+        connection.execute_batch(
+            r#"
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        ALTER TABLE profile_claims RENAME TO profile_claims_before_inference;
+        CREATE TABLE profile_claims (
+            id TEXT PRIMARY KEY,
+            current_version INTEGER NOT NULL CHECK (current_version > 0),
+            strength TEXT NOT NULL CHECK (strength IN ('hard', 'soft')),
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
+            scope_id TEXT REFERENCES projects(project_id),
+            applicability TEXT NOT NULL CHECK (applicability = 'software_building'),
+            confidence_category TEXT NOT NULL CHECK (confidence_category IN ('explicit', 'inferred')),
+            confidence_basis_points INTEGER NOT NULL CHECK (
+                confidence_basis_points >= 0 AND confidence_basis_points <= 10000
+            ),
+            lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN (
+                'candidate', 'active', 'suppressed', 'contradicted'
+            )),
+            statement_fingerprint TEXT NOT NULL,
+            last_nonweak_support_at INTEGER,
+            lifecycle_changed_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            CHECK (
+                (scope_kind = 'principal' AND scope_id IS NULL)
+                OR (scope_kind = 'project' AND scope_id IS NOT NULL)
+            ),
+            FOREIGN KEY (id, current_version)
+                REFERENCES profile_claim_versions(claim_id, version)
+        );
+        INSERT INTO profile_claims (
+            id, current_version, strength, scope_kind, scope_id, applicability,
+            confidence_category, confidence_basis_points, lifecycle_state,
+            statement_fingerprint, last_nonweak_support_at, lifecycle_changed_at,
+            created_at, updated_at
+        )
+        SELECT id, current_version, strength, scope_kind, scope_id, applicability,
+               confidence_category, confidence_basis_points, lifecycle_state,
+               'legacy:' || id, updated_at, updated_at, created_at, updated_at
+        FROM profile_claims_before_inference;
+        DROP TABLE profile_claims_before_inference;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        "#,
+        )?;
+    }
+    backfill_legacy_profile_fingerprints(connection)
+}
+
+fn backfill_legacy_profile_fingerprints(connection: &Connection) -> Result<(), TyrionError> {
+    let claims = {
+        let mut statement = connection.prepare(
+            "SELECT profile_claims.id, profile_claim_versions.statement
+             FROM profile_claims
+             JOIN profile_claim_versions
+               ON profile_claim_versions.claim_id = profile_claims.id
+              AND profile_claim_versions.version = profile_claims.current_version
+             WHERE profile_claims.statement_fingerprint LIKE 'legacy:%'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (claim_id, statement) in claims {
+        connection.execute(
+            "UPDATE profile_claims SET statement_fingerprint = ?2 WHERE id = ?1",
+            rusqlite::params![claim_id, super::preference_fingerprint(&statement)],
+        )?;
+    }
+    Ok(())
+}
+
+fn has_legacy_profile_fingerprints(connection: &Connection) -> Result<bool, TyrionError> {
+    if !table_exists(connection, "profile_claims")?
+        || !column_exists(connection, "profile_claims", "statement_fingerprint")?
+    {
+        return Ok(false);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM profile_claims
+            WHERE statement_fingerprint LIKE 'legacy:%'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 pub(super) fn migration_required(connection: &Connection) -> Result<bool, TyrionError> {
@@ -1014,7 +1266,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 15
+    Ok(user_version < 16
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1026,6 +1278,21 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
         || !table_exists(connection, "project_aliases")?
         || !table_exists(connection, "profile_claims")?
         || !table_exists(connection, "profile_claim_versions")?
+        || !column_exists(connection, "profile_claims", "statement_fingerprint")?
+        || has_legacy_profile_fingerprints(connection)?
+        || !table_exists(connection, "learning_observations")?
+        || !table_exists(connection, "profile_claim_lifecycle")?
+        || !table_exists(connection, "profile_claim_observations")?
+        || !table_exists(connection, "profile_claim_indexes")?
+        || !table_exists(connection, "profile_claim_caches")?
+        || !table_exists(connection, "learning_boundaries")?
+        || !trigger_exists(connection, "learning_boundaries_principal_unique_insert")?
+        || !trigger_exists(connection, "learning_boundaries_principal_unique_update")?
+        || !table_exists(connection, "memory_deletion_receipts")?
+        || !table_exists(connection, "imported_commission_records")?
+        || !table_exists(connection, "imported_profile_claim_attempts")?
+        || !table_exists(connection, "memory_import_provenance")?
+        || !table_exists(connection, "temporary_memory_materials")?
         || !table_exists(connection, "attempt_context_packets")?
         || !table_exists(connection, "attempt_profile_claims")?
         || !column_exists(connection, "attachments", "session_token_hash")?
@@ -1133,7 +1400,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v15", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v16", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -1160,7 +1427,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 15
+    if user_version != 16
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1172,6 +1439,21 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !table_exists(connection, "project_aliases")?
         || !table_exists(connection, "profile_claims")?
         || !table_exists(connection, "profile_claim_versions")?
+        || !column_exists(connection, "profile_claims", "statement_fingerprint")?
+        || has_legacy_profile_fingerprints(connection)?
+        || !table_exists(connection, "learning_observations")?
+        || !table_exists(connection, "profile_claim_lifecycle")?
+        || !table_exists(connection, "profile_claim_observations")?
+        || !table_exists(connection, "profile_claim_indexes")?
+        || !table_exists(connection, "profile_claim_caches")?
+        || !table_exists(connection, "learning_boundaries")?
+        || !trigger_exists(connection, "learning_boundaries_principal_unique_insert")?
+        || !trigger_exists(connection, "learning_boundaries_principal_unique_update")?
+        || !table_exists(connection, "memory_deletion_receipts")?
+        || !table_exists(connection, "imported_commission_records")?
+        || !table_exists(connection, "imported_profile_claim_attempts")?
+        || !table_exists(connection, "memory_import_provenance")?
+        || !table_exists(connection, "temporary_memory_materials")?
         || !table_exists(connection, "attempt_context_packets")?
         || !table_exists(connection, "attempt_profile_claims")?
         || !column_exists(connection, "attachments", "session_token_hash")?
@@ -1812,6 +2094,16 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, TyrionErro
     Ok(table_schema(connection, table)?.is_some())
 }
 
+fn trigger_exists(connection: &Connection, trigger: &str) -> Result<bool, TyrionError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1
+         )",
+        [trigger],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
 fn table_schema(connection: &Connection, table: &str) -> Result<Option<String>, TyrionError> {
     Ok(connection
         .query_row(
@@ -2132,5 +2424,148 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, ("migration fixture".into(), None, "[]".into()));
+    }
+
+    #[test]
+    fn version_sixteen_expands_profile_lifecycle_without_losing_hard_claims() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let database_path = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                DROP TABLE profile_claims;
+                CREATE TABLE profile_claims (
+                    id TEXT PRIMARY KEY,
+                    current_version INTEGER NOT NULL CHECK (current_version > 0),
+                    strength TEXT NOT NULL CHECK (strength = 'hard'),
+                    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('principal', 'project')),
+                    scope_id TEXT REFERENCES projects(project_id),
+                    applicability TEXT NOT NULL CHECK (applicability = 'software_building'),
+                    confidence_category TEXT NOT NULL CHECK (confidence_category = 'explicit'),
+                    confidence_basis_points INTEGER NOT NULL CHECK (confidence_basis_points = 10000),
+                    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('active', 'suppressed')),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    CHECK (
+                        (scope_kind = 'principal' AND scope_id IS NULL)
+                        OR (scope_kind = 'project' AND scope_id IS NOT NULL)
+                    ),
+                    FOREIGN KEY (id, current_version)
+                        REFERENCES profile_claim_versions(claim_id, version)
+                );
+                INSERT INTO projects (project_id, created_at)
+                VALUES ('project-v16', 1);
+                INSERT INTO commissions (
+                    id, goal, status, revision, control_revision, created_at, project_id
+                ) VALUES (
+                    'commission-v16', 'migration fixture', 'active', 1, 0, 1, 'project-v16'
+                );
+                INSERT INTO attachments (
+                    id, session_token_hash, harness, adapter_identity, adapter_version,
+                    protocol_version, native_session_id, mode, capabilities_json,
+                    missing_capabilities_json, created_at
+                ) VALUES (
+                    'attachment-v16', 'fixture-token-hash', 'codex', 'fixture', '1',
+                    2, 'fixture-session', 'full', '[]', '[]', 1
+                );
+                INSERT INTO profile_claim_versions (
+                    claim_id, version, statement, token_upper_bound,
+                    provenance_commission_id, provenance_attachment_id, created_at
+                ) VALUES (
+                    'claim-v16', 1, 'Prefer public seams.', 20,
+                    'commission-v16', 'attachment-v16', 1
+                );
+                INSERT INTO profile_claims (
+                    id, current_version, strength, scope_kind, scope_id, applicability,
+                    confidence_category, confidence_basis_points, lifecycle_state,
+                    created_at, updated_at
+                ) VALUES (
+                    'claim-v16', 1, 'hard', 'project', 'project-v16',
+                    'software_building', 'explicit', 10000, 'active', 1, 1
+                );
+                PRAGMA user_version = 15;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(super::super::Store::open(&database_path).unwrap());
+        let connection = Connection::open(database_path).unwrap();
+        verify(&connection).unwrap();
+        let preserved = connection
+            .query_row(
+                "SELECT strength, lifecycle_state, statement_fingerprint,
+                        last_nonweak_support_at, lifecycle_changed_at
+                 FROM profile_claims WHERE id = 'claim-v16'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved.0, "hard");
+        assert_eq!(preserved.1, "active");
+        assert_eq!(
+            preserved.2,
+            super::super::preference_fingerprint("Prefer public seams.")
+        );
+        assert_eq!(preserved.3, Some(1));
+        assert_eq!(preserved.4, 1);
+        assert!(table_exists(&connection, "learning_observations").unwrap());
+        assert!(table_exists(&connection, "temporary_memory_materials").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM profile_claim_indexes WHERE claim_id = 'claim-v16'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM profile_claim_lifecycle
+                     WHERE claim_id = 'claim-v16' AND reason = 'legacy_profile_migration'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        connection
+            .execute(
+                "UPDATE profile_claims
+                 SET statement_fingerprint = 'legacy:claim-v16'
+                 WHERE id = 'claim-v16'",
+                [],
+            )
+            .unwrap();
+        assert!(migration_required(&connection).unwrap());
+        assert!(verify(&connection).is_err());
+        migrate(&connection).unwrap();
+        verify(&connection).unwrap();
+        assert!(!migration_required(&connection).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT statement_fingerprint FROM profile_claims
+                     WHERE id = 'claim-v16'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            super::super::preference_fingerprint("Prefer public seams.")
+        );
     }
 }

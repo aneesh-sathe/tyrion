@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tyrion::protocol::{
     AdapterIdentity, AttachmentHandshake, Command, CommissionAmendment, CommissionProposal,
-    CommissionReplayCursor, CredentialGrantRequest, OperationReconciliationOutcome,
-    OperationRequest, Request, ReusablePreference, VerificationAmendment,
-    VerificationEvidenceSubmission, PROTOCOL_VERSION,
+    CommissionReplayCursor, CredentialGrantRequest, LearningObservationKind,
+    OperationReconciliationOutcome, OperationRequest, Request, ReusablePreference,
+    VerificationAmendment, VerificationEvidenceSubmission, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -265,6 +265,67 @@ enum PrincipalCommand {
         expected_version: i64,
         #[arg(long)]
         confirmation_digest: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    ObservePreference {
+        commission_id: String,
+        #[arg(long)]
+        statement: String,
+        #[arg(long)]
+        outcome: LearningObservationKind,
+        #[arg(long)]
+        explanation: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    ConfirmPreference {
+        commission_id: String,
+        claim_id: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    SuppressPreference {
+        commission_id: String,
+        claim_id: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    ForgetPreference {
+        commission_id: String,
+        claim_id: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        confirmation_digest: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    PreventPreference {
+        commission_id: String,
+        #[arg(long)]
+        statement: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    ExportMemory {
+        #[arg(long)]
+        project_id: Option<String>,
+    },
+    ImportMemory {
+        commission_id: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    PinMemoryMaterial {
+        commission_id: String,
+        material_id: String,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -781,6 +842,147 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     preference: ReusablePreference {
                         statement: statement.clone(),
                     },
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::ObservePreference {
+                        commission_id,
+                        statement,
+                        outcome,
+                        explanation,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ObserveProfilePreference {
+                    commission_id: commission_id.clone(),
+                    preference: ReusablePreference {
+                        statement: statement.clone(),
+                    },
+                    outcome: *outcome,
+                    explanation: explanation.clone(),
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::ConfirmPreference {
+                        commission_id,
+                        claim_id,
+                        expected_version,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ConfirmProfileClaim {
+                    commission_id: commission_id.clone(),
+                    claim_id: claim_id.clone(),
+                    expected_version: *expected_version,
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::SuppressPreference {
+                        commission_id,
+                        claim_id,
+                        expected_version,
+                        idempotency_key,
+                    },
+            } => (
+                Command::SuppressProfileClaim {
+                    commission_id: commission_id.clone(),
+                    claim_id: claim_id.clone(),
+                    expected_version: *expected_version,
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::ForgetPreference {
+                        commission_id,
+                        claim_id,
+                        expected_version,
+                        confirmation_digest,
+                        idempotency_key,
+                    },
+            } => (
+                Command::ForgetProfileClaim {
+                    commission_id: commission_id.clone(),
+                    claim_id: claim_id.clone(),
+                    expected_version: *expected_version,
+                    confirmation_digest: confirmation_digest.clone(),
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::PreventPreference {
+                        commission_id,
+                        statement,
+                        idempotency_key,
+                    },
+            } => (
+                Command::CreateLearningBoundary {
+                    commission_id: commission_id.clone(),
+                    preference: ReusablePreference {
+                        statement: statement.clone(),
+                    },
+                },
+                Some(idempotency_key.clone()),
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command: PrincipalCommand::ExportMemory { project_id },
+            } => (
+                Command::ExportMemory {
+                    project_id: project_id.clone(),
+                },
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::ImportMemory {
+                        commission_id,
+                        file,
+                        idempotency_key,
+                    },
+            } => {
+                let bundle: serde_json::Value = serde_json::from_slice(&fs::read(file)?)?;
+                (
+                    Command::ImportMemory {
+                        commission_id: commission_id.clone(),
+                        bundle: Box::new(bundle),
+                    },
+                    Some(idempotency_key.clone()),
+                    None,
+                    None,
+                )
+            }
+            TopLevelCommand::Principal {
+                command:
+                    PrincipalCommand::PinMemoryMaterial {
+                        commission_id,
+                        material_id,
+                        idempotency_key,
+                    },
+            } => (
+                Command::PinMemoryMaterial {
+                    commission_id: commission_id.clone(),
+                    material_id: material_id.clone(),
                 },
                 Some(idempotency_key.clone()),
                 None,

@@ -33,6 +33,51 @@ pub struct ReusablePreference {
     pub statement: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningObservationKind {
+    PrincipalEdit,
+    ExplainedRejection,
+    UneditedAcceptance,
+    Contradiction,
+}
+
+impl LearningObservationKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrincipalEdit => "principal_edit",
+            Self::ExplainedRejection => "explained_rejection",
+            Self::UneditedAcceptance => "unedited_acceptance",
+            Self::Contradiction => "contradiction",
+        }
+    }
+
+    pub(crate) const fn strength(self) -> &'static str {
+        match self {
+            Self::PrincipalEdit | Self::ExplainedRejection => "strong",
+            Self::UneditedAcceptance => "weak",
+            Self::Contradiction => "contradiction",
+        }
+    }
+}
+
+impl std::str::FromStr for LearningObservationKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "principal-edit" | "principal_edit" => Ok(Self::PrincipalEdit),
+            "explained-rejection" | "explained_rejection" => Ok(Self::ExplainedRejection),
+            "unedited-acceptance" | "unedited_acceptance" => Ok(Self::UneditedAcceptance),
+            "contradiction" => Ok(Self::Contradiction),
+            _ => Err(
+                "outcome must be principal-edit, explained-rejection, unedited-acceptance, or contradiction"
+                    .into(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CommissionPlan {
@@ -621,6 +666,45 @@ pub enum Command {
         confirmation_digest: Option<String>,
         preference: ReusablePreference,
     },
+    ObserveProfilePreference {
+        commission_id: String,
+        preference: ReusablePreference,
+        outcome: LearningObservationKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
+    ConfirmProfileClaim {
+        commission_id: String,
+        claim_id: String,
+        expected_version: i64,
+    },
+    SuppressProfileClaim {
+        commission_id: String,
+        claim_id: String,
+        expected_version: i64,
+    },
+    ForgetProfileClaim {
+        commission_id: String,
+        claim_id: String,
+        expected_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmation_digest: Option<String>,
+    },
+    CreateLearningBoundary {
+        commission_id: String,
+        preference: ReusablePreference,
+    },
+    ExportMemory {
+        project_id: Option<String>,
+    },
+    ImportMemory {
+        commission_id: String,
+        bundle: Box<Value>,
+    },
+    PinMemoryMaterial {
+        commission_id: String,
+        material_id: String,
+    },
     InspectProfileClaim {
         claim_id: String,
     },
@@ -640,6 +724,7 @@ impl Command {
                 | Self::ReplayEvents { .. }
                 | Self::InspectProfileClaim { .. }
                 | Self::InspectProfile { .. }
+                | Self::ExportMemory { .. }
         )
     }
 }

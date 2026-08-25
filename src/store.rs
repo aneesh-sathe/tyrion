@@ -27,11 +27,11 @@ use crate::protocol::{
     AcceptanceCriterion, AdapterIdentity, AssignmentPurpose, AssignmentResources,
     AttachmentHandshake, AuthorityEnvelope, CommissionAmendment, CommissionPlan,
     CommissionProposal, CommissionReplayCursor, CredentialExposure, CredentialGrantRequest,
-    CredentialUseMode, ExecutionSpec, OperationReconciliationOutcome, OperationRequest,
-    PlannedAssignment, Request, ResourceCeilings, ReusablePreference, SelectedSkillVersion,
-    SkillSelectionProvenance, SkillVersion, VerificationAmendment, VerificationDefect,
-    VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict, Verifier, VerifierType,
-    WorkerRequirements, PROTOCOL_VERSION,
+    CredentialUseMode, ExecutionSpec, LearningObservationKind, OperationReconciliationOutcome,
+    OperationRequest, PlannedAssignment, Request, ResourceCeilings, ReusablePreference,
+    SelectedSkillVersion, SkillSelectionProvenance, SkillVersion, VerificationAmendment,
+    VerificationDefect, VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict,
+    Verifier, VerifierType, WorkerRequirements, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
@@ -43,7 +43,8 @@ mod schema;
 use frontier::{Competition, OccupiedWork, Resources, Work};
 use projection::{
     affected_attempts, event_value, inspect_commission as project_commission,
-    inspect_profile as project_profile, profile_claim, profile_claim_versions,
+    inspect_profile as project_profile, learning_observation, learning_observations, profile_claim,
+    profile_claim_lifecycle, profile_claim_versions,
 };
 
 pub struct Store {
@@ -500,26 +501,30 @@ impl Store {
             None => ("principal", None, 20_u64, 1_000_u64),
         };
         let token_upper_bound = token_upper_bound(&preference.statement);
-        let (active_claims, active_tokens) = transaction.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(profile_claim_versions.token_upper_bound), 0)
-             FROM profile_claims
-             JOIN profile_claim_versions
-               ON profile_claim_versions.claim_id = profile_claims.id
-              AND profile_claim_versions.version = profile_claims.current_version
-             WHERE lifecycle_state = 'active' AND scope_kind = ?1
-               AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))",
-            params![scope_kind, scope_id],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
-        )?;
-        if active_claims >= claim_limit
-            || active_tokens.saturating_add(token_upper_bound) > token_limit
-        {
-            return Err(TyrionError::InvalidRequest(format!(
-                "the {scope_kind} Profile is at its active claim or token limit"
+        let statement_fingerprint = preference_fingerprint(&preference.statement);
+        if let Some(boundary_id) = blocking_learning_boundary_id(
+            &transaction,
+            &statement_fingerprint,
+            scope_kind,
+            scope_id.as_deref(),
+            &[],
+        )? {
+            return Err(TyrionError::ControlDenied(format!(
+                "Learning Boundary {boundary_id} prevents Profile Claim creation"
             )));
         }
         let claim_id = Uuid::new_v4().to_string();
-        let now = unix_timestamp()?;
+        let now = unix_timestamp_millis()?;
+        let evicted_claim_ids = make_room_in_active_profile(
+            &transaction,
+            scope_kind,
+            scope_id.as_deref(),
+            claim_limit,
+            token_limit,
+            token_upper_bound,
+            None,
+            now,
+        )?;
         transaction.execute(
             "INSERT INTO profile_claim_versions (
                 claim_id, version, statement, token_upper_bound,
@@ -538,11 +543,19 @@ impl Store {
             "INSERT INTO profile_claims (
                 id, current_version, strength, scope_kind, scope_id, applicability,
                 confidence_category, confidence_basis_points, lifecycle_state,
+                statement_fingerprint, last_nonweak_support_at, lifecycle_changed_at,
                 created_at, updated_at
              ) VALUES (?1, 1, 'hard', ?2, ?3, 'software_building',
-                       'explicit', 10000, 'active', ?4, ?4)",
-            params![claim_id, scope_kind, scope_id, now,],
+                       'explicit', 10000, 'active', ?4, ?5, ?5, ?5, ?5)",
+            params![claim_id, scope_kind, scope_id, statement_fingerprint, now],
         )?;
+        transaction.execute(
+            "INSERT INTO profile_claim_lifecycle (
+                claim_id, from_state, to_state, reason, changed_at
+             ) VALUES (?1, NULL, 'active', 'explicit_principal_statement', ?2)",
+            params![claim_id, now],
+        )?;
+        refresh_profile_claim_derived_data(&transaction, &claim_id, &statement_fingerprint, now)?;
         let claim = profile_claim(&transaction, &claim_id)?;
         let result = serde_json::json!({
             "claim": claim,
@@ -552,7 +565,994 @@ impl Store {
                 "claim_version": 1,
                 "scope": claim["scope"],
             },
+            "demoted_claim_ids": evicted_claim_ids,
         });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn observe_profile_preference(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        preference: &ReusablePreference,
+        outcome: LearningObservationKind,
+        explanation: Option<&str>,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        validate_reusable_preference(preference)?;
+        let explanation = explanation.map(str::trim).filter(|value| !value.is_empty());
+        if matches!(
+            outcome,
+            LearningObservationKind::ExplainedRejection | LearningObservationKind::Contradiction
+        ) && explanation.is_none()
+        {
+            return Err(TyrionError::InvalidRequest(
+                "explained rejection and contradiction observations require an explanation".into(),
+            ));
+        }
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let (project_id, commission_status) = transaction
+            .query_row(
+                "SELECT project_id, status FROM commissions WHERE id = ?1",
+                [commission_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))?;
+        let project_id = project_id.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "inferred learning requires a Commission with a verified Project".into(),
+            )
+        })?;
+        if !matches!(
+            commission_status.as_str(),
+            "verified_complete" | "cancelled"
+        ) {
+            return Err(TyrionError::InvalidRequest(
+                "learning observations require a terminal Commission".into(),
+            ));
+        }
+        let statement_fingerprint = preference_fingerprint(&preference.statement);
+        let learning_boundary_id = transaction
+            .query_row(
+                "SELECT id FROM learning_boundaries
+                 WHERE statement_fingerprint = ?1
+                   AND (
+                       scope_kind = 'principal'
+                       OR (scope_kind = 'project' AND scope_id = ?2)
+                   )
+                 ORDER BY CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END, created_at, id
+                 LIMIT 1",
+                params![statement_fingerprint, project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(learning_boundary_id) = learning_boundary_id {
+            let result = serde_json::json!({
+                "observation": Value::Null,
+                "claim": Value::Null,
+                "promoted": false,
+                "blocked_by_learning_boundary": true,
+                "learning_boundary_id": learning_boundary_id,
+            });
+            save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        let duplicate = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM learning_observations
+                WHERE commission_id = ?1 AND statement_fingerprint = ?2
+             )",
+            params![commission_id, statement_fingerprint],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if duplicate {
+            return Err(TyrionError::InvalidRequest(
+                "one Commission can contribute at most one observation per preference".into(),
+            ));
+        }
+        let observation_id = Uuid::new_v4().to_string();
+        let observed_at = unix_timestamp_millis()?;
+        transaction.execute(
+            "INSERT INTO learning_observations (
+                id, commission_id, project_id, attachment_id, claim_id,
+                statement, statement_fingerprint, kind, explanation, strength, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                observation_id,
+                commission_id,
+                project_id,
+                attachment_id,
+                preference.statement,
+                statement_fingerprint,
+                outcome.as_str(),
+                explanation,
+                outcome.strength(),
+                observed_at,
+            ],
+        )?;
+
+        let mut claim_id = transaction
+            .query_row(
+                "SELECT id FROM profile_claims
+                 WHERE scope_kind = 'project' AND scope_id = ?1
+                   AND statement_fingerprint = ?2
+                 ORDER BY created_at, id LIMIT 1",
+                params![project_id, statement_fingerprint],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if claim_id.is_none()
+            && matches!(
+                outcome,
+                LearningObservationKind::PrincipalEdit
+                    | LearningObservationKind::ExplainedRejection
+            )
+        {
+            let new_claim_id = Uuid::new_v4().to_string();
+            let token_upper_bound = token_upper_bound(&preference.statement);
+            transaction.execute(
+                "INSERT INTO profile_claim_versions (
+                    claim_id, version, statement, token_upper_bound,
+                    provenance_commission_id, provenance_attachment_id, created_at
+                 ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new_claim_id,
+                    preference.statement,
+                    token_upper_bound,
+                    commission_id,
+                    attachment_id,
+                    observed_at,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO profile_claims (
+                    id, current_version, strength, scope_kind, scope_id, applicability,
+                    confidence_category, confidence_basis_points, lifecycle_state,
+                    statement_fingerprint, last_nonweak_support_at, lifecycle_changed_at,
+                    created_at, updated_at
+                 ) VALUES (
+                    ?1, 1, 'soft', 'project', ?2, 'software_building',
+                    'inferred', 5000, 'candidate', ?3, ?4, ?4, ?4, ?4
+                 )",
+                params![new_claim_id, project_id, statement_fingerprint, observed_at],
+            )?;
+            transaction.execute(
+                "INSERT INTO profile_claim_lifecycle (
+                    claim_id, from_state, to_state, reason, observation_id, changed_at
+                 ) VALUES (?1, NULL, 'candidate', 'eligible_inferred_observation', ?2, ?3)",
+                params![new_claim_id, observation_id, observed_at],
+            )?;
+            refresh_profile_claim_derived_data(
+                &transaction,
+                &new_claim_id,
+                &statement_fingerprint,
+                observed_at,
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO profile_claim_observations (claim_id, observation_id)
+                 SELECT ?1, id FROM learning_observations
+                 WHERE project_id = ?2 AND statement_fingerprint = ?3
+                   AND strength IN ('strong', 'weak')",
+                params![new_claim_id, project_id, statement_fingerprint],
+            )?;
+            transaction.execute(
+                "UPDATE learning_observations SET claim_id = ?1
+                 WHERE project_id = ?2 AND statement_fingerprint = ?3
+                   AND claim_id IS NULL AND strength IN ('strong', 'weak')",
+                params![new_claim_id, project_id, statement_fingerprint],
+            )?;
+            claim_id = Some(new_claim_id);
+        }
+
+        if let Some(claim_id) = claim_id.as_deref() {
+            transaction.execute(
+                "UPDATE learning_observations SET claim_id = ?2 WHERE id = ?1",
+                params![observation_id, claim_id],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO profile_claim_observations (claim_id, observation_id)
+                 VALUES (?1, ?2)",
+                params![claim_id, observation_id],
+            )?;
+            if outcome.strength() == "strong" {
+                transaction.execute(
+                    "UPDATE profile_claims
+                     SET last_nonweak_support_at = MAX(
+                            COALESCE(last_nonweak_support_at, 0), ?2
+                         ), updated_at = MAX(updated_at, ?2)
+                     WHERE id = ?1",
+                    params![claim_id, observed_at],
+                )?;
+            }
+        }
+        if outcome == LearningObservationKind::Contradiction {
+            let mut contradicted_claims = Vec::new();
+            if let Some(claim_id) = claim_id.as_deref() {
+                contradicted_claims.push(claim_id.to_owned());
+            }
+            let principal_claim = transaction
+                .query_row(
+                    "SELECT id FROM profile_claims
+                     WHERE scope_kind = 'principal' AND strength = 'soft'
+                       AND lifecycle_state IN ('candidate', 'active')
+                       AND statement_fingerprint = ?1
+                     ORDER BY created_at, id LIMIT 1",
+                    [statement_fingerprint.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(principal_claim) = principal_claim {
+                contradicted_claims.push(principal_claim);
+            }
+            for contradicted_claim_id in contradicted_claims {
+                let (strength, lifecycle_state) = transaction.query_row(
+                    "SELECT strength, lifecycle_state FROM profile_claims WHERE id = ?1",
+                    [contradicted_claim_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                if strength == "soft" && lifecycle_state != "contradicted" {
+                    transaction.execute(
+                        "UPDATE profile_claims
+                         SET lifecycle_state = 'contradicted', lifecycle_changed_at = ?2,
+                             updated_at = ?2
+                         WHERE id = ?1",
+                        params![contradicted_claim_id, observed_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO profile_claim_lifecycle (
+                            claim_id, from_state, to_state, reason,
+                            observation_id, changed_at
+                         ) VALUES (?1, ?2, 'contradicted', 'current_project_evidence', ?3, ?4)",
+                        params![
+                            contradicted_claim_id,
+                            lifecycle_state,
+                            observation_id,
+                            observed_at,
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        let (independent_commissions, strong_observations, material_contradictions) = transaction
+            .query_row(
+            "SELECT COUNT(DISTINCT commission_id),
+                    COALESCE(SUM(CASE WHEN strength = 'strong' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN strength = 'contradiction' THEN 1 ELSE 0 END), 0)
+             FROM learning_observations
+             WHERE project_id = ?1 AND statement_fingerprint = ?2
+               AND strength IN ('strong', 'weak', 'contradiction')",
+            params![project_id, statement_fingerprint],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )?;
+        let mut promoted = false;
+        if independent_commissions >= 2 && strong_observations > 0 && material_contradictions == 0 {
+            if let Some(claim_id) = claim_id.as_deref() {
+                let lifecycle_state = transaction.query_row(
+                    "SELECT lifecycle_state FROM profile_claims WHERE id = ?1",
+                    [claim_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                if lifecycle_state == "candidate" {
+                    let token_upper_bound = transaction.query_row(
+                        "SELECT token_upper_bound FROM profile_claim_versions
+                         JOIN profile_claims
+                           ON profile_claims.id = profile_claim_versions.claim_id
+                          AND profile_claims.current_version = profile_claim_versions.version
+                         WHERE profile_claims.id = ?1",
+                        [claim_id],
+                        |row| row.get::<_, u64>(0),
+                    )?;
+                    if hard_profile_capacity_allows(
+                        &transaction,
+                        "project",
+                        Some(&project_id),
+                        80,
+                        4_000,
+                        token_upper_bound,
+                    )? {
+                        make_room_in_active_profile(
+                            &transaction,
+                            "project",
+                            Some(&project_id),
+                            80,
+                            4_000,
+                            token_upper_bound,
+                            None,
+                            observed_at,
+                        )?;
+                        transaction.execute(
+                            "UPDATE profile_claims
+                             SET lifecycle_state = 'active', confidence_basis_points = 7500,
+                                 lifecycle_changed_at = ?2, updated_at = ?2
+                             WHERE id = ?1",
+                            params![claim_id, observed_at],
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO profile_claim_lifecycle (
+                                claim_id, from_state, to_state, reason,
+                                observation_id, changed_at
+                             ) VALUES (
+                                ?1, 'candidate', 'active',
+                                'independent_commission_support', ?2, ?3
+                             )",
+                            params![claim_id, observation_id, observed_at],
+                        )?;
+                        promoted = true;
+                    }
+                }
+            }
+        }
+        let (
+            wider_commissions,
+            wider_projects,
+            wider_strong_observations,
+            wider_material_contradictions,
+        ) = transaction.query_row(
+            "SELECT COUNT(DISTINCT commission_id), COUNT(DISTINCT project_id),
+                        COALESCE(SUM(CASE WHEN strength = 'strong' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN strength = 'contradiction' THEN 1 ELSE 0 END), 0)
+                 FROM learning_observations
+                 WHERE statement_fingerprint = ?1
+                   AND strength IN ('strong', 'weak', 'contradiction')",
+            [statement_fingerprint.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        )?;
+        let mut principal_candidate_id = transaction
+            .query_row(
+                "SELECT id FROM profile_claims
+                 WHERE scope_kind = 'principal' AND statement_fingerprint = ?1
+                 ORDER BY created_at, id LIMIT 1",
+                [statement_fingerprint.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if principal_candidate_id.is_none()
+            && wider_commissions >= 3
+            && wider_projects >= 2
+            && wider_strong_observations > 0
+            && wider_material_contradictions == 0
+        {
+            let new_claim_id = Uuid::new_v4().to_string();
+            let token_upper_bound = token_upper_bound(&preference.statement);
+            transaction.execute(
+                "INSERT INTO profile_claim_versions (
+                    claim_id, version, statement, token_upper_bound,
+                    provenance_commission_id, provenance_attachment_id, created_at
+                 ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new_claim_id,
+                    preference.statement,
+                    token_upper_bound,
+                    commission_id,
+                    attachment_id,
+                    observed_at,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO profile_claims (
+                    id, current_version, strength, scope_kind, scope_id, applicability,
+                    confidence_category, confidence_basis_points, lifecycle_state,
+                    statement_fingerprint, last_nonweak_support_at, lifecycle_changed_at,
+                    created_at, updated_at
+                 ) VALUES (
+                    ?1, 1, 'soft', 'principal', NULL, 'software_building',
+                    'inferred', 7500, 'candidate', ?2, ?3, ?3, ?3, ?3
+                 )",
+                params![new_claim_id, statement_fingerprint, observed_at],
+            )?;
+            transaction.execute(
+                "INSERT INTO profile_claim_lifecycle (
+                    claim_id, from_state, to_state, reason, observation_id, changed_at
+                 ) VALUES (
+                    ?1, NULL, 'candidate', 'cross_project_support', ?2, ?3
+                 )",
+                params![new_claim_id, observation_id, observed_at],
+            )?;
+            refresh_profile_claim_derived_data(
+                &transaction,
+                &new_claim_id,
+                &statement_fingerprint,
+                observed_at,
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO profile_claim_observations (claim_id, observation_id)
+                 SELECT ?1, id FROM learning_observations
+                 WHERE statement_fingerprint = ?2 AND strength IN ('strong', 'weak')",
+                params![new_claim_id, statement_fingerprint],
+            )?;
+            principal_candidate_id = Some(new_claim_id);
+        } else if let Some(principal_candidate_id) = principal_candidate_id.as_deref() {
+            transaction.execute(
+                "INSERT OR IGNORE INTO profile_claim_observations (claim_id, observation_id)
+                 VALUES (?1, ?2)",
+                params![principal_candidate_id, observation_id],
+            )?;
+        }
+        if outcome.strength() == "strong" {
+            if let Some(principal_candidate_id) = principal_candidate_id.as_deref() {
+                transaction.execute(
+                    "UPDATE profile_claims
+                     SET last_nonweak_support_at = MAX(
+                            COALESCE(last_nonweak_support_at, 0), ?2
+                         ), updated_at = MAX(updated_at, ?2)
+                     WHERE id = ?1",
+                    params![principal_candidate_id, observed_at],
+                )?;
+            }
+        }
+        refresh_temporary_material_retention_links(&transaction, Some(commission_id))?;
+        let observation = learning_observation(&transaction, &observation_id)?;
+        let claim = claim_id
+            .as_deref()
+            .map(|claim_id| profile_claim(&transaction, claim_id))
+            .transpose()?;
+        let principal_candidate = principal_candidate_id
+            .as_deref()
+            .map(|claim_id| profile_claim(&transaction, claim_id))
+            .transpose()?;
+        let result = serde_json::json!({
+            "observation": observation,
+            "claim": claim,
+            "support": {
+                "independent_commissions": independent_commissions,
+                "includes_principal_signal": strong_observations > 0,
+                "material_contradictions": material_contradictions,
+            },
+            "promoted": promoted,
+            "principal_candidate": principal_candidate,
+            "wider_scope": {
+                "independent_commissions": wider_commissions,
+                "independent_projects": wider_projects,
+                "material_contradictions": wider_material_contradictions,
+                "requires_confirmation": principal_candidate_id.is_some(),
+            },
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn confirm_profile_claim(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        claim_id: &str,
+        expected_version: i64,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let (current_version, strength, scope_kind, lifecycle_state, statement_fingerprint) =
+            transaction
+                .query_row(
+                    "SELECT current_version, strength, scope_kind, lifecycle_state,
+                        statement_fingerprint
+                 FROM profile_claims WHERE id = ?1",
+                    [claim_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| TyrionError::NotFound(claim_id.to_owned()))?;
+        if current_version != expected_version {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_version,
+                actual: current_version,
+            });
+        }
+        if strength != "soft" || scope_kind != "principal" || lifecycle_state != "candidate" {
+            return Err(TyrionError::InvalidRequest(
+                "only an inferred Principal Profile candidate can be confirmed".into(),
+            ));
+        }
+        let related_project_ids = claim_observation_project_ids(&transaction, claim_id)?;
+        if let Some(boundary_id) = blocking_learning_boundary_id(
+            &transaction,
+            &statement_fingerprint,
+            &scope_kind,
+            None,
+            &related_project_ids,
+        )? {
+            return Err(TyrionError::ControlDenied(format!(
+                "Learning Boundary {boundary_id} prevents Profile Claim reactivation"
+            )));
+        }
+        let now = unix_timestamp_millis()?;
+        let token_upper_bound = transaction.query_row(
+            "SELECT token_upper_bound FROM profile_claim_versions
+             WHERE claim_id = ?1 AND version = ?2",
+            params![claim_id, current_version],
+            |row| row.get::<_, u64>(0),
+        )?;
+        make_room_in_active_profile(
+            &transaction,
+            "principal",
+            None,
+            20,
+            1_000,
+            token_upper_bound,
+            None,
+            now,
+        )?;
+        transaction.execute(
+            "UPDATE profile_claims
+             SET lifecycle_state = 'active', confidence_basis_points = 9000,
+                 lifecycle_changed_at = ?2, updated_at = ?2
+             WHERE id = ?1",
+            params![claim_id, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO profile_claim_lifecycle (
+                claim_id, from_state, to_state, reason, changed_at
+             ) VALUES (
+                ?1, 'candidate', 'active', 'explicit_principal_confirmation', ?2
+             )",
+            params![claim_id, now],
+        )?;
+        let claim = profile_claim(&transaction, claim_id)?;
+        let result = serde_json::json!({
+            "claim": claim,
+            "learning_receipt": {
+                "kind": "profile_claim_confirmed",
+                "claim_id": claim_id,
+                "claim_version": current_version,
+                "scope": {"kind": "principal"},
+            },
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn suppress_profile_claim(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        claim_id: &str,
+        expected_version: i64,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let source_project_id = commission_project_id(&transaction, commission_id)?;
+        let (current_version, scope_kind, scope_id, lifecycle_state) = transaction
+            .query_row(
+                "SELECT current_version, scope_kind, scope_id, lifecycle_state
+                 FROM profile_claims WHERE id = ?1",
+                [claim_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(claim_id.to_owned()))?;
+        ensure_claim_scope(
+            &scope_kind,
+            scope_id.as_deref(),
+            source_project_id.as_deref(),
+        )?;
+        if current_version != expected_version {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_version,
+                actual: current_version,
+            });
+        }
+        if lifecycle_state == "suppressed" {
+            return Err(TyrionError::InvalidRequest(
+                "the Profile Claim is already suppressed".into(),
+            ));
+        }
+        let now = unix_timestamp_millis()?;
+        transaction.execute(
+            "UPDATE profile_claims
+             SET lifecycle_state = 'suppressed', lifecycle_changed_at = ?2,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![claim_id, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO profile_claim_lifecycle (
+                claim_id, from_state, to_state, reason, changed_at
+             ) VALUES (?1, ?2, 'suppressed', 'principal_suppression', ?3)",
+            params![claim_id, lifecycle_state, now],
+        )?;
+        let claim = profile_claim(&transaction, claim_id)?;
+        let result = serde_json::json!({
+            "claim": claim,
+            "learning_receipt": {
+                "kind": "profile_claim_suppressed",
+                "claim_id": claim_id,
+                "claim_version": current_version,
+                "scope": claim["scope"],
+            },
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forget_profile_claim(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        claim_id: &str,
+        expected_version: i64,
+        confirmation_digest: Option<&str>,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let idempotency = if confirmation_digest.is_some() {
+            Some((mutation_key(request)?, request_hash(request)?))
+        } else {
+            None
+        };
+        let transaction = self.connection.transaction()?;
+        if let Some((idempotency_key, request_hash)) = idempotency.as_ref() {
+            if let Some(prior) = prior_result(&transaction, idempotency_key, request_hash)? {
+                return Ok(prior);
+            }
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let source_project_id = commission_project_id(&transaction, commission_id)?;
+        let (current_version, scope_kind, scope_id, statement_fingerprint) = transaction
+            .query_row(
+                "SELECT current_version, scope_kind, scope_id, statement_fingerprint
+                 FROM profile_claims WHERE id = ?1",
+                [claim_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| TyrionError::NotFound(claim_id.to_owned()))?;
+        ensure_claim_scope(
+            &scope_kind,
+            scope_id.as_deref(),
+            source_project_id.as_deref(),
+        )?;
+        if current_version != expected_version {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_version,
+                actual: current_version,
+            });
+        }
+        let mut claims_to_delete = vec![claim_id.to_owned()];
+        if scope_kind == "project" {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT candidate.id
+                 FROM profile_claims AS candidate
+                 JOIN profile_claim_observations AS candidate_observations
+                   ON candidate_observations.claim_id = candidate.id
+                 JOIN profile_claim_observations AS source_observations
+                   ON source_observations.observation_id = candidate_observations.observation_id
+                 WHERE source_observations.claim_id = ?1
+                   AND candidate.id != ?1
+                   AND candidate.scope_kind = 'principal'
+                   AND candidate.lifecycle_state = 'candidate'
+                 ORDER BY candidate.id",
+            )?;
+            let derived = statement
+                .query_map([claim_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            claims_to_delete.extend(derived);
+        }
+        let observation_ids = claim_observation_ids(&transaction, &claims_to_delete)?;
+        let dedicated_observation_ids =
+            dedicated_observation_ids(&transaction, &observation_ids, &claims_to_delete)?;
+        let claim_versions = count_for_claims(
+            &transaction,
+            "profile_claim_versions",
+            "claim_id",
+            &claims_to_delete,
+        )?;
+        let affected_attempts = count_for_claims(
+            &transaction,
+            "attempt_profile_claims",
+            "claim_id",
+            &claims_to_delete,
+        )?
+        .saturating_add(count_for_claims(
+            &transaction,
+            "imported_profile_claim_attempts",
+            "claim_id",
+            &claims_to_delete,
+        )?);
+        let indexes = count_for_claims(
+            &transaction,
+            "profile_claim_indexes",
+            "claim_id",
+            &claims_to_delete,
+        )?;
+        let caches = count_for_claims(
+            &transaction,
+            "profile_claim_caches",
+            "claim_id",
+            &claims_to_delete,
+        )?;
+        let remaining_related_claims = related_claim_ids(
+            &transaction,
+            &statement_fingerprint,
+            &observation_ids,
+            &claims_to_delete,
+        )?;
+        let cascade = serde_json::json!({
+            "claims": claims_to_delete.len(),
+            "claim_versions": claim_versions,
+            "supporting_observations": observation_ids.len(),
+            "dedicated_excerpts": dedicated_observation_ids.len(),
+            "affected_attempt_records": affected_attempts,
+            "indexes": indexes,
+            "caches": caches,
+        });
+        let preview_payload = serde_json::json!({
+            "operation": "forget_profile_claim",
+            "commission_id": commission_id,
+            "claim_id": claim_id,
+            "expected_version": expected_version,
+            "cascade": cascade,
+            "remaining_related_claim_ids": remaining_related_claims,
+        });
+        let required_confirmation_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&preview_payload)?)
+        );
+        let Some(confirmation_digest) = confirmation_digest else {
+            let result = serde_json::json!({
+                "claim_id": claim_id,
+                "expected_version": expected_version,
+                "cascade": cascade,
+                "remaining_related_claim_ids": remaining_related_claims,
+                "confirmation_digest": required_confirmation_digest,
+                "applied": false,
+            });
+            transaction.commit()?;
+            return Ok(result);
+        };
+        if confirmation_digest != required_confirmation_digest {
+            return Err(TyrionError::ControlDenied(
+                "Profile Claim forgetting confirmation digest does not match the exact cascade"
+                    .into(),
+            ));
+        }
+        for claim_to_delete in &claims_to_delete {
+            transaction.execute(
+                "DELETE FROM memory_import_provenance
+                 WHERE entity_kind = 'claim_version' AND entity_id = ?1",
+                [claim_to_delete],
+            )?;
+            transaction.execute(
+                "DELETE FROM attempt_profile_claims WHERE claim_id = ?1",
+                [claim_to_delete],
+            )?;
+            transaction.execute(
+                "DELETE FROM profile_claims WHERE id = ?1",
+                [claim_to_delete],
+            )?;
+            transaction.execute(
+                "DELETE FROM profile_claim_versions WHERE claim_id = ?1",
+                [claim_to_delete],
+            )?;
+        }
+        for observation_id in dedicated_observation_ids {
+            transaction.execute(
+                "DELETE FROM memory_import_provenance
+                 WHERE entity_kind = 'observation' AND entity_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM profile_claim_observations WHERE observation_id = ?1
+                   )",
+                [&observation_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM learning_observations
+                 WHERE id = ?1 AND NOT EXISTS (
+                    SELECT 1 FROM profile_claim_observations WHERE observation_id = ?1
+                 )",
+                [observation_id],
+            )?;
+        }
+        let deletion_receipt_id = Uuid::new_v4().to_string();
+        let deleted_at = unix_timestamp_millis()?;
+        transaction.execute(
+            "INSERT INTO memory_deletion_receipts (
+                id, claim_id, scope_kind, scope_id, cascade_json,
+                remaining_related_claims_json, deleted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                deletion_receipt_id,
+                claim_id,
+                scope_kind,
+                scope_id,
+                serde_json::to_string(&cascade)?,
+                serde_json::to_string(&remaining_related_claims)?,
+                deleted_at,
+            ],
+        )?;
+        let deletion_receipt = serde_json::json!({
+            "id": deletion_receipt_id,
+            "claim_id": claim_id,
+            "scope": profile_scope(&scope_kind, scope_id.as_deref()),
+            "cascade": cascade,
+            "remaining_related_claim_ids": remaining_related_claims,
+            "deleted_at": deleted_at,
+        });
+        let result = serde_json::json!({
+            "applied": true,
+            "deletion_receipt": deletion_receipt,
+        });
+        let (idempotency_key, request_hash) = idempotency
+            .as_ref()
+            .expect("confirmed forgetting has idempotency state");
+        save_idempotent_result(&transaction, idempotency_key, request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn create_learning_boundary(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        preference: &ReusablePreference,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        validate_reusable_preference(preference)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let project_id = commission_project_id(&transaction, commission_id)?;
+        let (scope_kind, scope_id) = match project_id {
+            Some(project_id) => ("project", Some(project_id)),
+            None => ("principal", None),
+        };
+        let statement_fingerprint = preference_fingerprint(&preference.statement);
+        let existing_boundary = transaction
+            .query_row(
+                "SELECT id FROM learning_boundaries
+                 WHERE scope_kind = ?1
+                   AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))
+                   AND statement_fingerprint = ?3",
+                params![scope_kind, scope_id, statement_fingerprint],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_boundary) = existing_boundary {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Learning Boundary {existing_boundary} already exists"
+            )));
+        }
+        let matching_claim = transaction
+            .query_row(
+                "SELECT id FROM profile_claims
+                 WHERE statement_fingerprint = ?1
+                   AND (
+                       ?2 = 'principal'
+                       OR scope_kind = 'principal'
+                       OR (scope_kind = 'project' AND scope_id = ?3)
+                   )
+                 ORDER BY CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END, created_at, id
+                 LIMIT 1",
+                params![statement_fingerprint, scope_kind, scope_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(matching_claim) = matching_claim {
+            return Err(TyrionError::ControlDenied(format!(
+                "forget matching Profile Claim {matching_claim} before creating a Learning Boundary"
+            )));
+        }
+        let boundary_id = Uuid::new_v4().to_string();
+        let created_at = unix_timestamp_millis()?;
+        transaction.execute(
+            "INSERT INTO learning_boundaries (
+                id, scope_kind, scope_id, statement_fingerprint,
+                provenance_commission_id, provenance_attachment_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                boundary_id,
+                scope_kind,
+                scope_id,
+                statement_fingerprint,
+                commission_id,
+                attachment_id,
+                created_at,
+            ],
+        )?;
+        let boundary = serde_json::json!({
+            "id": boundary_id,
+            "scope": profile_scope(scope_kind, scope_id.as_deref()),
+            "statement_fingerprint": statement_fingerprint,
+            "created_at": created_at,
+        });
+        let result = serde_json::json!({"boundary": boundary});
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
         transaction.commit()?;
         Ok(result)
@@ -615,9 +1615,9 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| TyrionError::NotFound(claim_id.to_owned()))?;
-        if lifecycle_state != "active" {
+        if !matches!(lifecycle_state.as_str(), "active" | "contradicted") {
             return Err(TyrionError::InvalidRequest(
-                "only an active Profile Claim can be revised".into(),
+                "only an active or contradicted Profile Claim can be revised".into(),
             ));
         }
         if current_version != expected_version {
@@ -667,31 +1667,36 @@ impl Store {
             ));
         }
         let token_upper_bound = token_upper_bound(&preference.statement);
-        let active_tokens_without_claim = transaction.query_row(
-            "SELECT COALESCE(SUM(profile_claim_versions.token_upper_bound), 0)
-             FROM profile_claims
-             JOIN profile_claim_versions
-               ON profile_claim_versions.claim_id = profile_claims.id
-              AND profile_claim_versions.version = profile_claims.current_version
-             WHERE profile_claims.lifecycle_state = 'active'
-               AND profile_claims.scope_kind = ?1
-               AND (profile_claims.scope_id = ?2 OR (profile_claims.scope_id IS NULL AND ?2 IS NULL))
-               AND profile_claims.id != ?3",
-            params![scope_kind, scope_id, claim_id],
-            |row| row.get::<_, u64>(0),
-        )?;
-        let token_limit = if scope_kind == "project" {
-            4_000
+        let (claim_limit, token_limit) = if scope_kind == "project" {
+            (80, 4_000)
         } else {
-            1_000
+            (20, 1_000)
         };
-        if active_tokens_without_claim.saturating_add(token_upper_bound) > token_limit {
-            return Err(TyrionError::InvalidRequest(format!(
-                "the {scope_kind} Profile is at its active token limit"
+        let next_version = current_version.saturating_add(1);
+        let now = unix_timestamp_millis()?;
+        let statement_fingerprint = preference_fingerprint(&preference.statement);
+        let related_project_ids = claim_observation_project_ids(&transaction, claim_id)?;
+        if let Some(boundary_id) = blocking_learning_boundary_id(
+            &transaction,
+            &statement_fingerprint,
+            &scope_kind,
+            scope_id.as_deref(),
+            &related_project_ids,
+        )? {
+            return Err(TyrionError::ControlDenied(format!(
+                "Learning Boundary {boundary_id} prevents Profile Claim correction"
             )));
         }
-        let next_version = current_version.saturating_add(1);
-        let now = unix_timestamp()?;
+        make_room_in_active_profile(
+            &transaction,
+            &scope_kind,
+            scope_id.as_deref(),
+            claim_limit,
+            token_limit,
+            token_upper_bound,
+            Some(claim_id),
+            now,
+        )?;
         transaction.execute(
             "INSERT INTO profile_claim_versions (
                 claim_id, version, statement, token_upper_bound,
@@ -708,9 +1713,20 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            "UPDATE profile_claims SET current_version = ?2, updated_at = ?3 WHERE id = ?1",
-            params![claim_id, next_version, now],
+            "UPDATE profile_claims
+             SET current_version = ?2, statement_fingerprint = ?3,
+                 lifecycle_state = 'active', last_nonweak_support_at = ?4,
+                 lifecycle_changed_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+            params![claim_id, next_version, statement_fingerprint, now],
         )?;
+        transaction.execute(
+            "INSERT INTO profile_claim_lifecycle (
+                claim_id, from_state, to_state, reason, changed_at
+             ) VALUES (?1, ?2, 'active', 'principal_correction', ?3)",
+            params![claim_id, lifecycle_state, now],
+        )?;
+        refresh_profile_claim_derived_data(&transaction, claim_id, &statement_fingerprint, now)?;
         let claim = profile_claim(&transaction, claim_id)?;
         let result = serde_json::json!({
             "claim": claim,
@@ -744,6 +1760,8 @@ impl Store {
             "claim": profile_claim(&self.connection, claim_id)?,
             "versions": profile_claim_versions(&self.connection, claim_id)?,
             "affected_attempts": affected_attempts(&self.connection, claim_id)?,
+            "observations": learning_observations(&self.connection, claim_id)?,
+            "lifecycle_history": profile_claim_lifecycle(&self.connection, claim_id)?,
         }))
     }
 
@@ -760,6 +1778,816 @@ impl Store {
             ));
         }
         project_profile(&self.connection, project_id)
+    }
+
+    pub fn export_memory(
+        &self,
+        request: &Request,
+        project_id: Option<&str>,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        if project_id.is_some_and(|project_id| project_id.trim().is_empty()) {
+            return Err(TyrionError::InvalidRequest(
+                "project_id must not be empty".into(),
+            ));
+        }
+        if let Some(project_id) = project_id {
+            let exists = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE project_id = ?1)",
+                [project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(TyrionError::NotFound(project_id.to_owned()));
+            }
+        }
+        let scope_kind = if project_id.is_some() {
+            "project"
+        } else {
+            "principal"
+        };
+        let claim_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT id FROM profile_claims
+                 WHERE scope_kind = ?1
+                   AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))
+                 ORDER BY created_at, id",
+            )?;
+            let rows = statement.query_map(params![scope_kind, project_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut claims = Vec::new();
+        for claim_id in &claim_ids {
+            let (last_nonweak_support_at, lifecycle_changed_at) = self.connection.query_row(
+                "SELECT last_nonweak_support_at, lifecycle_changed_at
+                 FROM profile_claims WHERE id = ?1",
+                [claim_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            claims.push(serde_json::json!({
+                "claim": profile_claim(&self.connection, claim_id)?,
+                "versions": profile_claim_versions(&self.connection, claim_id)?,
+                "observations": learning_observations(&self.connection, claim_id)?,
+                "lifecycle_history": profile_claim_lifecycle(&self.connection, claim_id)?,
+                "affected_attempts": affected_attempts(&self.connection, claim_id)?,
+                "retention": {
+                    "last_nonweak_support_at": last_nonweak_support_at,
+                    "lifecycle_changed_at": lifecycle_changed_at,
+                },
+            }));
+        }
+        let referenced_commission_ids = claims
+            .iter()
+            .flat_map(|entry| {
+                entry["versions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|version| version["provenance"]["commission_id"].as_str())
+                    .chain(
+                        entry["observations"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|observation| observation["commission_id"].as_str()),
+                    )
+                    .chain(
+                        entry["affected_attempts"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|attempt| attempt["commission_id"].as_str()),
+                    )
+            })
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let profile = project_profile(&self.connection, project_id)?;
+        let learning_boundaries =
+            exact_scope_values(&profile["learning_boundaries"], scope_kind, project_id);
+        let deletion_receipts =
+            exact_scope_values(&profile["deletion_receipts"], scope_kind, project_id);
+        let commission_records = export_commission_records(
+            &self.connection,
+            scope_kind,
+            project_id,
+            &referenced_commission_ids,
+        )?;
+        let data = serde_json::json!({
+            "claims": claims,
+            "learning_boundaries": learning_boundaries,
+            "deletion_receipts": deletion_receipts,
+            "commission_records": commission_records,
+            "excluded_categories": [
+                "credentials",
+                "secrets",
+                "session_tokens",
+                "approval_artifacts",
+                "raw_worker_transcripts",
+                "unpinned_temporary_artifacts"
+            ],
+        });
+        let checksum = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&data)?));
+        let scope = profile_scope(scope_kind, project_id);
+        let claim_lines = claims
+            .iter()
+            .map(|entry| {
+                format!(
+                    "- Profile Claim `{}` version {} ({}, {} lifecycle events, {} observations)",
+                    entry["claim"]["id"].as_str().unwrap_or_default(),
+                    entry["claim"]["version"].as_i64().unwrap_or_default(),
+                    entry["claim"]["lifecycle"]["state"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    entry["lifecycle_history"].as_array().map_or(0, Vec::len),
+                    entry["observations"].as_array().map_or(0, Vec::len),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let boundary_lines = data["learning_boundaries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|boundary| {
+                format!(
+                    "- Learning Boundary `{}`",
+                    boundary["id"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let deletion_lines = data["deletion_receipts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|receipt| {
+                format!(
+                    "- Deletion Receipt `{}` for claim `{}`",
+                    receipt["id"].as_str().unwrap_or_default(),
+                    receipt["claim_id"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let commission_lines = data["commission_records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|record| {
+                format!(
+                    "- Commission Record `{}`",
+                    record["id"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary_markdown = format!(
+            "# Tyrion Memory Export\n\nChecksum: `{checksum}`\n\nScope: `{}`\n\nClaims: {}\n\n{}\n\nLearning Boundaries: {}\n\n{}\n\nDeletion Receipts: {}\n\n{}\n\nCommission Records: {}\n\n{}\n",
+            if let Some(project_id) = project_id {
+                format!("project:{project_id}")
+            } else {
+                "principal".into()
+            },
+            claim_ids.len(),
+            claim_lines,
+            data["learning_boundaries"].as_array().map_or(0, Vec::len),
+            boundary_lines,
+            data["deletion_receipts"].as_array().map_or(0, Vec::len),
+            deletion_lines,
+            data["commission_records"].as_array().map_or(0, Vec::len),
+            commission_lines,
+        );
+        Ok(serde_json::json!({
+            "format": "tyrion.memory",
+            "version": 1,
+            "scope": scope,
+            "exported_at": unix_timestamp_millis()?,
+            "checksum": checksum,
+            "data": data,
+            "summary_markdown": summary_markdown,
+        }))
+    }
+
+    pub fn import_memory(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        bundle: &Value,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        validate_memory_bundle(bundle)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let project_id = commission_project_id(&transaction, commission_id)?;
+        let bundle_scope_kind = required_json_str(&bundle["scope"], "kind")?;
+        let bundle_scope_id = bundle["scope"]["project_id"].as_str();
+        match (bundle_scope_kind, bundle_scope_id, project_id.as_deref()) {
+            ("project", Some(bundle_project_id), Some(anchor_project_id))
+                if bundle_project_id == anchor_project_id => {}
+            ("principal", None, None) => {}
+            _ => {
+                return Err(TyrionError::ControlDenied(
+                    "memory import scope must match the anchor Commission's verified scope".into(),
+                ))
+            }
+        }
+        let checksum = required_json_str(bundle, "checksum")?;
+        let data = bundle["data"].as_object().ok_or_else(|| {
+            TyrionError::InvalidRequest("memory export data must be an object".into())
+        })?;
+        let imported_at = unix_timestamp_millis()?;
+        let mut commission_id_map = HashMap::new();
+        let commission_records = data
+            .get("commission_records")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "memory export commission_records must be an array".into(),
+                )
+            })?;
+        for record in commission_records {
+            let source_commission_id = required_json_str(record, "id")?;
+            if commission_id_map.contains_key(source_commission_id) {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "memory export repeats Commission Record {source_commission_id}"
+                )));
+            }
+            let local_commission_id = imported_commission_id(checksum, source_commission_id);
+            let source_project_id = record["project_id"].as_str().or(project_id.as_deref());
+            if bundle_scope_kind == "project" && source_project_id != bundle_scope_id {
+                return Err(TyrionError::InvalidRequest(
+                    "project memory contains a Commission Record outside its declared scope".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO commissions (
+                    id, goal, status, revision, control_revision, created_at,
+                    completed_at, project_id
+                 ) VALUES (
+                    ?1, 'Imported Commission Record', 'cancelled', 1, 0, ?2, ?2, ?3
+                 )",
+                params![local_commission_id, imported_at, source_project_id],
+            )?;
+            let record_checksum =
+                format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(record)?));
+            let record_json = serde_json::to_string(record)?;
+            let existing_record = transaction
+                .query_row(
+                    "SELECT record_json, checksum FROM imported_commission_records
+                     WHERE record_id = ?1",
+                    [source_commission_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_json, existing_checksum)) = existing_record {
+                if existing_json != record_json || existing_checksum != record_checksum {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "Commission Record {source_commission_id} conflicts with existing immutable provenance"
+                    )));
+                }
+            } else {
+                transaction.execute(
+                    "INSERT INTO imported_commission_records (
+                        record_id, project_id, record_json, checksum, imported_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        source_commission_id,
+                        project_id,
+                        record_json,
+                        record_checksum,
+                        imported_at,
+                    ],
+                )?;
+            }
+            commission_id_map.insert(source_commission_id.to_owned(), local_commission_id);
+        }
+
+        let mut imported_boundaries = 0_u64;
+        for boundary in required_json_array(&bundle["data"], "learning_boundaries")? {
+            let boundary_scope_kind = required_json_str(&boundary["scope"], "kind")?;
+            let boundary_scope_id = boundary["scope"]["project_id"].as_str();
+            if boundary_scope_kind != bundle_scope_kind || boundary_scope_id != bundle_scope_id {
+                return Err(TyrionError::InvalidRequest(
+                    "memory import contains a Learning Boundary outside its declared scope".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO learning_boundaries (
+                    id, scope_kind, scope_id, statement_fingerprint,
+                    provenance_commission_id, provenance_attachment_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    required_json_str(boundary, "id")?,
+                    boundary_scope_kind,
+                    boundary_scope_id,
+                    required_json_str(boundary, "statement_fingerprint")?,
+                    commission_id,
+                    attachment_id,
+                    required_json_i64(boundary, "created_at")?,
+                ],
+            )?;
+            imported_boundaries = imported_boundaries.saturating_add(1);
+        }
+
+        let claims = data
+            .get("claims")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                TyrionError::InvalidRequest("memory export claims must be an array".into())
+            })?;
+        let mut imported_claims = 0_u64;
+        for entry in claims {
+            let claim = entry.get("claim").ok_or_else(|| {
+                TyrionError::InvalidRequest("memory claim entry is missing claim".into())
+            })?;
+            let claim_id = required_json_str(claim, "id")?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM profile_claims WHERE id = ?1)",
+                [claim_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "memory import Profile Claim {claim_id} already exists"
+                )));
+            }
+            let claim_scope_kind = required_json_str(&claim["scope"], "kind")?;
+            let claim_scope_id = claim["scope"]["project_id"].as_str();
+            if claim_scope_kind != bundle_scope_kind || claim_scope_id != bundle_scope_id {
+                return Err(TyrionError::InvalidRequest(
+                    "memory import contains a Profile Claim outside its declared scope".into(),
+                ));
+            }
+            let current_version = required_json_i64(claim, "version")?;
+            let statement = required_json_str(claim, "statement")?;
+            let statement_fingerprint = preference_fingerprint(statement);
+            let related_project_ids = required_json_array(entry, "observations")?
+                .iter()
+                .map(|observation| required_json_str(observation, "project_id").map(str::to_owned))
+                .collect::<Result<Vec<_>, _>>()?;
+            if bundle_scope_kind == "project"
+                && related_project_ids.iter().any(|observation_project_id| {
+                    Some(observation_project_id.as_str()) != bundle_scope_id
+                })
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "project memory contains an observation outside its declared scope".into(),
+                ));
+            }
+            if let Some(boundary_id) = blocking_learning_boundary_id(
+                &transaction,
+                &statement_fingerprint,
+                claim_scope_kind,
+                claim_scope_id,
+                &related_project_ids,
+            )? {
+                return Err(TyrionError::ControlDenied(format!(
+                    "Learning Boundary {boundary_id} prevents Profile Claim import"
+                )));
+            }
+            let versions = entry["versions"].as_array().ok_or_else(|| {
+                TyrionError::InvalidRequest("memory claim versions must be an array".into())
+            })?;
+            if versions.is_empty() {
+                return Err(TyrionError::InvalidRequest(
+                    "memory Profile Claim must contain at least one version".into(),
+                ));
+            }
+            let mut current_version_statement = None;
+            for version in versions {
+                let version_number = required_json_i64(version, "version")?;
+                let version_statement = required_json_str(version, "statement")?;
+                let declared_token_upper_bound = required_json_u64(version, "token_upper_bound")?;
+                if declared_token_upper_bound != token_upper_bound(version_statement) {
+                    return Err(TyrionError::InvalidRequest(
+                        "memory claim token accounting does not match its statement".into(),
+                    ));
+                }
+                if version_number == current_version {
+                    current_version_statement = Some(version_statement);
+                }
+                let provenance = version.get("provenance").ok_or_else(|| {
+                    TyrionError::InvalidRequest("memory claim version is missing provenance".into())
+                })?;
+                let source_commission_id = required_json_str(provenance, "commission_id")?;
+                let local_commission_id = commission_id_map
+                    .get(source_commission_id)
+                    .map(String::as_str)
+                    .ok_or_else(|| {
+                        TyrionError::InvalidRequest(format!(
+                            "memory claim provenance references missing Commission Record {source_commission_id}"
+                        ))
+                    })?;
+                transaction.execute(
+                    "INSERT INTO profile_claim_versions (
+                        claim_id, version, statement, token_upper_bound,
+                        provenance_commission_id, provenance_attachment_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        claim_id,
+                        version_number,
+                        version_statement,
+                        declared_token_upper_bound,
+                        local_commission_id,
+                        attachment_id,
+                        required_json_i64(version, "created_at")?,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO memory_import_provenance (
+                        entity_kind, entity_id, entity_version, provenance_json
+                     ) VALUES ('claim_version', ?1, ?2, ?3)",
+                    params![
+                        claim_id,
+                        version_number,
+                        serde_json::to_string(&serde_json::json!({
+                            "kind": required_json_str(provenance, "kind")?,
+                            "commission_id": source_commission_id,
+                            "attachment_id": required_json_str(provenance, "attachment_id")?,
+                        }))?
+                    ],
+                )?;
+            }
+            if current_version_statement != Some(statement) {
+                return Err(TyrionError::InvalidRequest(
+                    "memory claim head does not match its current immutable version".into(),
+                ));
+            }
+            let retention = entry.get("retention").unwrap_or(&Value::Null);
+            let last_nonweak_support_at = retention["last_nonweak_support_at"].as_i64();
+            let lifecycle_changed_at = retention["lifecycle_changed_at"]
+                .as_i64()
+                .unwrap_or_else(|| claim["updated_at"].as_i64().unwrap_or(imported_at));
+            transaction.execute(
+                "INSERT INTO profile_claims (
+                    id, current_version, strength, scope_kind, scope_id, applicability,
+                    confidence_category, confidence_basis_points, lifecycle_state,
+                    statement_fingerprint, last_nonweak_support_at, lifecycle_changed_at,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'software_building', ?6, ?7, ?8,
+                           ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    claim_id,
+                    current_version,
+                    required_json_str(claim, "strength")?,
+                    claim_scope_kind,
+                    claim_scope_id,
+                    required_json_str(&claim["confidence"], "category")?,
+                    required_json_u64(&claim["confidence"], "basis_points")?,
+                    required_json_str(&claim["lifecycle"], "state")?,
+                    statement_fingerprint,
+                    last_nonweak_support_at,
+                    lifecycle_changed_at,
+                    required_json_i64(claim, "created_at")?,
+                    required_json_i64(claim, "updated_at")?,
+                ],
+            )?;
+            for observation in required_json_array(entry, "observations")? {
+                let observation_id = required_json_str(observation, "id")?;
+                let source_commission_id = required_json_str(observation, "commission_id")?;
+                let local_commission_id = commission_id_map
+                    .get(source_commission_id)
+                    .map(String::as_str)
+                    .ok_or_else(|| {
+                        TyrionError::InvalidRequest(format!(
+                            "memory observation references missing Commission Record {source_commission_id}"
+                        ))
+                    })?;
+                let observation_project_id = required_json_str(observation, "project_id")?;
+                let observation_statement = required_json_str(observation, "statement")?;
+                let observation_fingerprint =
+                    required_json_str(observation, "statement_fingerprint")?;
+                let observation_kind = required_json_str(observation, "kind")?;
+                let observation_explanation = observation["explanation"].as_str();
+                let observation_strength = required_json_str(observation, "strength")?;
+                let observation_time = required_json_i64(observation, "observed_at")?;
+                let provenance = serde_json::json!({
+                    "commission_id": source_commission_id,
+                    "project_id": observation_project_id,
+                });
+                let existing_observation = transaction
+                    .query_row(
+                        "SELECT statement, statement_fingerprint, kind, explanation,
+                                strength, observed_at,
+                                (SELECT provenance_json FROM memory_import_provenance
+                                 WHERE entity_kind = 'observation'
+                                   AND entity_id = learning_observations.id
+                                   AND entity_version = 0)
+                         FROM learning_observations WHERE id = ?1",
+                        [observation_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, i64>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some(existing) = existing_observation {
+                    let existing_provenance = existing
+                        .6
+                        .as_deref()
+                        .map(serde_json::from_str::<Value>)
+                        .transpose()?;
+                    if existing.0 != observation_statement
+                        || existing.1 != observation_fingerprint
+                        || existing.2 != observation_kind
+                        || existing.3.as_deref() != observation_explanation
+                        || existing.4 != observation_strength
+                        || existing.5 != observation_time
+                        || existing_provenance.as_ref() != Some(&provenance)
+                    {
+                        return Err(TyrionError::InvalidRequest(format!(
+                            "memory observation identifier {observation_id} conflicts with existing immutable provenance"
+                        )));
+                    }
+                } else {
+                    transaction.execute(
+                        "INSERT INTO learning_observations (
+                            id, commission_id, project_id, attachment_id, claim_id,
+                            statement, statement_fingerprint, kind, explanation,
+                            strength, observed_at
+                         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            observation_id,
+                            local_commission_id,
+                            observation_project_id,
+                            attachment_id,
+                            observation_statement,
+                            observation_fingerprint,
+                            observation_kind,
+                            observation_explanation,
+                            observation_strength,
+                            observation_time,
+                        ],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO memory_import_provenance (
+                            entity_kind, entity_id, entity_version, provenance_json
+                         ) VALUES ('observation', ?1, 0, ?2)",
+                        params![observation_id, serde_json::to_string(&provenance)?],
+                    )?;
+                }
+                transaction.execute(
+                    "INSERT OR IGNORE INTO profile_claim_observations (claim_id, observation_id)
+                     VALUES (?1, ?2)",
+                    params![claim_id, observation_id],
+                )?;
+            }
+            for lifecycle in required_json_array(entry, "lifecycle_history")? {
+                let observation_id = lifecycle["observation_id"].as_str();
+                if let Some(observation_id) = observation_id {
+                    let linked = transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM profile_claim_observations
+                            WHERE claim_id = ?1 AND observation_id = ?2
+                         )",
+                        params![claim_id, observation_id],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    if !linked {
+                        return Err(TyrionError::InvalidRequest(
+                            "memory lifecycle transition references an unlinked observation".into(),
+                        ));
+                    }
+                }
+                transaction.execute(
+                    "INSERT INTO profile_claim_lifecycle (
+                        claim_id, from_state, to_state, reason, observation_id, changed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        claim_id,
+                        lifecycle["from_state"].as_str(),
+                        required_json_str(lifecycle, "to_state")?,
+                        required_json_str(lifecycle, "reason")?,
+                        observation_id,
+                        required_json_i64(lifecycle, "changed_at")?,
+                    ],
+                )?;
+            }
+            for (position, attempt) in required_json_array(entry, "affected_attempts")?
+                .iter()
+                .enumerate()
+            {
+                let source_commission_id = required_json_str(attempt, "commission_id")?;
+                if !commission_id_map.contains_key(source_commission_id) {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "affected Attempt references missing Commission Record {source_commission_id}"
+                    )));
+                }
+                transaction.execute(
+                    "INSERT INTO imported_profile_claim_attempts (
+                        claim_id, attempt_id, position, record_json, imported_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        claim_id,
+                        required_json_str(attempt, "attempt_id")?,
+                        position as i64,
+                        serde_json::to_string(attempt)?,
+                        imported_at,
+                    ],
+                )?;
+            }
+            refresh_profile_claim_derived_data(
+                &transaction,
+                claim_id,
+                &preference_fingerprint(statement),
+                imported_at,
+            )?;
+            imported_claims = imported_claims.saturating_add(1);
+        }
+
+        let mut imported_deletion_receipts = 0_u64;
+        for receipt in required_json_array(&bundle["data"], "deletion_receipts")? {
+            let receipt_scope_kind = required_json_str(&receipt["scope"], "kind")?;
+            let receipt_scope_id = receipt["scope"]["project_id"].as_str();
+            if receipt_scope_kind != bundle_scope_kind || receipt_scope_id != bundle_scope_id {
+                return Err(TyrionError::InvalidRequest(
+                    "memory import contains a deletion receipt outside its declared scope".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO memory_deletion_receipts (
+                    id, claim_id, scope_kind, scope_id, cascade_json,
+                    remaining_related_claims_json, deleted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    required_json_str(receipt, "id")?,
+                    required_json_str(receipt, "claim_id")?,
+                    receipt_scope_kind,
+                    receipt_scope_id,
+                    serde_json::to_string(&receipt["cascade"])?,
+                    serde_json::to_string(&receipt["remaining_related_claim_ids"])?,
+                    required_json_i64(receipt, "deleted_at")?,
+                ],
+            )?;
+            imported_deletion_receipts = imported_deletion_receipts.saturating_add(1);
+        }
+        let (claim_limit, token_limit) = if bundle_scope_kind == "project" {
+            (80, 4_000)
+        } else {
+            (20, 1_000)
+        };
+        let demoted_claim_ids = reconcile_active_profile_budget(
+            &transaction,
+            bundle_scope_kind,
+            bundle_scope_id,
+            claim_limit,
+            token_limit,
+            imported_at,
+        )?;
+        let result = serde_json::json!({
+            "checksum": checksum,
+            "scope": bundle["scope"],
+            "imported": {
+                "claims": imported_claims,
+                "learning_boundaries": imported_boundaries,
+                "deletion_receipts": imported_deletion_receipts,
+                "commission_records": commission_records.len(),
+                "demoted_claim_ids": demoted_claim_ids,
+            },
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn pin_memory_material(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        material_id: &str,
+        principal_token_hash: &str,
+    ) -> Result<Value, TyrionError> {
+        authenticate_principal(request, principal_token_hash)?;
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_active_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let updated = transaction.execute(
+            "UPDATE temporary_memory_materials SET pinned = 1
+             WHERE id = ?1 AND commission_id = ?2 AND content_json IS NOT NULL",
+            params![material_id, commission_id],
+        )?;
+        if updated != 1 {
+            return Err(TyrionError::NotFound(material_id.to_owned()));
+        }
+        let result = serde_json::json!({
+            "material_id": material_id,
+            "commission_id": commission_id,
+            "pinned": true,
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn maintain_memory(&mut self, now_epoch_seconds: Option<i64>) -> Result<(), TyrionError> {
+        let now_epoch_seconds = now_epoch_seconds.unwrap_or(unix_timestamp()?);
+        if now_epoch_seconds < 0 {
+            return Err(TyrionError::InvalidRequest(
+                "memory maintenance time must not precede the Unix epoch".into(),
+            ));
+        }
+        let now_millis = now_epoch_seconds.saturating_mul(1_000);
+        let decay_cutoff = now_millis.saturating_sub(180_i64 * 24 * 60 * 60 * 1_000);
+        let transaction = self.connection.transaction()?;
+        refresh_temporary_material_retention_links(&transaction, None)?;
+        let claim_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM profile_claims
+                 WHERE strength = 'soft' AND lifecycle_state = 'active'
+                   AND last_nonweak_support_at IS NOT NULL
+                   AND last_nonweak_support_at <= ?1
+                 ORDER BY last_nonweak_support_at, id",
+            )?;
+            let rows = statement.query_map([decay_cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for claim_id in claim_ids {
+            transaction.execute(
+                "UPDATE profile_claims
+                 SET lifecycle_state = 'candidate', lifecycle_changed_at = ?2,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![claim_id, now_millis],
+            )?;
+            transaction.execute(
+                "INSERT INTO profile_claim_lifecycle (
+                    claim_id, from_state, to_state, reason, changed_at
+                 ) VALUES (?1, 'active', 'candidate', 'soft_claim_decay', ?2)",
+                params![claim_id, now_millis],
+            )?;
+        }
+        let expiring_materials = {
+            let mut statement = transaction.prepare(
+                "SELECT id, kind, result_id FROM temporary_memory_materials
+                 WHERE content_json IS NOT NULL AND expired_at IS NULL
+                   AND expires_at IS NOT NULL AND expires_at <= ?1
+                   AND pinned = 0 AND retained_by_evidence = 0
+                   AND retained_by_claim = 0 AND retained_for_uncertain_effect = 0
+                   AND commission_id IN (
+                       SELECT id FROM commissions
+                       WHERE status IN ('verified_complete', 'cancelled')
+                   )
+                 ORDER BY expires_at, id",
+            )?;
+            let rows = statement.query_map([now_epoch_seconds], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (material_id, kind, result_id) in expiring_materials {
+            transaction.execute(
+                "UPDATE temporary_memory_materials
+                 SET content_json = NULL, expired_at = ?2 WHERE id = ?1",
+                params![material_id, now_epoch_seconds],
+            )?;
+            if kind == "unaccepted_artifact" {
+                if let Some(result_id) = result_id {
+                    transaction.execute(
+                        "UPDATE results SET artifacts_json = '[]'
+                         WHERE id = ?1 AND status != 'accepted'",
+                        [result_id],
+                    )?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn take_control(
@@ -1351,6 +3179,7 @@ impl Store {
              ) AND status != 'accepted'",
             [commission_id],
         )?;
+        finalize_temporary_material_retention(&transaction, commission_id, now)?;
         for (attempt_id, assignment_id) in &running_attempts {
             record_attempt_recovery(
                 &transaction,
@@ -5269,6 +7098,21 @@ impl Store {
                 now,
             ],
         )?;
+        transaction.execute(
+            "INSERT INTO temporary_memory_materials (
+                id, commission_id, attempt_id, kind, content_json, created_at
+             ) VALUES (?1, ?2, ?3, 'raw_worker_transcript', ?4, ?5)",
+            params![
+                format!("transcript:{attempt_id}"),
+                commission_id,
+                attempt_id,
+                serde_json::to_string(&serde_json::json!({
+                    "attempt_id": attempt_id,
+                    "events": ["worker_launched"],
+                }))?,
+                now,
+            ],
+        )?;
         for (position, claim) in worker_context.claims.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO attempt_profile_claims (
@@ -5381,7 +7225,11 @@ impl Store {
                 "reserved_atomically": true,
             }),
         )?;
-        worker.begin_attempt(&attempt_id, ready.mandate_revision)?;
+        worker.begin_attempt(
+            &attempt_id,
+            ready.mandate_revision,
+            ready.reserved_storage_bytes,
+        )?;
         if let Err(error) = transaction.commit() {
             worker.end_attempt(&attempt_id)?;
             return Err(error.into());
@@ -5438,6 +7286,28 @@ impl Store {
         let candidate = match execution_result {
             Ok(candidate) => candidate,
             Err(error) => {
+                self.connection.execute(
+                    "UPDATE temporary_memory_materials
+                     SET content_json = ?2
+                     WHERE id = ?1 AND kind = 'raw_worker_transcript'",
+                    params![
+                        format!("transcript:{attempt_id}"),
+                        serde_json::to_string(&serde_json::json!({
+                            "attempt_id": attempt_id,
+                            "adapter_events": terminal_telemetry
+                                .as_ref()
+                                .map_or_else(|| serde_json::json!([]), |telemetry| {
+                                    telemetry["raw_adapter_events"].clone()
+                                }),
+                            "adapter_events_truncated": terminal_telemetry
+                                .as_ref()
+                                .is_some_and(|telemetry| {
+                                    telemetry["raw_adapter_events_truncated"] == true
+                                }),
+                            "terminal_error": error.to_string(),
+                        }))?,
+                    ],
+                )?;
                 self.fail_attempt(
                     commission_id,
                     &assignment.assignment_id,
@@ -5452,6 +7322,28 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE temporary_memory_materials
+             SET content_json = ?2
+             WHERE id = ?1 AND kind = 'raw_worker_transcript'",
+            params![
+                format!("transcript:{attempt_id}"),
+                serde_json::to_string(&serde_json::json!({
+                    "attempt_id": attempt_id,
+                    "adapter_events": terminal_telemetry
+                        .as_ref()
+                        .map_or_else(|| serde_json::json!([]), |telemetry| {
+                            telemetry["raw_adapter_events"].clone()
+                        }),
+                    "adapter_events_truncated": terminal_telemetry
+                        .as_ref()
+                        .is_some_and(|telemetry| {
+                            telemetry["raw_adapter_events_truncated"] == true
+                        }),
+                    "worker_output": &candidate.output,
+                }))?,
+            ],
+        )?;
         let continuation = attempt_continuation(&transaction, commission_id, &ready, &attempt_id)?;
         transaction.execute(
             "UPDATE workers
@@ -5501,6 +7393,22 @@ impl Store {
                 changed_paths_json,
                 artifacts_json,
                 known_effects_json,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO temporary_memory_materials (
+                id, commission_id, attempt_id, result_id, kind, content_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 'unaccepted_artifact', ?5, ?6)",
+            params![
+                format!("artifact:{result_id}"),
+                commission_id,
+                attempt_id,
+                result_id,
+                serde_json::to_string(&serde_json::json!({
+                    "artifact_revision": candidate.artifact_revision.as_str(),
+                    "artifacts": &candidate.artifacts,
+                }))?,
+                result_created_at,
             ],
         )?;
         if stale {
@@ -9700,11 +11608,63 @@ fn finish_verified_commission(
             completed_at,
         ],
     )?;
+    finalize_temporary_material_retention(transaction, completion.commission_id, completed_at)?;
     record_event(
         transaction,
         completion.commission_id,
         EventKind::CommissionVerifiedComplete,
         completion_revision,
+    )?;
+    Ok(())
+}
+
+fn finalize_temporary_material_retention(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    completed_at: i64,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "DELETE FROM temporary_memory_materials
+         WHERE commission_id = ?1 AND kind = 'unaccepted_artifact'
+           AND result_id IN (SELECT id FROM results WHERE status = 'accepted')",
+        [commission_id],
+    )?;
+    refresh_temporary_material_retention_links(transaction, Some(commission_id))?;
+    let expires_at = completed_at.saturating_add(30 * 24 * 60 * 60);
+    transaction.execute(
+        "UPDATE temporary_memory_materials
+         SET expires_at = ?2
+         WHERE commission_id = ?1 AND expired_at IS NULL",
+        params![commission_id, expires_at],
+    )?;
+    Ok(())
+}
+
+fn refresh_temporary_material_retention_links(
+    transaction: &Transaction<'_>,
+    commission_id: Option<&str>,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "UPDATE temporary_memory_materials
+         SET retained_by_evidence = kind = 'unaccepted_artifact' AND EXISTS (
+                 SELECT 1 FROM evidence
+                 WHERE evidence.result_id = temporary_memory_materials.result_id
+             ),
+             retained_by_claim = EXISTS (
+                 SELECT 1 FROM learning_observations
+                 JOIN profile_claim_observations
+                   ON profile_claim_observations.observation_id = learning_observations.id
+                 WHERE learning_observations.commission_id =
+                       temporary_memory_materials.commission_id
+             ),
+             retained_for_uncertain_effect = EXISTS (
+                 SELECT 1 FROM operation_requests
+                 WHERE operation_requests.commission_id =
+                       temporary_memory_materials.commission_id
+                   AND operation_requests.status = 'uncertain'
+             )
+         WHERE (?1 IS NULL OR commission_id = ?1) AND expired_at IS NULL",
+        [commission_id],
     )?;
     Ok(())
 }
@@ -10735,6 +12695,1136 @@ fn token_upper_bound(value: &str) -> u64 {
     value.len() as u64
 }
 
+fn preference_fingerprint(statement: &str) -> String {
+    let normalized = statement
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    format!("sha256:{:x}", Sha256::digest(normalized.as_bytes()))
+}
+
+fn refresh_profile_claim_derived_data(
+    transaction: &Transaction<'_>,
+    claim_id: &str,
+    statement_fingerprint: &str,
+    now: i64,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "INSERT INTO profile_claim_indexes (claim_id, statement_fingerprint, indexed_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(claim_id) DO UPDATE SET
+             statement_fingerprint = excluded.statement_fingerprint,
+             indexed_at = excluded.indexed_at",
+        params![claim_id, statement_fingerprint, now],
+    )?;
+    transaction.execute(
+        "INSERT INTO profile_claim_caches (claim_id, cached_projection_json, cached_at)
+         VALUES (?1, '{}', ?2)
+         ON CONFLICT(claim_id) DO UPDATE SET
+             cached_projection_json = excluded.cached_projection_json,
+             cached_at = excluded.cached_at",
+        params![claim_id, now],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_room_in_active_profile(
+    transaction: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    claim_limit: u64,
+    token_limit: u64,
+    incoming_tokens: u64,
+    excluded_claim_id: Option<&str>,
+    now: i64,
+) -> Result<Vec<String>, TyrionError> {
+    let mut demoted_claim_ids = Vec::new();
+    loop {
+        let (active_claims, active_tokens) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(profile_claim_versions.token_upper_bound), 0)
+             FROM profile_claims
+             JOIN profile_claim_versions
+               ON profile_claim_versions.claim_id = profile_claims.id
+              AND profile_claim_versions.version = profile_claims.current_version
+             WHERE lifecycle_state = 'active' AND scope_kind = ?1
+               AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))
+               AND id != COALESCE(?3, '')",
+            params![scope_kind, scope_id, excluded_claim_id],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+        )?;
+        if active_claims.saturating_add(1) <= claim_limit
+            && active_tokens.saturating_add(incoming_tokens) <= token_limit
+        {
+            return Ok(demoted_claim_ids);
+        }
+        let demotion = transaction
+            .query_row(
+                "SELECT id FROM profile_claims
+                 WHERE lifecycle_state = 'active' AND strength = 'soft'
+                   AND scope_kind = ?1
+                   AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))
+                   AND id != COALESCE(?3, '')
+                 ORDER BY confidence_basis_points, updated_at, created_at, id
+                 LIMIT 1",
+                params![scope_kind, scope_id, excluded_claim_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(demotion) = demotion else {
+            return Err(TyrionError::InvalidRequest(format!(
+                "the {scope_kind} Profile cannot admit this preference without truncating hard Profile Claims"
+            )));
+        };
+        transaction.execute(
+            "UPDATE profile_claims
+             SET lifecycle_state = 'candidate', lifecycle_changed_at = ?2,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![demotion, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO profile_claim_lifecycle (
+                claim_id, from_state, to_state, reason, changed_at
+             ) VALUES (?1, 'active', 'candidate', 'active_profile_capacity', ?2)",
+            params![demotion, now],
+        )?;
+        demoted_claim_ids.push(demotion);
+    }
+}
+
+fn reconcile_active_profile_budget(
+    transaction: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    claim_limit: u64,
+    token_limit: u64,
+    now: i64,
+) -> Result<Vec<String>, TyrionError> {
+    let mut demoted_claim_ids = Vec::new();
+    loop {
+        let (active_claims, active_tokens) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(profile_claim_versions.token_upper_bound), 0)
+             FROM profile_claims
+             JOIN profile_claim_versions
+               ON profile_claim_versions.claim_id = profile_claims.id
+              AND profile_claim_versions.version = profile_claims.current_version
+             WHERE lifecycle_state = 'active' AND scope_kind = ?1
+               AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))",
+            params![scope_kind, scope_id],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+        )?;
+        if active_claims <= claim_limit && active_tokens <= token_limit {
+            return Ok(demoted_claim_ids);
+        }
+        let demotion = transaction
+            .query_row(
+                "SELECT id FROM profile_claims
+                 WHERE lifecycle_state = 'active' AND strength = 'soft'
+                   AND scope_kind = ?1
+                   AND (scope_id = ?2 OR (scope_id IS NULL AND ?2 IS NULL))
+                 ORDER BY confidence_basis_points, updated_at, created_at, id
+                 LIMIT 1",
+                params![scope_kind, scope_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(demotion) = demotion else {
+            return Err(TyrionError::InvalidRequest(format!(
+                "memory import exceeds the {scope_kind} Profile budget and cannot truncate hard Profile Claims"
+            )));
+        };
+        transaction.execute(
+            "UPDATE profile_claims
+             SET lifecycle_state = 'candidate', lifecycle_changed_at = ?2,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![demotion, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO profile_claim_lifecycle (
+                claim_id, from_state, to_state, reason, changed_at
+             ) VALUES (?1, 'active', 'candidate', 'memory_import_capacity', ?2)",
+            params![demotion, now],
+        )?;
+        demoted_claim_ids.push(demotion);
+    }
+}
+
+fn hard_profile_capacity_allows(
+    transaction: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    claim_limit: u64,
+    token_limit: u64,
+    incoming_tokens: u64,
+) -> Result<bool, TyrionError> {
+    let (hard_claims, hard_tokens) = transaction.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(profile_claim_versions.token_upper_bound), 0)
+         FROM profile_claims
+         JOIN profile_claim_versions
+           ON profile_claim_versions.claim_id = profile_claims.id
+          AND profile_claim_versions.version = profile_claims.current_version
+         WHERE profile_claims.lifecycle_state = 'active'
+           AND profile_claims.strength = 'hard' AND profile_claims.scope_kind = ?1
+           AND (profile_claims.scope_id = ?2
+                OR (profile_claims.scope_id IS NULL AND ?2 IS NULL))",
+        params![scope_kind, scope_id],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+    )?;
+    Ok(hard_claims.saturating_add(1) <= claim_limit
+        && hard_tokens.saturating_add(incoming_tokens) <= token_limit)
+}
+
+fn commission_project_id(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+) -> Result<Option<String>, TyrionError> {
+    transaction
+        .query_row(
+            "SELECT project_id FROM commissions WHERE id = ?1",
+            [commission_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| TyrionError::NotFound(commission_id.to_owned()))
+}
+
+fn ensure_claim_scope(
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    source_project_id: Option<&str>,
+) -> Result<(), TyrionError> {
+    if scope_kind == "project" && scope_id != source_project_id {
+        return Err(TyrionError::ControlDenied(
+            "a project Profile Claim can only be controlled from the same verified Project".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn profile_scope(scope_kind: &str, scope_id: Option<&str>) -> Value {
+    if scope_kind == "project" {
+        serde_json::json!({"kind": scope_kind, "project_id": scope_id})
+    } else {
+        serde_json::json!({"kind": scope_kind})
+    }
+}
+
+fn claim_observation_ids(
+    transaction: &Transaction<'_>,
+    claim_ids: &[String],
+) -> Result<Vec<String>, TyrionError> {
+    let mut observation_ids = HashSet::new();
+    for claim_id in claim_ids {
+        let mut statement = transaction
+            .prepare("SELECT observation_id FROM profile_claim_observations WHERE claim_id = ?1")?;
+        let rows = statement.query_map([claim_id], |row| row.get::<_, String>(0))?;
+        for observation_id in rows {
+            observation_ids.insert(observation_id?);
+        }
+    }
+    let mut observation_ids = observation_ids.into_iter().collect::<Vec<_>>();
+    observation_ids.sort();
+    Ok(observation_ids)
+}
+
+fn claim_observation_project_ids(
+    transaction: &Transaction<'_>,
+    claim_id: &str,
+) -> Result<Vec<String>, TyrionError> {
+    let mut statement = transaction.prepare(
+        "SELECT DISTINCT learning_observations.project_id
+         FROM learning_observations
+         JOIN profile_claim_observations
+           ON profile_claim_observations.observation_id = learning_observations.id
+         WHERE profile_claim_observations.claim_id = ?1
+         ORDER BY learning_observations.project_id",
+    )?;
+    let project_ids = statement
+        .query_map([claim_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(project_ids)
+}
+
+fn blocking_learning_boundary_id(
+    transaction: &Transaction<'_>,
+    statement_fingerprint: &str,
+    claim_scope_kind: &str,
+    claim_scope_id: Option<&str>,
+    related_project_ids: &[String],
+) -> Result<Option<String>, TyrionError> {
+    let mut statement = transaction.prepare(
+        "SELECT id, scope_kind, scope_id FROM learning_boundaries
+         WHERE statement_fingerprint = ?1
+         ORDER BY CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END, created_at, id",
+    )?;
+    let boundaries = statement
+        .query_map([statement_fingerprint], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(boundaries
+        .into_iter()
+        .find(|(_, boundary_scope_kind, boundary_scope_id)| {
+            boundary_scope_kind == "principal"
+                || (boundary_scope_kind == "project"
+                    && (claim_scope_kind == "principal"
+                        || claim_scope_kind == "project"
+                            && boundary_scope_id.as_deref() == claim_scope_id
+                        || boundary_scope_id
+                            .as_ref()
+                            .is_some_and(|project_id| related_project_ids.contains(project_id))))
+        })
+        .map(|(id, _, _)| id))
+}
+
+fn dedicated_observation_ids(
+    transaction: &Transaction<'_>,
+    observation_ids: &[String],
+    claims_to_delete: &[String],
+) -> Result<Vec<String>, TyrionError> {
+    let deleting = claims_to_delete.iter().collect::<HashSet<_>>();
+    let mut dedicated = Vec::new();
+    for observation_id in observation_ids {
+        let mut statement = transaction
+            .prepare("SELECT claim_id FROM profile_claim_observations WHERE observation_id = ?1")?;
+        let linked_claim_ids = statement
+            .query_map([observation_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if linked_claim_ids
+            .iter()
+            .all(|linked_claim_id| deleting.contains(linked_claim_id))
+        {
+            dedicated.push(observation_id.clone());
+        }
+    }
+    Ok(dedicated)
+}
+
+fn related_claim_ids(
+    transaction: &Transaction<'_>,
+    statement_fingerprint: &str,
+    observation_ids: &[String],
+    claims_to_delete: &[String],
+) -> Result<Vec<String>, TyrionError> {
+    let mut related = HashSet::new();
+    {
+        let mut statement = transaction
+            .prepare("SELECT id FROM profile_claims WHERE statement_fingerprint = ?1")?;
+        for claim_id in
+            statement.query_map([statement_fingerprint], |row| row.get::<_, String>(0))?
+        {
+            related.insert(claim_id?);
+        }
+    }
+    for observation_id in observation_ids {
+        let mut statement = transaction
+            .prepare("SELECT claim_id FROM profile_claim_observations WHERE observation_id = ?1")?;
+        for claim_id in statement.query_map([observation_id], |row| row.get::<_, String>(0))? {
+            related.insert(claim_id?);
+        }
+    }
+    for claim_id in claims_to_delete {
+        related.remove(claim_id);
+    }
+    let mut related = related.into_iter().collect::<Vec<_>>();
+    related.sort();
+    Ok(related)
+}
+
+fn count_for_claims(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    claim_ids: &[String],
+) -> Result<u64, TyrionError> {
+    let allowed = [
+        ("profile_claim_versions", "claim_id"),
+        ("attempt_profile_claims", "claim_id"),
+        ("imported_profile_claim_attempts", "claim_id"),
+        ("profile_claim_indexes", "claim_id"),
+        ("profile_claim_caches", "claim_id"),
+    ];
+    if !allowed.contains(&(table, column)) {
+        return Err(TyrionError::InvalidRequest(
+            "invalid internal Profile Claim count target".into(),
+        ));
+    }
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
+    let mut total = 0_u64;
+    for claim_id in claim_ids {
+        total = total
+            .saturating_add(transaction.query_row(&sql, [claim_id], |row| row.get::<_, u64>(0))?);
+    }
+    Ok(total)
+}
+
+fn exact_scope_values(value: &Value, scope_kind: &str, scope_id: Option<&str>) -> Vec<Value> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["scope"]["kind"] == scope_kind
+                && (scope_kind == "principal" || entry["scope"]["project_id"].as_str() == scope_id)
+        })
+        .cloned()
+        .collect()
+}
+
+fn validate_memory_bundle(bundle: &Value) -> Result<(), TyrionError> {
+    if contains_prohibited_memory_key(bundle) {
+        return Err(TyrionError::InvalidRequest(
+            "memory import contains a prohibited secret or credential field".into(),
+        ));
+    }
+    reject_unknown_memory_fields(
+        bundle,
+        &[
+            "format",
+            "version",
+            "scope",
+            "exported_at",
+            "checksum",
+            "data",
+            "summary_markdown",
+        ],
+        "memory export",
+    )?;
+    if bundle["format"] != "tyrion.memory" || bundle["version"] != 1 {
+        return Err(TyrionError::InvalidRequest(
+            "memory import requires tyrion.memory version 1".into(),
+        ));
+    }
+    required_json_i64(bundle, "exported_at")?;
+    validate_memory_scope(&bundle["scope"])?;
+    let data = bundle.get("data").ok_or_else(|| {
+        TyrionError::InvalidRequest("memory import is missing structured data".into())
+    })?;
+    reject_unknown_memory_fields(
+        data,
+        &[
+            "claims",
+            "learning_boundaries",
+            "deletion_receipts",
+            "commission_records",
+            "excluded_categories",
+        ],
+        "memory data",
+    )?;
+    for claim in required_json_array(data, "claims")? {
+        validate_memory_claim_entry(claim)?;
+    }
+    for boundary in required_json_array(data, "learning_boundaries")? {
+        validate_memory_boundary(boundary)?;
+    }
+    for receipt in required_json_array(data, "deletion_receipts")? {
+        validate_memory_deletion_receipt(receipt)?;
+    }
+    for record in required_json_array(data, "commission_records")? {
+        validate_memory_commission_record(record)?;
+    }
+    if required_json_array(data, "excluded_categories")?
+        .iter()
+        .any(|category| !category.is_string())
+    {
+        return Err(TyrionError::InvalidRequest(
+            "memory excluded_categories must contain only strings".into(),
+        ));
+    }
+    let checksum = required_json_str(bundle, "checksum")?;
+    let actual_checksum = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(data)?));
+    if checksum != actual_checksum {
+        return Err(TyrionError::InvalidRequest(
+            "memory import checksum does not match its structured data".into(),
+        ));
+    }
+    let summary = bundle["summary_markdown"].as_str().ok_or_else(|| {
+        TyrionError::InvalidRequest("memory import requires a readable Markdown summary".into())
+    })?;
+    let mut summary_identifiers = vec![checksum];
+    summary_identifiers.extend(
+        required_json_array(data, "claims")?
+            .iter()
+            .filter_map(|entry| entry["claim"]["id"].as_str()),
+    );
+    for collection in [
+        "learning_boundaries",
+        "deletion_receipts",
+        "commission_records",
+    ] {
+        summary_identifiers.extend(
+            required_json_array(data, collection)?
+                .iter()
+                .filter_map(|entry| entry["id"].as_str()),
+        );
+    }
+    if summary_identifiers
+        .into_iter()
+        .any(|identifier| !summary.contains(identifier))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "memory Markdown summary omits a structured identifier or checksum".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_memory_claim_entry(entry: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(
+        entry,
+        &[
+            "claim",
+            "versions",
+            "observations",
+            "lifecycle_history",
+            "affected_attempts",
+            "retention",
+        ],
+        "memory claim entry",
+    )?;
+    let claim = entry
+        .get("claim")
+        .ok_or_else(|| TyrionError::InvalidRequest("memory claim entry is missing claim".into()))?;
+    reject_unknown_memory_fields(
+        claim,
+        &[
+            "id",
+            "version",
+            "statement",
+            "token_upper_bound",
+            "token_accounting",
+            "strength",
+            "scope",
+            "applicability",
+            "provenance",
+            "confidence",
+            "lifecycle",
+            "created_at",
+            "updated_at",
+        ],
+        "memory claim",
+    )?;
+    required_json_str(claim, "id")?;
+    let current_version = required_json_i64(claim, "version")?;
+    let current_statement = required_json_str(claim, "statement")?;
+    if required_json_u64(claim, "token_upper_bound")? != token_upper_bound(current_statement) {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim head token accounting does not match its statement".into(),
+        ));
+    }
+    if claim["token_accounting"] != "utf8_byte_upper_bound" {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim uses unsupported token accounting".into(),
+        ));
+    }
+    let strength = required_json_str(claim, "strength")?;
+    if !matches!(strength, "hard" | "soft") {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim strength must be hard or soft".into(),
+        ));
+    }
+    validate_memory_scope(&claim["scope"])?;
+    reject_unknown_memory_fields(&claim["applicability"], &["work_kind"], "applicability")?;
+    if claim["applicability"]["work_kind"] != "software_building" {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim applicability must be software_building".into(),
+        ));
+    }
+    validate_claim_version_provenance(&claim["provenance"])?;
+    reject_unknown_memory_fields(
+        &claim["confidence"],
+        &["category", "basis_points"],
+        "confidence",
+    )?;
+    let confidence = required_json_str(&claim["confidence"], "category")?;
+    if !matches!(confidence, "explicit" | "inferred")
+        || (strength == "hard") != (confidence == "explicit")
+    {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim strength and confidence are inconsistent".into(),
+        ));
+    }
+    if required_json_u64(&claim["confidence"], "basis_points")? > 10_000 {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim confidence exceeds 10000 basis points".into(),
+        ));
+    }
+    reject_unknown_memory_fields(&claim["lifecycle"], &["state"], "claim lifecycle")?;
+    let lifecycle_state = required_json_str(&claim["lifecycle"], "state")?;
+    if !matches!(
+        lifecycle_state,
+        "candidate" | "active" | "suppressed" | "contradicted"
+    ) {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim lifecycle state is invalid".into(),
+        ));
+    }
+    required_json_i64(claim, "created_at")?;
+    required_json_i64(claim, "updated_at")?;
+
+    let versions = required_json_array(entry, "versions")?;
+    if versions.is_empty() {
+        return Err(TyrionError::InvalidRequest(
+            "memory Profile Claim must contain at least one version".into(),
+        ));
+    }
+    let mut current_matches = 0;
+    let mut version_numbers = HashSet::new();
+    for version in versions {
+        reject_unknown_memory_fields(
+            version,
+            &[
+                "version",
+                "statement",
+                "token_upper_bound",
+                "token_accounting",
+                "provenance",
+                "disposition",
+                "created_at",
+            ],
+            "memory claim version",
+        )?;
+        let version_number = required_json_i64(version, "version")?;
+        if version_number <= 0 || !version_numbers.insert(version_number) {
+            return Err(TyrionError::InvalidRequest(
+                "memory claim versions must use unique positive numbers".into(),
+            ));
+        }
+        let statement = required_json_str(version, "statement")?;
+        if required_json_u64(version, "token_upper_bound")? != token_upper_bound(statement)
+            || version["token_accounting"] != "utf8_byte_upper_bound"
+        {
+            return Err(TyrionError::InvalidRequest(
+                "memory claim token accounting does not match its statement".into(),
+            ));
+        }
+        validate_claim_version_provenance(&version["provenance"])?;
+        let disposition = required_json_str(version, "disposition")?;
+        if version_number == current_version {
+            current_matches += 1;
+            if statement != current_statement || disposition != "current" {
+                return Err(TyrionError::InvalidRequest(
+                    "memory claim head does not match its current immutable version".into(),
+                ));
+            }
+        } else if disposition != "superseded" {
+            return Err(TyrionError::InvalidRequest(
+                "memory claim version disposition is inconsistent".into(),
+            ));
+        }
+        required_json_i64(version, "created_at")?;
+    }
+    if current_matches != 1 {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim must identify exactly one current version".into(),
+        ));
+    }
+    if version_numbers.len() != current_version as usize
+        || !(1..=current_version).all(|version| version_numbers.contains(&version))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim versions must form a complete sequence".into(),
+        ));
+    }
+
+    let observations = required_json_array(entry, "observations")?;
+    let mut observation_ids = HashSet::new();
+    for observation in observations {
+        validate_memory_observation(observation)?;
+        observation_ids.insert(required_json_str(observation, "id")?);
+    }
+    let lifecycle_history = required_json_array(entry, "lifecycle_history")?;
+    if lifecycle_history.is_empty() {
+        return Err(TyrionError::InvalidRequest(
+            "memory claim requires lifecycle history".into(),
+        ));
+    }
+    let mut prior_state: Option<&str> = None;
+    let mut prior_sequence = None;
+    for lifecycle in lifecycle_history {
+        reject_unknown_memory_fields(
+            lifecycle,
+            &[
+                "sequence",
+                "from_state",
+                "to_state",
+                "reason",
+                "observation_id",
+                "changed_at",
+            ],
+            "memory lifecycle history",
+        )?;
+        let sequence = required_json_i64(lifecycle, "sequence")?;
+        if prior_sequence.is_some_and(|prior| sequence <= prior) {
+            return Err(TyrionError::InvalidRequest(
+                "memory lifecycle sequence must increase".into(),
+            ));
+        }
+        prior_sequence = Some(sequence);
+        let from_state = lifecycle["from_state"].as_str();
+        if lifecycle["from_state"].is_null() {
+            if prior_state.is_some() {
+                return Err(TyrionError::InvalidRequest(
+                    "memory lifecycle transition unexpectedly resets its prior state".into(),
+                ));
+            }
+        } else if from_state != prior_state {
+            return Err(TyrionError::InvalidRequest(
+                "memory lifecycle transition chain is inconsistent".into(),
+            ));
+        }
+        let to_state = required_json_str(lifecycle, "to_state")?;
+        if !matches!(
+            to_state,
+            "candidate" | "active" | "suppressed" | "contradicted"
+        ) {
+            return Err(TyrionError::InvalidRequest(
+                "memory lifecycle transition has an invalid state".into(),
+            ));
+        }
+        prior_state = Some(to_state);
+        required_json_str(lifecycle, "reason")?;
+        required_json_i64(lifecycle, "changed_at")?;
+        if let Some(observation_id) = lifecycle["observation_id"].as_str() {
+            if !observation_ids.contains(observation_id) {
+                return Err(TyrionError::InvalidRequest(
+                    "memory lifecycle transition references an unknown observation".into(),
+                ));
+            }
+        } else if !lifecycle["observation_id"].is_null() {
+            return Err(TyrionError::InvalidRequest(
+                "memory lifecycle observation_id must be a string or null".into(),
+            ));
+        }
+    }
+    if lifecycle_history
+        .last()
+        .and_then(|entry| entry["to_state"].as_str())
+        != Some(lifecycle_state)
+    {
+        return Err(TyrionError::InvalidRequest(
+            "memory lifecycle history does not match the claim head".into(),
+        ));
+    }
+    let mut attempt_ids = HashSet::new();
+    for attempt in required_json_array(entry, "affected_attempts")? {
+        reject_unknown_memory_fields(
+            attempt,
+            &[
+                "claim_version",
+                "attempt_id",
+                "assignment_id",
+                "commission_id",
+                "result_id",
+                "outcome",
+                "recorded_at",
+            ],
+            "affected Attempt",
+        )?;
+        let claim_version = required_json_i64(attempt, "claim_version")?;
+        if !version_numbers.contains(&claim_version) {
+            return Err(TyrionError::InvalidRequest(
+                "affected Attempt references a missing claim version".into(),
+            ));
+        }
+        let attempt_id = required_json_str(attempt, "attempt_id")?;
+        if !attempt_ids.insert(attempt_id) {
+            return Err(TyrionError::InvalidRequest(format!(
+                "memory claim repeats affected Attempt {attempt_id}"
+            )));
+        }
+        required_json_str(attempt, "assignment_id")?;
+        required_json_str(attempt, "commission_id")?;
+        validate_optional_memory_string(attempt, "result_id")?;
+        if let Some(outcome) = attempt["outcome"].as_str() {
+            if !matches!(outcome, "accepted" | "edited" | "rejected" | "contradicted") {
+                return Err(TyrionError::InvalidRequest(
+                    "affected Attempt outcome is invalid".into(),
+                ));
+            }
+        } else if !attempt["outcome"].is_null() {
+            return Err(TyrionError::InvalidRequest(
+                "affected Attempt outcome must be a string or null".into(),
+            ));
+        }
+        validate_optional_memory_i64(attempt, "recorded_at")?;
+    }
+    reject_unknown_memory_fields(
+        &entry["retention"],
+        &["last_nonweak_support_at", "lifecycle_changed_at"],
+        "claim retention",
+    )?;
+    validate_optional_memory_i64(&entry["retention"], "last_nonweak_support_at")?;
+    required_json_i64(&entry["retention"], "lifecycle_changed_at")?;
+    Ok(())
+}
+
+fn validate_memory_observation(observation: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(
+        observation,
+        &[
+            "id",
+            "commission_id",
+            "project_id",
+            "claim_id",
+            "statement",
+            "statement_fingerprint",
+            "kind",
+            "explanation",
+            "strength",
+            "observed_at",
+            "provenance",
+        ],
+        "learning observation",
+    )?;
+    required_json_str(observation, "id")?;
+    let commission_id = required_json_str(observation, "commission_id")?;
+    let project_id = required_json_str(observation, "project_id")?;
+    let statement = required_json_str(observation, "statement")?;
+    let fingerprint = required_json_str(observation, "statement_fingerprint")?;
+    if fingerprint != preference_fingerprint(statement) {
+        return Err(TyrionError::InvalidRequest(
+            "learning observation fingerprint does not match its statement".into(),
+        ));
+    }
+    let kind = required_json_str(observation, "kind")?;
+    validate_optional_memory_string(observation, "claim_id")?;
+    validate_optional_memory_string(observation, "explanation")?;
+    let strength = required_json_str(observation, "strength")?;
+    let valid_pair = matches!(
+        (kind, strength),
+        ("principal_edit" | "explained_rejection", "strong")
+            | ("unedited_acceptance", "weak")
+            | ("contradiction", "contradiction")
+    );
+    if !valid_pair {
+        return Err(TyrionError::InvalidRequest(
+            "learning observation kind and strength are inconsistent".into(),
+        ));
+    }
+    if matches!(kind, "explained_rejection" | "contradiction")
+        && observation["explanation"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(TyrionError::InvalidRequest(
+            "learning observation requires an explanation".into(),
+        ));
+    }
+    required_json_i64(observation, "observed_at")?;
+    reject_unknown_memory_fields(
+        &observation["provenance"],
+        &["commission_id", "project_id"],
+        "observation provenance",
+    )?;
+    if required_json_str(&observation["provenance"], "commission_id")? != commission_id
+        || required_json_str(&observation["provenance"], "project_id")? != project_id
+    {
+        return Err(TyrionError::InvalidRequest(
+            "learning observation provenance does not match its identifiers".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_claim_version_provenance(provenance: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(
+        provenance,
+        &["kind", "commission_id", "attachment_id"],
+        "claim provenance",
+    )?;
+    required_json_str(provenance, "kind")?;
+    required_json_str(provenance, "commission_id")?;
+    required_json_str(provenance, "attachment_id")?;
+    Ok(())
+}
+
+fn validate_memory_boundary(boundary: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(
+        boundary,
+        &["id", "scope", "statement_fingerprint", "created_at"],
+        "Learning Boundary",
+    )?;
+    required_json_str(boundary, "id")?;
+    validate_memory_scope(&boundary["scope"])?;
+    required_json_str(boundary, "statement_fingerprint")?;
+    required_json_i64(boundary, "created_at")?;
+    Ok(())
+}
+
+fn validate_memory_deletion_receipt(receipt: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(
+        receipt,
+        &[
+            "id",
+            "claim_id",
+            "scope",
+            "cascade",
+            "remaining_related_claim_ids",
+            "deleted_at",
+        ],
+        "deletion receipt",
+    )?;
+    required_json_str(receipt, "id")?;
+    required_json_str(receipt, "claim_id")?;
+    validate_memory_scope(&receipt["scope"])?;
+    reject_unknown_memory_fields(
+        &receipt["cascade"],
+        &[
+            "claims",
+            "claim_versions",
+            "supporting_observations",
+            "dedicated_excerpts",
+            "affected_attempt_records",
+            "indexes",
+            "caches",
+        ],
+        "deletion cascade",
+    )?;
+    for field in [
+        "claims",
+        "claim_versions",
+        "supporting_observations",
+        "dedicated_excerpts",
+        "affected_attempt_records",
+        "indexes",
+        "caches",
+    ] {
+        required_json_u64(&receipt["cascade"], field)?;
+    }
+    if receipt["remaining_related_claim_ids"]
+        .as_array()
+        .is_none_or(|ids| ids.iter().any(|id| !id.is_string()))
+    {
+        return Err(TyrionError::InvalidRequest(
+            "deletion receipt related claim identifiers must be an array of strings".into(),
+        ));
+    }
+    required_json_i64(receipt, "deleted_at")?;
+    Ok(())
+}
+
+fn validate_memory_commission_record(record: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(
+        record,
+        &[
+            "id",
+            "project_id",
+            "status",
+            "revision",
+            "created_at",
+            "accepted_at",
+            "completed_at",
+            "artifact_revision",
+            "retained_results",
+            "retained_evidence",
+        ],
+        "Commission Record",
+    )?;
+    required_json_str(record, "id")?;
+    validate_optional_memory_string(record, "project_id")?;
+    let status = required_json_str(record, "status")?;
+    if !matches!(
+        status,
+        "proposed" | "active" | "paused" | "cancelled" | "verified_complete"
+    ) {
+        return Err(TyrionError::InvalidRequest(
+            "Commission Record status is invalid".into(),
+        ));
+    }
+    required_json_i64(record, "revision")?;
+    required_json_i64(record, "created_at")?;
+    validate_optional_memory_i64(record, "accepted_at")?;
+    validate_optional_memory_i64(record, "completed_at")?;
+    validate_optional_memory_string(record, "artifact_revision")?;
+    required_json_u64(record, "retained_results")?;
+    required_json_u64(record, "retained_evidence")?;
+    Ok(())
+}
+
+fn validate_memory_scope(scope: &Value) -> Result<(), TyrionError> {
+    reject_unknown_memory_fields(scope, &["kind", "project_id"], "memory scope")?;
+    match required_json_str(scope, "kind")? {
+        "principal" if scope.get("project_id").is_none() => Ok(()),
+        "project" if scope["project_id"].as_str().is_some() => Ok(()),
+        _ => Err(TyrionError::InvalidRequest(
+            "memory scope must be principal or name one project".into(),
+        )),
+    }
+}
+
+fn reject_unknown_memory_fields(
+    value: &Value,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), TyrionError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| TyrionError::InvalidRequest(format!("{context} must be an object")))?;
+    if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(TyrionError::InvalidRequest(format!(
+            "{context} contains unknown field {unknown}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_memory_string(value: &Value, field: &str) -> Result<(), TyrionError> {
+    if !value[field].is_null() && !value[field].is_string() {
+        return Err(TyrionError::InvalidRequest(format!(
+            "memory import field {field} must be a string or null"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_memory_i64(value: &Value, field: &str) -> Result<(), TyrionError> {
+    if !value[field].is_null() && value[field].as_i64().is_none() {
+        return Err(TyrionError::InvalidRequest(format!(
+            "memory import field {field} must be an integer or null"
+        )));
+    }
+    Ok(())
+}
+
+fn contains_prohibited_memory_key(value: &Value) -> bool {
+    const PROHIBITED: &[&str] = &[
+        "credential",
+        "credential_grant",
+        "credential_grants",
+        "credential_value",
+        "api_key",
+        "password",
+        "access_token",
+        "refresh_token",
+        "authorization",
+        "private_key",
+        "secret",
+        "raw_secret",
+        "principal_control_token",
+        "attachment_token",
+        "session_token",
+        "session_token_hash",
+        "approval_artifact",
+    ];
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            PROHIBITED.contains(&key.as_str()) || contains_prohibited_memory_key(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_prohibited_memory_key),
+        _ => false,
+    }
+}
+
+fn required_json_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, TyrionError> {
+    value[field].as_str().ok_or_else(|| {
+        TyrionError::InvalidRequest(format!("memory import field {field} must be a string"))
+    })
+}
+
+fn required_json_i64(value: &Value, field: &str) -> Result<i64, TyrionError> {
+    value[field].as_i64().ok_or_else(|| {
+        TyrionError::InvalidRequest(format!("memory import field {field} must be an integer"))
+    })
+}
+
+fn required_json_u64(value: &Value, field: &str) -> Result<u64, TyrionError> {
+    value[field].as_u64().ok_or_else(|| {
+        TyrionError::InvalidRequest(format!(
+            "memory import field {field} must be a non-negative integer"
+        ))
+    })
+}
+
+fn required_json_array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], TyrionError> {
+    value[field].as_array().map(Vec::as_slice).ok_or_else(|| {
+        TyrionError::InvalidRequest(format!("memory import field {field} must be an array"))
+    })
+}
+
+fn imported_commission_id(checksum: &str, source_commission_id: &str) -> String {
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{checksum}:{source_commission_id}").as_bytes())
+    );
+    format!("memory-import-{}", &digest[..32])
+}
+
+fn export_commission_records(
+    connection: &Connection,
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    referenced_commission_ids: &HashSet<String>,
+) -> Result<Vec<Value>, TyrionError> {
+    let mut records = Vec::new();
+    let mut record_ids = HashSet::new();
+    let mut statement = connection.prepare(
+        "SELECT id, project_id, status, revision, created_at, accepted_at,
+                completed_at, artifact_revision,
+                (SELECT COUNT(*) FROM results
+                 JOIN attempts ON attempts.id = results.attempt_id
+                 JOIN assignments ON assignments.id = attempts.assignment_id
+                 WHERE assignments.commission_id = commissions.id),
+                (SELECT COUNT(*) FROM evidence
+                 WHERE evidence.commission_id = commissions.id)
+         FROM commissions
+         WHERE id NOT LIKE 'memory-import-%'
+         ORDER BY created_at, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "project_id": row.get::<_, Option<String>>(1)?,
+            "status": row.get::<_, String>(2)?,
+            "revision": row.get::<_, i64>(3)?,
+            "created_at": row.get::<_, i64>(4)?,
+            "accepted_at": row.get::<_, Option<i64>>(5)?,
+            "completed_at": row.get::<_, Option<i64>>(6)?,
+            "artifact_revision": row.get::<_, Option<String>>(7)?,
+            "retained_results": row.get::<_, u64>(8)?,
+            "retained_evidence": row.get::<_, u64>(9)?,
+        }))
+    })?;
+    for record in rows {
+        let record = record?;
+        let record_id = record["id"].as_str().unwrap_or_default();
+        let record_project_id = record["project_id"].as_str();
+        let in_scope = scope_kind == "principal" && record_project_id.is_none()
+            || scope_kind == "project" && record_project_id == scope_id;
+        if in_scope || referenced_commission_ids.contains(record_id) {
+            record_ids.insert(record_id.to_owned());
+            records.push(record);
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT record_id, record_json FROM imported_commission_records
+         ORDER BY imported_at, record_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (record_id, record_json) = row?;
+        let record = serde_json::from_str::<Value>(&record_json)?;
+        let record_project_id = record["project_id"].as_str();
+        let in_scope = scope_kind == "principal" && record_project_id.is_none()
+            || scope_kind == "project" && record_project_id == scope_id;
+        if (in_scope || referenced_commission_ids.contains(&record_id))
+            && record_ids.insert(record_id)
+        {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 fn record_result_profile_claim_outcome(
     transaction: &Transaction<'_>,
     result_id: &str,
@@ -10844,6 +13934,7 @@ fn build_worker_context_packet(
                        AND profile_claims.scope_id = ?2 AND ?2 IS NOT NULL)
                )
              ORDER BY CASE profile_claims.scope_kind WHEN 'project' THEN 0 ELSE 1 END,
+                      CASE profile_claims.strength WHEN 'hard' THEN 0 ELSE 1 END,
                       profile_claims.created_at, profile_claims.id",
         )?;
         let rows = statement.query_map(params![commission_id, project_id.as_deref()], |row| {

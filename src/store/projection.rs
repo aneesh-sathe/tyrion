@@ -1380,6 +1380,40 @@ pub(super) fn inspect_commission(
         ],
         "findings": watchdog_findings,
     });
+    let retention_materials = query_values(
+        connection,
+        "SELECT id, attempt_id, result_id, kind, content_json IS NOT NULL,
+                pinned, retained_by_evidence, retained_by_claim,
+                retained_for_uncertain_effect, created_at, expires_at, expired_at,
+                LENGTH(COALESCE(content_json, '')),
+                CASE WHEN json_type(content_json, '$.worker_output') = 'text'
+                     THEN 1 ELSE 0 END,
+                COALESCE(json_array_length(
+                    json_extract(content_json, '$.adapter_events')
+                ), 0)
+         FROM temporary_memory_materials
+         WHERE commission_id = ?1 ORDER BY created_at, id",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "attempt_id": row.get::<_, Option<String>>(1)?,
+                "result_id": row.get::<_, Option<String>>(2)?,
+                "kind": row.get::<_, String>(3)?,
+                "content_available": row.get::<_, bool>(4)?,
+                "pinned": row.get::<_, bool>(5)?,
+                "retained_by_evidence": row.get::<_, bool>(6)?,
+                "retained_by_claim": row.get::<_, bool>(7)?,
+                "retained_for_uncertain_effect": row.get::<_, bool>(8)?,
+                "created_at": row.get::<_, i64>(9)?,
+                "expires_at": row.get::<_, Option<i64>>(10)?,
+                "expired_at": row.get::<_, Option<i64>>(11)?,
+                "content_bytes": row.get::<_, u64>(12)?,
+                "captured_worker_output": row.get::<_, bool>(13)?,
+                "captured_adapter_events": row.get::<_, u64>(14)?,
+            }))
+        },
+    )?;
 
     Ok(json!({
         "commission": commission,
@@ -1413,6 +1447,7 @@ pub(super) fn inspect_commission(
         "attachments": attachments,
         "activity_journal": activity_journal,
         "verification": verification,
+        "retention_materials": retention_materials,
     }))
 }
 
@@ -1644,7 +1679,11 @@ pub(super) fn profile_claim(connection: &Connection, claim_id: &str) -> Result<V
                     profile_claims.confidence_category,
                     profile_claims.confidence_basis_points,
                     profile_claims.lifecycle_state, profile_claims.created_at,
-                    profile_claims.updated_at
+                    profile_claims.updated_at,
+                    (SELECT provenance_json FROM memory_import_provenance
+                     WHERE entity_kind = 'claim_version'
+                       AND entity_id = profile_claims.id
+                       AND entity_version = profile_claims.current_version)
              FROM profile_claims
              JOIN profile_claim_versions
                ON profile_claim_versions.claim_id = profile_claims.id
@@ -1654,6 +1693,20 @@ pub(super) fn profile_claim(connection: &Connection, claim_id: &str) -> Result<V
             |row| {
                 let scope_kind = row.get::<_, String>(5)?;
                 let scope_id = row.get::<_, Option<String>>(6)?;
+                let confidence_category = row.get::<_, String>(10)?;
+                let local_commission_id = row.get::<_, String>(8)?;
+                let local_attachment_id = row.get::<_, String>(9)?;
+                let imported_provenance = row
+                    .get::<_, Option<String>>(15)?
+                    .map(|value| serde_json::from_str::<Value>(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            15,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
                 let scope = if scope_kind == "project" {
                     json!({
                         "kind": scope_kind,
@@ -1673,13 +1726,17 @@ pub(super) fn profile_claim(connection: &Connection, claim_id: &str) -> Result<V
                     "applicability": {
                         "work_kind": row.get::<_, String>(7)?,
                     },
-                    "provenance": {
-                        "kind": "explicit_principal_statement",
-                        "commission_id": row.get::<_, String>(8)?,
-                        "attachment_id": row.get::<_, String>(9)?,
-                    },
+                    "provenance": imported_provenance.unwrap_or_else(|| json!({
+                            "kind": if confidence_category == "explicit" {
+                                "explicit_principal_statement"
+                            } else {
+                                "inferred_learning_observation"
+                            },
+                            "commission_id": local_commission_id,
+                            "attachment_id": local_attachment_id,
+                        })),
                     "confidence": {
-                        "category": row.get::<_, String>(10)?,
+                        "category": confidence_category,
                         "basis_points": row.get::<_, u64>(11)?,
                     },
                     "lifecycle": {
@@ -1694,15 +1751,117 @@ pub(super) fn profile_claim(connection: &Connection, claim_id: &str) -> Result<V
         .ok_or_else(|| TyrionError::NotFound(claim_id.to_owned()))
 }
 
+pub(super) fn learning_observation(
+    connection: &Connection,
+    observation_id: &str,
+) -> Result<Value, TyrionError> {
+    connection
+        .query_row(
+            "SELECT id, commission_id, project_id, claim_id, statement,
+                    statement_fingerprint, kind, explanation, strength, observed_at,
+                    (SELECT provenance_json FROM memory_import_provenance
+                     WHERE entity_kind = 'observation'
+                       AND entity_id = learning_observations.id AND entity_version = 0)
+             FROM learning_observations WHERE id = ?1",
+            [observation_id],
+            |row| {
+                let imported_provenance = row
+                    .get::<_, Option<String>>(10)?
+                    .map(|value| serde_json::from_str::<Value>(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let local_commission_id = row.get::<_, String>(1)?;
+                let local_project_id = row.get::<_, String>(2)?;
+                let local_provenance = json!({
+                    "commission_id": local_commission_id.clone(),
+                    "project_id": local_project_id.clone(),
+                });
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "commission_id": imported_provenance.as_ref()
+                        .and_then(|value| value["commission_id"].as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| local_commission_id.clone()),
+                    "project_id": imported_provenance.as_ref()
+                        .and_then(|value| value["project_id"].as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| local_project_id.clone()),
+                    "claim_id": row.get::<_, Option<String>>(3)?,
+                    "statement": row.get::<_, String>(4)?,
+                    "statement_fingerprint": row.get::<_, String>(5)?,
+                    "kind": row.get::<_, String>(6)?,
+                    "explanation": row.get::<_, Option<String>>(7)?,
+                    "strength": row.get::<_, String>(8)?,
+                    "observed_at": row.get::<_, i64>(9)?,
+                    "provenance": imported_provenance.unwrap_or(local_provenance),
+                }))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| TyrionError::NotFound(observation_id.to_owned()))
+}
+
+pub(super) fn learning_observations(
+    connection: &Connection,
+    claim_id: &str,
+) -> Result<Vec<Value>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT learning_observations.id
+         FROM learning_observations
+         JOIN profile_claim_observations
+           ON profile_claim_observations.observation_id = learning_observations.id
+         WHERE profile_claim_observations.claim_id = ?1
+         ORDER BY learning_observations.observed_at, learning_observations.id",
+    )?;
+    let observation_ids = statement
+        .query_map([claim_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    observation_ids
+        .iter()
+        .map(|observation_id| learning_observation(connection, observation_id))
+        .collect()
+}
+
+pub(super) fn profile_claim_lifecycle(
+    connection: &Connection,
+    claim_id: &str,
+) -> Result<Vec<Value>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, from_state, to_state, reason, observation_id, changed_at
+         FROM profile_claim_lifecycle WHERE claim_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map([claim_id], |row| {
+        Ok(json!({
+            "sequence": row.get::<_, i64>(0)?,
+            "from_state": row.get::<_, Option<String>>(1)?,
+            "to_state": row.get::<_, String>(2)?,
+            "reason": row.get::<_, String>(3)?,
+            "observation_id": row.get::<_, Option<String>>(4)?,
+            "changed_at": row.get::<_, i64>(5)?,
+        }))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 pub(super) fn inspect_profile(
     connection: &Connection,
     project_id: Option<&str>,
 ) -> Result<Value, TyrionError> {
     let mut statement = connection.prepare(
         "SELECT id FROM profile_claims
-         WHERE lifecycle_state = 'active'
-           AND (scope_kind = 'principal' OR (scope_kind = 'project' AND scope_id = ?1))
-         ORDER BY CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END, created_at, id",
+         WHERE scope_kind = 'principal' OR (scope_kind = 'project' AND scope_id = ?1)
+         ORDER BY CASE lifecycle_state
+                    WHEN 'active' THEN 0 WHEN 'candidate' THEN 1
+                    WHEN 'contradicted' THEN 2 ELSE 3 END,
+                  CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END,
+                  CASE strength WHEN 'hard' THEN 0 ELSE 1 END,
+                  created_at, id",
     )?;
     let claim_ids = statement
         .query_map([project_id], |row| row.get::<_, String>(0))?
@@ -1711,9 +1870,87 @@ pub(super) fn inspect_profile(
         .iter()
         .map(|claim_id| profile_claim(connection, claim_id))
         .collect::<Result<Vec<_>, _>>()?;
+    let learning_boundaries = {
+        let mut statement = connection.prepare(
+            "SELECT id, scope_kind, scope_id, statement_fingerprint, created_at
+             FROM learning_boundaries
+             WHERE scope_kind = 'principal' OR (scope_kind = 'project' AND scope_id = ?1)
+             ORDER BY CASE scope_kind WHEN 'project' THEN 0 ELSE 1 END, created_at, id",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            let scope_kind = row.get::<_, String>(1)?;
+            let scope_id = row.get::<_, Option<String>>(2)?;
+            let scope = if scope_kind == "project" {
+                json!({"kind": scope_kind, "project_id": scope_id})
+            } else {
+                json!({"kind": scope_kind})
+            };
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "scope": scope,
+                "statement_fingerprint": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, i64>(4)?,
+            }))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let deletion_receipts = {
+        let mut statement = connection.prepare(
+            "SELECT id, claim_id, scope_kind, scope_id, cascade_json,
+                    remaining_related_claims_json, deleted_at
+             FROM memory_deletion_receipts
+             WHERE scope_kind = 'principal' OR (scope_kind = 'project' AND scope_id = ?1)
+             ORDER BY deleted_at, id",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            let scope_kind = row.get::<_, String>(2)?;
+            let scope_id = row.get::<_, Option<String>>(3)?;
+            let scope = if scope_kind == "project" {
+                json!({"kind": scope_kind, "project_id": scope_id})
+            } else {
+                json!({"kind": scope_kind})
+            };
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "claim_id": row.get::<_, String>(1)?,
+                "scope": scope,
+                "cascade": json_column(row, 4)?,
+                "remaining_related_claim_ids": json_column(row, 5)?,
+                "deleted_at": row.get::<_, i64>(6)?,
+            }))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let (scope_kind, claim_limit, token_limit) = if project_id.is_some() {
+        ("project", 80_u64, 4_000_u64)
+    } else {
+        ("principal", 20_u64, 1_000_u64)
+    };
+    let (active_claims, tokens_used) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(profile_claim_versions.token_upper_bound), 0)
+         FROM profile_claims
+         JOIN profile_claim_versions
+           ON profile_claim_versions.claim_id = profile_claims.id
+          AND profile_claim_versions.version = profile_claims.current_version
+         WHERE profile_claims.lifecycle_state = 'active'
+           AND profile_claims.scope_kind = ?1
+           AND (profile_claims.scope_id = ?2 OR (profile_claims.scope_id IS NULL AND ?2 IS NULL))",
+        rusqlite::params![scope_kind, project_id],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+    )?;
     Ok(json!({
         "project_id": project_id,
         "claims": claims,
+        "learning_boundaries": learning_boundaries,
+        "deletion_receipts": deletion_receipts,
+        "active_budget": {
+            "scope_kind": scope_kind,
+            "active_claims": active_claims,
+            "claim_limit": claim_limit,
+            "tokens_used": tokens_used,
+            "token_limit": token_limit,
+            "accounting": "utf8_byte_upper_bound",
+        },
     }))
 }
 
@@ -1731,20 +1968,49 @@ pub(super) fn profile_claim_versions(
     }
     let mut statement = connection.prepare(
         "SELECT version, statement, token_upper_bound,
-                provenance_commission_id, provenance_attachment_id, created_at
+                provenance_commission_id, provenance_attachment_id, created_at,
+                (SELECT provenance_json FROM memory_import_provenance
+                 WHERE entity_kind = 'claim_version'
+                   AND entity_id = profile_claim_versions.claim_id
+                   AND entity_version = profile_claim_versions.version),
+                (SELECT current_version FROM profile_claims
+                 WHERE id = profile_claim_versions.claim_id),
+                (SELECT confidence_category FROM profile_claims
+                 WHERE id = profile_claim_versions.claim_id)
          FROM profile_claim_versions WHERE claim_id = ?1 ORDER BY version",
     )?;
     let rows = statement.query_map([claim_id], |row| {
+        let imported_provenance = row
+            .get::<_, Option<String>>(6)?
+            .map(|value| serde_json::from_str::<Value>(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        let current_version = row.get::<_, i64>(7)?;
+        let confidence_category = row.get::<_, String>(8)?;
+        let version = row.get::<_, i64>(0)?;
+        let local_commission_id = row.get::<_, String>(3)?;
+        let local_attachment_id = row.get::<_, String>(4)?;
         Ok(json!({
-            "version": row.get::<_, i64>(0)?,
+            "version": version,
             "statement": row.get::<_, String>(1)?,
             "token_upper_bound": row.get::<_, u64>(2)?,
             "token_accounting": "utf8_byte_upper_bound",
-            "provenance": {
-                "kind": "explicit_principal_statement",
-                "commission_id": row.get::<_, String>(3)?,
-                "attachment_id": row.get::<_, String>(4)?,
-            },
+            "provenance": imported_provenance.unwrap_or_else(|| json!({
+                "kind": if confidence_category == "explicit" {
+                    "explicit_principal_statement"
+                } else {
+                    "inferred_learning_observation"
+                },
+                "commission_id": local_commission_id,
+                "attachment_id": local_attachment_id,
+            })),
+            "disposition": if version == current_version { "current" } else { "superseded" },
             "created_at": row.get::<_, i64>(5)?,
         }))
     })?;
@@ -1777,7 +2043,16 @@ pub(super) fn affected_attempts(
             "recorded_at": row.get::<_, Option<i64>>(6)?,
         }))
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let mut attempts = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut statement = connection.prepare(
+        "SELECT record_json FROM imported_profile_claim_attempts
+         WHERE claim_id = ?1 ORDER BY position, attempt_id",
+    )?;
+    let imported = statement.query_map([claim_id], |row| row.get::<_, String>(0))?;
+    for record in imported {
+        attempts.push(serde_json::from_str(&record?)?);
+    }
+    Ok(attempts)
 }
 
 fn scope_values(

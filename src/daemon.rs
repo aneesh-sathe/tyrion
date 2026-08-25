@@ -49,6 +49,7 @@ pub struct DaemonOptions {
     pub leave_one_shot_effect_started_before_cleanup: bool,
     pub hold_effect_before_commit_milliseconds: u64,
     pub watchdog_stall_milliseconds: u64,
+    pub memory_now_epoch_seconds: Option<i64>,
 }
 
 impl Default for DaemonOptions {
@@ -71,6 +72,7 @@ impl Default for DaemonOptions {
             leave_one_shot_effect_started_before_cleanup: false,
             hold_effect_before_commit_milliseconds: 0,
             watchdog_stall_milliseconds: 30_000,
+            memory_now_epoch_seconds: None,
         }
     }
 }
@@ -111,6 +113,7 @@ pub fn run_daemon_with_options(
         .map(Arc::new);
     store.recover_stranded_operations(credential.as_deref())?;
     let pending_cleanups = store.recover_stranded_attempts()?;
+    store.maintain_memory(options.memory_now_epoch_seconds)?;
     if !options.skip_sandbox_cleanup {
         for cleanup in pending_cleanups {
             match worker.cleanup_stranded_attempt(
@@ -507,6 +510,91 @@ fn dispatch(
                 },
                 principal_token_hash,
             )?,
+        )),
+        Command::ObserveProfilePreference {
+            commission_id,
+            preference,
+            outcome,
+            explanation,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.observe_profile_preference(
+                request,
+                commission_id,
+                preference,
+                *outcome,
+                explanation.as_deref(),
+                principal_token_hash,
+            )?,
+        )),
+        Command::ConfirmProfileClaim {
+            commission_id,
+            claim_id,
+            expected_version,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.confirm_profile_claim(
+                request,
+                commission_id,
+                claim_id,
+                *expected_version,
+                principal_token_hash,
+            )?,
+        )),
+        Command::SuppressProfileClaim {
+            commission_id,
+            claim_id,
+            expected_version,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.suppress_profile_claim(
+                request,
+                commission_id,
+                claim_id,
+                *expected_version,
+                principal_token_hash,
+            )?,
+        )),
+        Command::ForgetProfileClaim {
+            commission_id,
+            claim_id,
+            expected_version,
+            confirmation_digest,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.forget_profile_claim(
+                request,
+                commission_id,
+                claim_id,
+                *expected_version,
+                confirmation_digest.as_deref(),
+                principal_token_hash,
+            )?,
+        )),
+        Command::CreateLearningBoundary {
+            commission_id,
+            preference,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.create_learning_boundary(
+                request,
+                commission_id,
+                preference,
+                principal_token_hash,
+            )?,
+        )),
+        Command::ExportMemory { project_id } => Ok(DispatchOutcome::without_follow_up(
+            store.export_memory(request, project_id.as_deref(), principal_token_hash)?,
+        )),
+        Command::ImportMemory {
+            commission_id,
+            bundle,
+        } => Ok(DispatchOutcome::without_follow_up(store.import_memory(
+            request,
+            commission_id,
+            bundle,
+            principal_token_hash,
+        )?)),
+        Command::PinMemoryMaterial {
+            commission_id,
+            material_id,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.pin_memory_material(request, commission_id, material_id, principal_token_hash)?,
         )),
         Command::InspectProfileClaim { claim_id } => Ok(DispatchOutcome::without_follow_up(
             store.inspect_profile_claim(request, claim_id, principal_token_hash)?,
