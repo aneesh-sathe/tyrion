@@ -195,6 +195,30 @@ CREATE TABLE IF NOT EXISTS assignment_routes (
     decided_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS assignment_skill_defaults (
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    skill_name TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    requirement TEXT NOT NULL CHECK (requirement IN ('required', 'selected')),
+    provenance TEXT NOT NULL CHECK (provenance IN ('principal', 'plan', 'worker')),
+    plan_revision INTEGER NOT NULL,
+    delegation TEXT NOT NULL CHECK (delegation = 'native_unchanged'),
+    selected_at INTEGER NOT NULL,
+    PRIMARY KEY (assignment_id, skill_name)
+);
+
+CREATE TRIGGER IF NOT EXISTS assignment_skill_defaults_are_immutable_update
+BEFORE UPDATE ON assignment_skill_defaults
+BEGIN
+    SELECT RAISE(ABORT, 'Assignment Skill defaults are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS assignment_skill_defaults_are_immutable_delete
+BEFORE DELETE ON assignment_skill_defaults
+BEGIN
+    SELECT RAISE(ABORT, 'Assignment Skill defaults are immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS attention_conditions (
     id TEXT PRIMARY KEY,
     commission_id TEXT NOT NULL REFERENCES commissions(id),
@@ -343,6 +367,51 @@ CREATE TABLE IF NOT EXISTS results (
     revision_disposition TEXT NOT NULL DEFAULT 'current' CHECK (revision_disposition IN (
         'current', 'retained', 'superseded', 'stale', 'requires_revalidation'
     ))
+);
+
+CREATE TABLE IF NOT EXISTS result_skill_executions (
+    result_id TEXT NOT NULL REFERENCES results(id),
+    skill_name TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    requirement TEXT NOT NULL CHECK (requirement IN ('required', 'selected')),
+    provenance TEXT NOT NULL CHECK (provenance IN ('principal', 'plan', 'worker')),
+    worker_configuration TEXT NOT NULL,
+    assignment_class TEXT NOT NULL,
+    verification_outcome TEXT NOT NULL CHECK (verification_outcome IN ('passed', 'failed', 'uncertain')),
+    corrections INTEGER NOT NULL,
+    cost_cents INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    principal_intervention INTEGER NOT NULL CHECK (principal_intervention IN (0, 1)),
+    delegation TEXT NOT NULL CHECK (delegation = 'native_unchanged'),
+    PRIMARY KEY (result_id, skill_name)
+);
+
+CREATE TABLE IF NOT EXISTS skill_associations (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    assignment_id TEXT NOT NULL REFERENCES assignments(id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    result_id TEXT REFERENCES results(id),
+    skill_name TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    worker_configuration TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    assignment_class TEXT NOT NULL,
+    observation TEXT NOT NULL CHECK (observation IN (
+        'verified_success', 'verification_failure', 'required_skill_failure'
+    )),
+    verification_outcome TEXT NOT NULL CHECK (verification_outcome IN ('passed', 'failed', 'uncertain')),
+    corrections INTEGER NOT NULL,
+    cost_cents INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    principal_intervention INTEGER NOT NULL CHECK (principal_intervention IN (0, 1)),
+    evidence_ids_json TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    confidence_basis_points INTEGER NOT NULL CHECK (
+        confidence_basis_points BETWEEN 0 AND 10000
+    ),
+    observed_at INTEGER NOT NULL,
+    UNIQUE (attempt_id, skill_name, observation)
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -833,7 +902,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
         );
         "#,
     )?;
-    connection.pragma_update(None, "user_version", 13)?;
+    connection.pragma_update(None, "user_version", 14)?;
     Ok(())
 }
 
@@ -851,7 +920,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 13
+    Ok(user_version < 14
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -896,6 +965,9 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
             "worker_requirements_json",
         )?
         || !table_exists(connection, "assignment_routes")?
+        || !table_exists(connection, "assignment_skill_defaults")?
+        || !table_exists(connection, "result_skill_executions")?
+        || !table_exists(connection, "skill_associations")?
         || !table_exists(connection, "attention_conditions")?
         || !table_exists(connection, "workers")?
         || !table_exists(connection, "worker_commands")?
@@ -958,7 +1030,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v13", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v14", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -985,7 +1057,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 13
+    if user_version != 14
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1027,6 +1099,9 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
             "worker_requirements_json",
         )?
         || !table_exists(connection, "assignment_routes")?
+        || !table_exists(connection, "assignment_skill_defaults")?
+        || !table_exists(connection, "result_skill_executions")?
+        || !table_exists(connection, "skill_associations")?
         || !table_exists(connection, "attention_conditions")?
         || !table_exists(connection, "workers")?
         || !table_exists(connection, "worker_commands")?
@@ -1840,5 +1915,56 @@ mod tests {
             [],
         );
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn version_fourteen_adds_immutable_skill_records() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let database_path = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                DROP TRIGGER assignment_skill_defaults_are_immutable_update;
+                DROP TRIGGER assignment_skill_defaults_are_immutable_delete;
+                DROP TABLE skill_associations;
+                DROP TABLE result_skill_executions;
+                DROP TABLE assignment_skill_defaults;
+                PRAGMA user_version = 13;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(super::super::Store::open(&database_path).unwrap());
+        let connection = Connection::open(database_path).unwrap();
+        verify(&connection).unwrap();
+        assert!(table_exists(&connection, "assignment_skill_defaults").unwrap());
+        assert!(table_exists(&connection, "result_skill_executions").unwrap());
+        assert!(table_exists(&connection, "skill_associations").unwrap());
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO commissions (id, goal, status, revision, created_at)
+                VALUES ('commission-v14', 'migration fixture', 'active', 1, 1);
+                INSERT INTO assignments (id, commission_id, plan_revision, status, created_at)
+                VALUES ('assignment-v14', 'commission-v14', 1, 'ready', 1);
+                INSERT INTO assignment_skill_defaults (
+                    assignment_id, skill_name, content_digest, requirement,
+                    provenance, plan_revision, delegation, selected_at
+                ) VALUES (
+                    'assignment-v14', 'code-review',
+                    'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                    'required', 'principal', 1, 'native_unchanged', 1
+                );
+                "#,
+            )
+            .unwrap();
+        let update = connection.execute(
+            "UPDATE assignment_skill_defaults SET content_digest = 'changed'",
+            [],
+        );
+        assert!(update.is_err());
     }
 }

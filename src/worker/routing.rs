@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{AssignmentResources, WorkerRequirements};
+use crate::protocol::{AssignmentResources, SkillVersion, WorkerRequirements};
 use crate::TyrionError;
 
 const REQUIRED_ADAPTER_CAPABILITIES: [&str; 7] = [
@@ -49,7 +49,9 @@ pub(super) struct WorkerConfiguration {
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
-    pub skills: Vec<String>,
+    pub skills: Vec<SkillVersion>,
+    #[serde(default)]
+    pub selected_skills: Vec<SkillVersion>,
     pub context: WorkerContext,
     pub resource_limits: WorkerResourceLimits,
     #[serde(default)]
@@ -375,7 +377,6 @@ impl WorkerCatalog {
             }
             let named_values = [
                 ("tool", &configuration.tools),
-                ("Skill", &configuration.skills),
                 ("capability", &configuration.capabilities),
                 ("authority action", &configuration.authority_actions),
                 ("authority scope type", &configuration.authority_scope_types),
@@ -399,6 +400,38 @@ impl WorkerCatalog {
                             configuration.id, value
                         )));
                     }
+                }
+            }
+            let mut skill_names = HashSet::new();
+            for skill in &configuration.skills {
+                if !skill.is_content_identified() {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "Worker Configuration {} Skill {} requires a lowercase sha256 content digest",
+                        configuration.id, skill.name
+                    )));
+                }
+                if !skill_names.insert(skill.name.as_str()) {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "Worker Configuration {} Skill {} is duplicated",
+                        configuration.id, skill.name
+                    )));
+                }
+            }
+            let mut selected_names = HashSet::new();
+            for selected in &configuration.selected_skills {
+                if !selected.is_content_identified()
+                    || !configuration.skills.iter().any(|skill| skill == selected)
+                {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "Worker Configuration {} selected Skill {} must exactly match its native inventory",
+                        configuration.id, selected.name
+                    )));
+                }
+                if !selected_names.insert(selected.name.as_str()) {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "Worker Configuration {} selected Skill {} is duplicated",
+                        configuration.id, selected.name
+                    )));
                 }
             }
             if configuration
@@ -593,7 +626,21 @@ fn failed_gates(
     if !contains_all(&configuration.tools, &requirements.tools) {
         failures.push("required_tools");
     }
-    if !contains_all(&configuration.skills, &requirements.skills) {
+    if !contains_all(&configuration.skills, &requirements.skills)
+        || !requirements.selected_skills.iter().all(|selected| {
+            configuration
+                .skills
+                .iter()
+                .any(|available| available == &selected.version())
+        })
+        || configuration.selected_skills.iter().any(|selected| {
+            requirements.skills.iter().any(|existing| {
+                existing.name == selected.name && existing.content_digest != selected.content_digest
+            }) || requirements.selected_skills.iter().any(|existing| {
+                existing.name == selected.name && existing.content_digest != selected.content_digest
+            })
+        })
+    {
         failures.push("required_skills");
     }
     if configuration.context.capacity_tokens < requirements.min_context_tokens {
@@ -643,7 +690,7 @@ fn failed_gates(
     failures
 }
 
-fn contains_all(actual: &[String], required: &[String]) -> bool {
+fn contains_all<T: PartialEq>(actual: &[T], required: &[T]) -> bool {
     required
         .iter()
         .all(|required| actual.iter().any(|candidate| candidate == required))
@@ -709,6 +756,7 @@ fn deterministic_configuration() -> WorkerConfiguration {
         settings: BTreeMap::new(),
         tools: Vec::new(),
         skills: Vec::new(),
+        selected_skills: Vec::new(),
         context: WorkerContext {
             strategy: "exact_assignment".into(),
             capacity_tokens: u64::MAX,

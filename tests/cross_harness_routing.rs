@@ -18,6 +18,19 @@ struct RunningDaemon {
     socket_path: PathBuf,
 }
 
+fn skill_version(name: &str) -> Value {
+    let marker = match name {
+        "code-review" => "1",
+        "backend" => "2",
+        "frontend" => "3",
+        _ => "f",
+    };
+    json!({
+        "name": name,
+        "content_digest": format!("sha256:{}", marker.repeat(64)),
+    })
+}
+
 impl RunningDaemon {
     fn start(data_dir: &Path, worker_catalog: &Path) -> Self {
         Self::start_with_arguments(data_dir, worker_catalog, &["--fault-defer-ready-dispatch"])
@@ -88,6 +101,599 @@ impl Drop for RunningDaemon {
 }
 
 #[test]
+fn routed_native_skill_versions_are_pinned_and_recorded_with_verified_results() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let mut catalog = worker_catalog();
+    let versions = [
+        ("code-review", format!("sha256:{}", "1".repeat(64))),
+        ("backend", format!("sha256:{}", "2".repeat(64))),
+        ("frontend", format!("sha256:{}", "3".repeat(64))),
+    ];
+    catalog["configurations"][1]["skills"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "name": "backend",
+            "content_digest": versions[1].1
+        }));
+    catalog["configurations"][1]["selected_skills"] = json!([{
+        "name": "frontend",
+        "content_digest": versions[2].1
+    }]);
+    let catalog_path = write_worker_catalog_value(temp.path(), catalog);
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "skill-version-entry");
+    let proposal_path = temp.path().join("skill-version-proposal.json");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&json!({
+            "goal": "return a routed greeting",
+            "execution": {"kind": "deterministic"},
+            "worker_requirements": {
+                "capabilities": ["structured_lifecycle", "semantic_interrupt"],
+                "tools": ["git"],
+                "skills": [{
+                    "name": "code-review",
+                    "content_digest": versions[0].1
+                }],
+                "selected_skills": [{
+                    "version": {
+                        "name": "backend",
+                        "content_digest": versions[1].1
+                    },
+                    "provenance": "principal"
+                }],
+                "min_context_tokens": 100000,
+                "context_strategy": "fresh_with_retrieval",
+                "assignment_constraints": ["coding"]
+            },
+            "criteria": [{
+                "id": "greeting",
+                "description": "The Result contains the routed greeting",
+                "required_evidence": "exact_output",
+                "verifier_type": "deterministic",
+                "verification_depth": "standard",
+                "verifier_configuration": "deterministic-exact-match-v1",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {"kind": "exact_match", "expected": "return a routed greeting"}
+            }],
+            "authority": {
+                "repositories": [],
+                "paths": [],
+                "actions": ["deterministic.echo"],
+                "destinations": [],
+                "effects": []
+            },
+            "resource_ceilings": {
+                "max_attempts": 1,
+                "max_elapsed_seconds": 30,
+                "max_worker_concurrency": 1,
+                "max_storage_bytes": 1048576,
+                "max_model_spend_cents": 100,
+                "max_paid_service_spend_cents": 0
+            },
+            "known_uncertainties": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "versioned-native-skill",
+    );
+    let defaults = accepted["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert_eq!(defaults.len(), 1);
+    assert!(defaults.iter().any(|skill| {
+        skill["name"] == "code-review"
+            && skill["content_digest"] == versions[0].1
+            && skill["requirement"] == "required"
+            && skill["provenance"] == "principal"
+            && skill["delegation"] == "native_unchanged"
+    }));
+    assert_eq!(
+        accepted["commission"]["authority"]["actions"],
+        json!(["deterministic.echo"])
+    );
+    assert_eq!(accepted["credential_grants"], json!([]));
+
+    let completed = wait_for_commission_status(
+        &daemon,
+        &attachment_token,
+        accepted["commission"]["id"].as_str().unwrap(),
+        "verified_complete",
+    );
+    let defaults = completed["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert_eq!(defaults.len(), 3);
+    assert!(defaults.iter().any(|skill| {
+        skill["name"] == "backend"
+            && skill["content_digest"] == versions[1].1
+            && skill["requirement"] == "selected"
+            && skill["provenance"] == "principal"
+    }));
+    assert!(defaults.iter().any(|skill| {
+        skill["name"] == "frontend"
+            && skill["content_digest"] == versions[2].1
+            && skill["requirement"] == "selected"
+            && skill["provenance"] == "worker"
+    }));
+    let result_skills = completed["results"][0]["skill_executions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(result_skills.len(), 3);
+    assert!(result_skills.iter().all(|skill| {
+        skill["worker_configuration"] == "claude-opus-review"
+            && skill["assignment_class"] == "critical_path"
+            && skill["verification_outcome"] == "passed"
+            && skill["corrections"] == 0
+            && skill["cost_cents"] == 0
+            && skill["latency_ms"].as_u64().is_some()
+            && skill["principal_intervention"] == false
+    }));
+    assert_eq!(completed["skill_associations"].as_array().unwrap().len(), 3);
+    assert!(completed["skill_associations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|association| {
+            association["causal"] == false
+                && association["global_ban"] == false
+                && association["confidence_basis_points"].as_u64().is_some()
+                && association["observed_at"].as_i64().is_some()
+                && !association["evidence"].as_array().unwrap().is_empty()
+        }));
+}
+
+#[test]
+fn worker_selected_native_skill_is_pinned_only_after_observed_invocation() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let catalog_path = write_worker_catalog(temp.path());
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "worker-skill-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["goal"] = json!("invoke native Worker-selected Skill");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "worker-selected-native-skill",
+    );
+    let accepted_defaults = accepted["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert_eq!(accepted_defaults.len(), 1);
+    assert!(accepted_defaults
+        .iter()
+        .all(|skill| skill["requirement"] == "required"));
+
+    let completed = wait_for_commission_status(
+        &daemon,
+        &attachment_token,
+        accepted["commission"]["id"].as_str().unwrap(),
+        "verified_complete",
+    );
+    let defaults = completed["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert_eq!(defaults.len(), 2);
+    assert!(defaults.iter().any(|skill| {
+        skill["name"] == "frontend"
+            && skill["content_digest"] == skill_version("frontend")["content_digest"]
+            && skill["requirement"] == "selected"
+            && skill["provenance"] == "worker"
+            && skill["delegation"] == "native_unchanged"
+    }));
+    assert!(completed["results"][0]["skill_executions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|skill| skill["name"] == "frontend"));
+}
+
+#[test]
+fn observed_worker_skill_remains_pinned_after_attempt_failure() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let catalog_path = write_worker_catalog(temp.path());
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "failed-worker-skill-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["goal"] = json!("invoke native Worker-selected Skill then report structured failure");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "failed-worker-selected-native-skill",
+    );
+    let failed = wait_for_worker_status(
+        &daemon,
+        &attachment_token,
+        accepted["commission"]["id"].as_str().unwrap(),
+        "failed",
+    );
+    let defaults = failed["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert!(defaults.iter().any(|skill| {
+        skill["name"] == "frontend"
+            && skill["content_digest"] == skill_version("frontend")["content_digest"]
+            && skill["requirement"] == "selected"
+            && skill["provenance"] == "worker"
+    }));
+}
+
+#[test]
+fn observed_worker_skill_remains_pinned_after_adapter_exit() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let catalog_path = write_worker_catalog(temp.path());
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "exited-worker-skill-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["goal"] = json!("invoke native Worker-selected Skill then exit nonzero");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "exited-worker-selected-native-skill",
+    );
+    let failed = wait_for_worker_status(
+        &daemon,
+        &attachment_token,
+        accepted["commission"]["id"].as_str().unwrap(),
+        "failed",
+    );
+    let defaults = failed["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert!(defaults.iter().any(|skill| {
+        skill["name"] == "frontend"
+            && skill["content_digest"] == skill_version("frontend")["content_digest"]
+            && skill["requirement"] == "selected"
+            && skill["provenance"] == "worker"
+    }));
+}
+
+#[test]
+fn harness_reported_required_skill_failure_reroutes_without_substitution_or_global_ban() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let digest = format!("sha256:{}", "1".repeat(64));
+    let mut catalog = worker_catalog();
+    catalog["configurations"][0]["skills"]
+        .as_array_mut()
+        .unwrap()
+        .push(skill_version("frontend"));
+    catalog["configurations"][1]["selected_skills"] = json!([skill_version("frontend")]);
+    catalog["configurations"][0]["metrics"]["first_pass_acceptance"] = json!(9100);
+    let catalog_path = write_worker_catalog_value(temp.path(), catalog);
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "skill-reroute-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["goal"] = json!("fail required Skill on preferred harness");
+    proposal["worker_requirements"]["min_context_tokens"] = json!(0);
+    proposal["worker_requirements"]
+        .as_object_mut()
+        .unwrap()
+        .remove("context_strategy");
+    proposal["worker_requirements"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": digest
+    }]);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "required-skill-reroute",
+    );
+    assert_eq!(
+        accepted["assignments"][0]["route"]["selected_configuration"]["id"],
+        "claude-opus-review"
+    );
+    let completed = wait_for_commission_status(
+        &daemon,
+        &attachment_token,
+        accepted["commission"]["id"].as_str().unwrap(),
+        "verified_complete",
+    );
+    let attempts = completed["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["worker_configuration"], "claude-opus-review");
+    assert_eq!(attempts[0]["status"], "failed");
+    assert_eq!(attempts[1]["worker_configuration"], "codex-deep");
+    assert_eq!(attempts[1]["status"], "succeeded");
+    let defaults = completed["assignments"][0]["skill_defaults"]
+        .as_array()
+        .unwrap();
+    assert!(defaults.iter().all(|skill| skill["name"] != "frontend"));
+    let associations = completed["skill_associations"].as_array().unwrap();
+    let failure = associations
+        .iter()
+        .find(|association| association["observation"] == "required_skill_failure")
+        .unwrap();
+    assert_eq!(failure["skill_version"]["content_digest"], digest);
+    assert_eq!(failure["worker_configuration"], "claude-opus-review");
+    assert_eq!(failure["causal"], false);
+    assert_eq!(failure["global_ban"], false);
+    assert!(!failure["evidence"].as_array().unwrap().is_empty());
+    let success = associations
+        .iter()
+        .find(|association| {
+            association["observation"] == "verified_success"
+                && association["skill_version"]["name"] == "code-review"
+        })
+        .unwrap();
+    assert_eq!(success["skill_version"]["content_digest"], digest);
+    assert_eq!(success["worker_configuration"], "codex-deep");
+    assert!(completed["attention_conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|condition| condition["status"] == "resolved"));
+
+    proposal["goal"] = json!("report malformed required Skill failure");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let malformed = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "malformed-required-skill-report",
+    );
+    let failed = wait_for_worker_status(
+        &daemon,
+        &attachment_token,
+        malformed["commission"]["id"].as_str().unwrap(),
+        "failed",
+    );
+    assert_eq!(failed["attempts"].as_array().unwrap().len(), 1);
+    assert!(failed["skill_associations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|association| association["observation"] != "required_skill_failure"));
+}
+
+#[test]
+fn principal_and_plan_skill_selections_are_pinned_to_the_accepted_plan_revision() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let versions = [
+        ("code-review", format!("sha256:{}", "1".repeat(64))),
+        ("backend", format!("sha256:{}", "2".repeat(64))),
+        ("frontend", format!("sha256:{}", "3".repeat(64))),
+    ];
+    let mut catalog = worker_catalog();
+    for configuration in catalog["configurations"].as_array_mut().unwrap() {
+        configuration["skills"] = json!(versions
+            .iter()
+            .map(|(name, content_digest)| json!({
+                "name": name,
+                "content_digest": content_digest
+            }))
+            .collect::<Vec<_>>());
+    }
+    let catalog_path = write_worker_catalog_value(temp.path(), catalog);
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "plan-skill-entry");
+    let proposal_path = temp.path().join("plan-skill-proposal.json");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&json!({
+            "goal": "complete two skill-pinned assignments",
+            "execution": {"kind": "deterministic"},
+            "worker_requirements": {
+                "capabilities": ["commission-only-marker"],
+                "skills": [{
+                    "name": "code-review",
+                    "content_digest": versions[0].1
+                }],
+                "selected_skills": [{
+                    "version": {
+                        "name": "backend",
+                        "content_digest": versions[1].1
+                    },
+                    "provenance": "principal"
+                }]
+            },
+            "plan": {"assignments": [{
+                "id": "backend-assignment",
+                "goal": "complete backend work",
+                "dependencies": [],
+                "criterion_ids": ["backend"],
+                "purpose": "critical_path",
+                "read_scopes": [],
+                "write_scopes": [],
+                "resources": {
+                    "concurrency_slots": 1,
+                    "max_storage_bytes": 1048576,
+                    "max_model_spend_cents": 50,
+                    "max_paid_service_spend_cents": 0
+                },
+                "worker_requirements": {"selected_skills": [{
+                    "version": {
+                        "name": "frontend",
+                        "content_digest": versions[2].1
+                    },
+                    "provenance": "plan"
+                }]}
+            }, {
+                "id": "review-assignment",
+                "goal": "complete review work",
+                "dependencies": [],
+                "criterion_ids": ["review"],
+                "purpose": "independent_verification",
+                "read_scopes": [],
+                "write_scopes": [],
+                "resources": {
+                    "concurrency_slots": 1,
+                    "max_storage_bytes": 1048576,
+                    "max_model_spend_cents": 50,
+                    "max_paid_service_spend_cents": 0
+                },
+                "worker_requirements": {}
+            }]},
+            "criteria": [{
+                "id": "backend",
+                "description": "backend work completes",
+                "required_evidence": "exact_output",
+                "verifier_type": "deterministic",
+                "verification_depth": "standard",
+                "verifier_configuration": "deterministic-exact-match-v1",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {"kind": "exact_match", "expected": "return a routed greeting"}
+            }, {
+                "id": "review",
+                "description": "review work completes",
+                "required_evidence": "exact_output",
+                "verifier_type": "deterministic",
+                "verification_depth": "standard",
+                "verifier_configuration": "deterministic-exact-match-v1",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {"kind": "exact_match", "expected": "return a routed greeting"}
+            }],
+            "authority": {
+                "repositories": [],
+                "paths": [],
+                "actions": ["deterministic.echo"],
+                "destinations": [],
+                "effects": []
+            },
+            "resource_ceilings": {
+                "max_attempts": 2,
+                "max_elapsed_seconds": 30,
+                "max_worker_concurrency": 2,
+                "max_storage_bytes": 2097152,
+                "max_model_spend_cents": 100,
+                "max_paid_service_spend_cents": 0
+            },
+            "known_uncertainties": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(
+        &daemon,
+        &attachment_token,
+        &proposal_path,
+        "plan-skill-provenance",
+    );
+    assert!(accepted["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|assignment| assignment["skill_defaults"].as_array().unwrap())
+        .all(|skill| skill["requirement"] == "required"));
+    let completed = wait_for_commission_status(
+        &daemon,
+        &attachment_token,
+        accepted["commission"]["id"].as_str().unwrap(),
+        "verified_complete",
+    );
+    let backend = completed["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assignment| assignment["logical_id"] == "backend-assignment")
+        .unwrap();
+    let review = completed["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assignment| assignment["logical_id"] == "review-assignment")
+        .unwrap();
+    assert!(backend["skill_defaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|skill| {
+            skill["name"] == "backend"
+                && skill["provenance"] == "principal"
+                && skill["plan_revision"] == 1
+        }));
+    assert!(backend["skill_defaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|skill| {
+            skill["name"] == "frontend"
+                && skill["provenance"] == "plan"
+                && skill["plan_revision"] == 1
+        }));
+    assert!(review["skill_defaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|skill| {
+            skill["name"] == "backend"
+                && skill["provenance"] == "principal"
+                && skill["plan_revision"] == 1
+        }));
+    assert!(completed["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|assignment| {
+            assignment["skill_defaults"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| {
+                    skill["name"] == "code-review"
+                        && skill["requirement"] == "required"
+                        && skill["provenance"] == "principal"
+                        && skill["content_digest"] == versions[0].1
+                })
+        }));
+}
+
+#[test]
 fn codex_entry_routes_to_the_best_complete_claude_configuration() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
@@ -104,7 +710,7 @@ fn codex_entry_routes_to_the_best_complete_claude_configuration() {
             "worker_requirements": {
                 "capabilities": ["structured_lifecycle", "semantic_interrupt"],
                 "tools": ["git"],
-                "skills": ["code-review"],
+                "skills": [skill_version("code-review")],
                 "min_context_tokens": 100000,
                 "context_strategy": "fresh_with_retrieval",
                 "assignment_constraints": ["coding"]
@@ -181,7 +787,7 @@ fn codex_entry_routes_to_the_best_complete_claude_configuration() {
     assert_eq!(route["selected_configuration"]["tools"], json!(["git"]));
     assert_eq!(
         route["selected_configuration"]["skills"],
-        json!(["code-review", "frontend"])
+        json!([skill_version("code-review"), skill_version("frontend")])
     );
     assert_eq!(
         route["selected_configuration"]["context"]["strategy"],
@@ -260,7 +866,7 @@ fn every_declared_worker_eligibility_constraint_is_a_hard_gate() {
     });
     add_ineligible("missing-tool", |candidate| candidate["tools"] = json!([]));
     add_ineligible("missing-skill", |candidate| {
-        candidate["skills"] = json!(["frontend"])
+        candidate["skills"] = json!([skill_version("frontend")])
     });
     add_ineligible("insufficient-context", |candidate| {
         candidate["context"]["capacity_tokens"] = json!(99999);
@@ -434,7 +1040,7 @@ fn one_commission_routes_independent_assignments_across_codex_and_claude() {
                         "worker_requirements": {
                             "capabilities": ["structured_lifecycle", "semantic_interrupt"],
                             "tools": ["git"],
-                            "skills": ["backend"],
+                            "skills": [skill_version("backend")],
                             "min_context_tokens": 100000,
                             "assignment_constraints": ["coding"]
                         }
@@ -451,7 +1057,7 @@ fn one_commission_routes_independent_assignments_across_codex_and_claude() {
                         "worker_requirements": {
                             "capabilities": ["structured_lifecycle", "semantic_interrupt"],
                             "tools": ["git"],
-                            "skills": ["frontend"],
+                            "skills": [skill_version("frontend")],
                             "min_context_tokens": 100000,
                             "assignment_constraints": ["coding"]
                         }
@@ -535,7 +1141,7 @@ fn one_commission_executes_and_accepts_results_from_codex_and_claude_adapters() 
             "worker_requirements": {
                 "capabilities": ["structured_lifecycle", "semantic_interrupt"],
                 "tools": ["git"],
-                "skills": [skill],
+                "skills": [skill_version(skill)],
                 "min_context_tokens": 100000,
                 "assignment_constraints": ["coding"]
             }
@@ -1525,7 +2131,7 @@ fn write_deterministic_routing_proposal(root: &Path) -> PathBuf {
             "worker_requirements": {
                 "capabilities": ["structured_lifecycle", "semantic_interrupt"],
                 "tools": ["git"],
-                "skills": ["code-review"],
+                "skills": [skill_version("code-review")],
                 "min_context_tokens": 100000,
                 "context_strategy": "fresh_with_retrieval",
                 "assignment_constraints": ["coding"]
@@ -1637,7 +2243,7 @@ fn worker_catalog() -> Value {
                 "model": "gpt-5.3-codex",
                 "settings": {"reasoning_effort": "xhigh"},
                 "tools": ["git"],
-                "skills": ["code-review", "backend"],
+                "skills": [skill_version("code-review"), skill_version("backend")],
                 "context": {"strategy": "fresh_with_retrieval", "capacity_tokens": 400000},
                 "resource_limits": {
                     "max_concurrency_slots": 1,
@@ -1668,7 +2274,7 @@ fn worker_catalog() -> Value {
                 "model": "claude-opus-5",
                 "settings": {"effort": "high"},
                 "tools": ["git"],
-                "skills": ["code-review", "frontend"],
+                "skills": [skill_version("code-review"), skill_version("frontend")],
                 "context": {"strategy": "fresh_with_retrieval", "capacity_tokens": 200000},
                 "resource_limits": {
                     "max_concurrency_slots": 1,
@@ -1699,7 +2305,7 @@ fn worker_catalog() -> Value {
                 "model": "gpt-5.3-codex",
                 "settings": {"reasoning_effort": "low"},
                 "tools": ["git"],
-                "skills": ["code-review"],
+                "skills": [skill_version("code-review")],
                 "context": {"strategy": "fresh", "capacity_tokens": 64000},
                 "resource_limits": {
                     "max_concurrency_slots": 1,
@@ -1877,7 +2483,7 @@ fn daemon_responds(socket_path: &Path) -> bool {
         return false;
     };
     let request = json!({
-        "protocol_version": 1,
+        "protocol_version": 2,
         "command": {"type": "inspect_commission", "commission_id": "readiness-probe"}
     });
     if serde_json::to_writer(&mut stream, &request).is_err()

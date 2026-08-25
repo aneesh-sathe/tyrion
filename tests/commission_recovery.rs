@@ -1034,7 +1034,7 @@ fn daemon_responds(socket_path: &Path) -> bool {
         return false;
     };
     let request = json!({
-        "protocol_version": 1,
+        "protocol_version": 2,
         "command": {"type": "inspect_commission", "commission_id": "readiness-probe"}
     });
     if serde_json::to_writer(&mut stream, &request).is_err()

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{ErrorCode, TyrionError};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CommissionProposal {
@@ -57,7 +57,9 @@ pub struct WorkerRequirements {
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
-    pub skills: Vec<String>,
+    pub skills: Vec<SkillVersion>,
+    #[serde(default)]
+    pub selected_skills: Vec<SelectedSkillVersion>,
     #[serde(default)]
     pub min_context_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +70,74 @@ pub struct WorkerRequirements {
     pub require_configurations: Vec<String>,
     #[serde(default)]
     pub exclude_configurations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct SkillVersion {
+    pub name: String,
+    pub content_digest: String,
+}
+
+impl SkillVersion {
+    pub(crate) fn is_content_identified(&self) -> bool {
+        self.name.trim() == self.name
+            && !self.name.is_empty()
+            && !self.name.contains('\0')
+            && self.content_digest.len() == 71
+            && self.content_digest.starts_with("sha256:")
+            && self.content_digest[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSelectionProvenance {
+    Principal,
+    Plan,
+    Worker,
+}
+
+impl SkillSelectionProvenance {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Principal => "principal",
+            Self::Plan => "plan",
+            Self::Worker => "worker",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "principal" => Some(Self::Principal),
+            "plan" => Some(Self::Plan),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedSkillVersion {
+    pub version: SkillVersion,
+    pub provenance: SkillSelectionProvenance,
+}
+
+impl SelectedSkillVersion {
+    pub(crate) fn version(&self) -> SkillVersion {
+        self.version.clone()
+    }
+}
+
+impl std::ops::Deref for SelectedSkillVersion {
+    type Target = SkillVersion;
+
+    fn deref(&self) -> &Self::Target {
+        &self.version
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

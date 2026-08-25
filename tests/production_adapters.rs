@@ -9,8 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tyrion::adapter_contract::{validate_trace, AdapterContractExpectation, StructuredAdapterKind};
+use tyrion::protocol::SkillVersion;
 
 #[test]
 fn production_codex_adapter_uses_app_server_protocol() {
@@ -18,7 +20,7 @@ fn production_codex_adapter_uses_app_server_protocol() {
     let fake_codex = write_executable(
         &temp.path().join("codex"),
         r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
 if sys.argv[1:] != ["app-server", "--strict-config"]:
     raise RuntimeError(f"unexpected Codex arguments: {sys.argv[1:]}")
 selected_model = None
@@ -36,7 +38,7 @@ for line in sys.stdin:
         reasoning_effort = (request["params"].get("config") or {}).get("model_reasoning_effort", "medium")
         result = {"thread": {"id": "codex-production-thread"}, "model": request["params"]["model"], "reasoningEffort": reasoning_effort, "approvalPolicy": "never"}
     elif method == "skills/list":
-        skills = [{"name": "code-review", "path": "/fixture/code-review/SKILL.md", "enabled": True}] if selected_model == "gpt-skill-fixture" else []
+        skills = [{"name": "code-review", "path": os.environ["TYRION_SKILL_PATH"], "enabled": True}] if selected_model == "gpt-skill-fixture" else []
         result = {"data": [{"cwd": "/sandbox", "skills": skills, "errors": []}]}
     elif method == "turn/start":
         if selected_model == "gpt-effort-fixture":
@@ -45,7 +47,7 @@ for line in sys.stdin:
             with open(workspace + "/codex-uncommitted.txt", "w") as output:
                 output.write("saved by Codex\n")
         if selected_model == "gpt-skill-fixture":
-            assert {"type": "skill", "name": "code-review", "path": "/fixture/code-review/SKILL.md"} in request["params"]["input"]
+            assert {"type": "skill", "name": "code-review", "path": os.environ["TYRION_SKILL_PATH"]} in request["params"]["input"]
         print(json.dumps({"method": "turn/started", "params": {"turn": {"id": "turn-1", "status": "inProgress"}}}), flush=True)
         result = {"turn": {"id": "turn-1", "status": "inProgress"}}
         print(json.dumps({"id": request["id"], "result": result}), flush=True)
@@ -103,22 +105,56 @@ for line in sys.stdin:
     assert_eq!(report.terminal_state, "completed");
     assert_eq!(report.input_tokens, 9);
 
+    let skill_root = temp.path().join("codex-native-skill");
+    fs::create_dir(&skill_root).unwrap();
+    let skill_path = skill_root.join("SKILL.md");
+    fs::write(&skill_path, "# Code review\n").unwrap();
+    let skill_digest = skill_content_digest(&skill_root);
     let mut skill_launch = launch("codex_app_server", "gpt-skill-fixture");
-    skill_launch["worker_configuration"]["skills"] = json!(["code-review"]);
+    skill_launch["worker_configuration"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest
+    }]);
+    skill_launch["skill_defaults"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest,
+        "requirement": "required",
+        "provenance": "principal",
+        "delegation": "native_unchanged"
+    }]);
     let trace = run_adapter(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/codex_app_server.py"),
-        skill_launch,
-        &[("TYRION_CODEX_BINARY", fake_codex.as_os_str())],
+        skill_launch.clone(),
+        &[
+            ("TYRION_CODEX_BINARY", fake_codex.as_os_str()),
+            ("TYRION_SKILL_PATH", skill_path.as_os_str()),
+        ],
         &[],
         false,
     );
-    let required_skills = vec!["code-review".to_owned()];
+    let required_skills = vec![SkillVersion {
+        name: "code-review".to_owned(),
+        content_digest: skill_digest.clone(),
+    }];
     let report = validate_production_trace(
         StructuredAdapterKind::CodexAppServer,
         trace,
         &required_skills,
     );
     assert_eq!(report.native_skills, ["code-review"]);
+    fs::write(&skill_path, "# Changed code review\n").unwrap();
+    let output = run_adapter_output(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/codex_app_server.py"),
+        skill_launch,
+        &[
+            ("TYRION_CODEX_BINARY", fake_codex.as_os_str()),
+            ("TYRION_SKILL_PATH", skill_path.as_os_str()),
+        ],
+        &[],
+        false,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("required_skill_failure"));
 
     let git = git_bundle_fixture(temp.path(), "codex");
     let trace = run_adapter(
@@ -162,10 +198,19 @@ fn production_claude_adapter_uses_agent_sdk_messages() {
     def __init__(self, **kwargs): self.__dict__.update(kwargs)
 class TextBlock:
     def __init__(self, text): self.text = text
+class ToolUseBlock:
+    def __init__(self, name, input):
+        self.name = name
+        self.input = input
 class AssistantMessage:
-    def __init__(self, model):
-        self.model = model
-        self.content = [TextBlock("implemented by Claude")]
+    def __init__(self, options):
+        self.model = options.model
+        self.content = []
+        if options.model == "claude-fixture":
+            self.content.append(ToolUseBlock("Skill", {"skill": "code-review"}))
+        elif options.model == "claude-worker-skill-fixture":
+            self.content.append(ToolUseBlock("Skill", {"skill": "frontend"}))
+        self.content.append(TextBlock("implemented by Claude"))
         self.usage = {"input_tokens": 7, "output_tokens": 4}
         self.session_id = "claude-production-session"
 class SystemMessage:
@@ -175,8 +220,9 @@ class SystemMessage:
             "session_id": "claude-production-session",
             "model": options.model,
             "permissionMode": options.permission_mode,
-            "tools": sorted(set(options.tools) | ({"Skill"} if options.skills else set())),
-            "skills": options.skills,
+            "tools": options.tools,
+            "skills": ["code-review", "frontend"],
+            "slash_commands": ["code-review", "frontend"],
         }
 class ResultMessage:
     def __init__(self, options):
@@ -191,39 +237,65 @@ class ResultMessage:
 class ClaudeSDKClient:
     def __init__(self, options): self.options = options
     async def connect(self): pass
-    async def query(self, prompt): self.prompt = prompt
+    async def query(self, prompt): self.prompt = await prompt.__anext__()
     async def receive_response(self):
-        assert self.options.tools == []
-        assert self.options.allowed_tools == []
+        assert self.options.tools == ["Skill"]
+        assert self.options.allowed_tools == ["Skill"]
+        assert self.options.skills == "all"
+        assert not hasattr(self.options, "setting_sources")
         assert self.options.max_budget_usd == 1.0
         assert self.options.cli_path == "/fixture/claude"
+        if self.options.model in {"claude-fixture", "claude-skill-refusal"}:
+            assert "native Skill tool: code-review" in self.prompt["message"]["content"]
         if self.options.model == "claude-git-fixture":
             with open(self.options.cwd + "/claude-uncommitted.txt", "w") as output:
                 output.write("saved by Claude\n")
         yield SystemMessage(self.options)
-        yield AssistantMessage(self.options.model)
+        yield AssistantMessage(self.options)
         yield ResultMessage(self.options)
     async def interrupt(self): pass
     async def disconnect(self): pass
 "#,
     )
     .unwrap();
+    let claude_workspace = temp.path().join("claude-skill-workspace");
+    let isolated_claude_config = temp.path().join("isolated-claude-config");
+    fs::create_dir(&isolated_claude_config).unwrap();
+    let skill_root = claude_workspace.join(".claude/skills/code-review");
+    fs::create_dir_all(&skill_root).unwrap();
+    fs::write(skill_root.join("SKILL.md"), "# Code review\n").unwrap();
+    let skill_digest = skill_content_digest(&skill_root);
     let mut claude_launch = launch("claude_agent_sdk", "claude-fixture");
-    claude_launch["worker_configuration"]["skills"] = json!(["code-review"]);
+    claude_launch["worker_configuration"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest
+    }]);
+    claude_launch["skill_defaults"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest,
+        "requirement": "required",
+        "provenance": "principal",
+        "delegation": "native_unchanged"
+    }]);
     let trace = run_adapter(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/claude_sdk_adapter.py"),
-        claude_launch,
+        claude_launch.clone(),
         &[
             ("PYTHONPATH", temp.path().as_os_str()),
             (
                 "TYRION_CLAUDE_BINARY",
                 std::ffi::OsStr::new("/fixture/claude"),
             ),
+            ("TYRION_WORKSPACE_ROOT", claude_workspace.as_os_str()),
+            ("CLAUDE_CONFIG_DIR", isolated_claude_config.as_os_str()),
         ],
         &[],
         true,
     );
-    let required_skills = vec!["code-review".to_owned()];
+    let required_skills = vec![SkillVersion {
+        name: "code-review".to_owned(),
+        content_digest: skill_digest,
+    }];
     let report = validate_production_trace(
         StructuredAdapterKind::ClaudeAgentSdk,
         trace,
@@ -232,6 +304,132 @@ class ClaudeSDKClient:
     assert_eq!(report.result_summary, "implemented by Claude");
     assert_eq!(report.input_tokens, 7);
     assert_eq!(report.output_tokens, 4);
+    assert_eq!(report.cost_cents, 25);
+
+    let mut refusal_launch = claude_launch.clone();
+    refusal_launch["worker_configuration"]["model"] = json!("claude-skill-refusal");
+    let refusal_trace = run_adapter(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/claude_sdk_adapter.py"),
+        refusal_launch,
+        &[
+            ("PYTHONPATH", temp.path().as_os_str()),
+            (
+                "TYRION_CLAUDE_BINARY",
+                std::ffi::OsStr::new("/fixture/claude"),
+            ),
+            ("TYRION_WORKSPACE_ROOT", claude_workspace.as_os_str()),
+            ("CLAUDE_CONFIG_DIR", isolated_claude_config.as_os_str()),
+        ],
+        &[],
+        true,
+    );
+    assert!(refusal_trace
+        .iter()
+        .all(|event| event["type"] != "tyrion.skill.invoked"));
+
+    let frontend_skill_root = claude_workspace.join(".claude/skills/frontend");
+    fs::create_dir_all(&frontend_skill_root).unwrap();
+    fs::write(frontend_skill_root.join("SKILL.md"), "# Frontend\n").unwrap();
+    let frontend_digest = skill_content_digest(&frontend_skill_root);
+    let mut worker_selected_launch = launch("claude_agent_sdk", "claude-worker-skill-fixture");
+    worker_selected_launch["worker_configuration"]["skills"] = json!([{
+        "name": "frontend",
+        "content_digest": frontend_digest
+    }]);
+    let trace = run_adapter(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/claude_sdk_adapter.py"),
+        worker_selected_launch,
+        &[
+            ("PYTHONPATH", temp.path().as_os_str()),
+            (
+                "TYRION_CLAUDE_BINARY",
+                std::ffi::OsStr::new("/fixture/claude"),
+            ),
+            ("TYRION_WORKSPACE_ROOT", claude_workspace.as_os_str()),
+            ("CLAUDE_CONFIG_DIR", isolated_claude_config.as_os_str()),
+        ],
+        &[],
+        true,
+    );
+    let allowed_skills = [SkillVersion {
+        name: "frontend".into(),
+        content_digest: frontend_digest.clone(),
+    }];
+    let report = validate_production_trace_with_allowed(
+        StructuredAdapterKind::ClaudeAgentSdk,
+        trace,
+        &[],
+        &allowed_skills,
+    );
+    assert_eq!(
+        report.skill_versions,
+        [SkillVersion {
+            name: "frontend".into(),
+            content_digest: frontend_digest,
+        }]
+    );
+    let claude_config = temp.path().join("claude-config");
+    let personal_skill_root = claude_config.join("skills/code-review");
+    fs::create_dir_all(&personal_skill_root).unwrap();
+    fs::write(
+        personal_skill_root.join("SKILL.md"),
+        "# Personal code review\n",
+    )
+    .unwrap();
+    let personal_digest = skill_content_digest(&personal_skill_root);
+    let mut personal_launch = launch("claude_agent_sdk", "claude-fixture");
+    personal_launch["worker_configuration"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": personal_digest
+    }]);
+    personal_launch["skill_defaults"] = json!([{
+        "name": "code-review",
+        "content_digest": personal_digest,
+        "requirement": "required",
+        "provenance": "principal",
+        "delegation": "native_unchanged"
+    }]);
+    let trace = run_adapter(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/claude_sdk_adapter.py"),
+        personal_launch,
+        &[
+            ("PYTHONPATH", temp.path().as_os_str()),
+            (
+                "TYRION_CLAUDE_BINARY",
+                std::ffi::OsStr::new("/fixture/claude"),
+            ),
+            ("TYRION_WORKSPACE_ROOT", claude_workspace.as_os_str()),
+            ("CLAUDE_CONFIG_DIR", claude_config.as_os_str()),
+        ],
+        &[],
+        true,
+    );
+    validate_production_trace(
+        StructuredAdapterKind::ClaudeAgentSdk,
+        trace,
+        &[SkillVersion {
+            name: "code-review".into(),
+            content_digest: personal_digest,
+        }],
+    );
+    fs::write(skill_root.join("SKILL.md"), "# Changed code review\n").unwrap();
+    let output = run_adapter_output(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/claude_sdk_adapter.py"),
+        claude_launch,
+        &[
+            ("PYTHONPATH", temp.path().as_os_str()),
+            (
+                "TYRION_CLAUDE_BINARY",
+                std::ffi::OsStr::new("/fixture/claude"),
+            ),
+            ("TYRION_WORKSPACE_ROOT", claude_workspace.as_os_str()),
+            ("CLAUDE_CONFIG_DIR", isolated_claude_config.as_os_str()),
+        ],
+        &[],
+        false,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("required_skill_failure"));
 
     let output = run_adapter_output(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/claude_sdk_adapter.py"),
@@ -395,8 +593,17 @@ fn run_adapter_output(
 
 fn validate_production_trace(
     kind: StructuredAdapterKind,
+    trace: Vec<Value>,
+    required_skills: &[SkillVersion],
+) -> tyrion::adapter_contract::AdapterContractReport {
+    validate_production_trace_with_allowed(kind, trace, required_skills, required_skills)
+}
+
+fn validate_production_trace_with_allowed(
+    kind: StructuredAdapterKind,
     mut trace: Vec<Value>,
-    required_skills: &[String],
+    required_skills: &[SkillVersion],
+    allowed_skills: &[SkillVersion],
 ) -> tyrion::adapter_contract::AdapterContractReport {
     trace[0]["containment_enforced"] = json!(true);
     trace[0]["containment_profile"] = json!("production-test-containment");
@@ -404,8 +611,10 @@ fn validate_production_trace(
         kind,
         &trace,
         AdapterContractExpectation {
+            configuration_id: "production-configuration",
             containment_profile: "production-test-containment",
-            required_skills,
+            expected_skills: required_skills,
+            allowed_skills,
             commission_id: "commission-production",
             assignment_id: "assignment-production",
             attempt_id: "attempt-production",
@@ -421,6 +630,46 @@ fn write_executable(path: &Path, contents: &str) -> PathBuf {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     path.to_owned()
+}
+
+fn skill_content_digest(root: &Path) -> String {
+    fn collect(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) {
+        let mut entries = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                collect(root, &path, files);
+            } else {
+                assert!(metadata.is_file());
+                files.push(path.strip_prefix(root).unwrap().to_owned());
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(root, root, &mut files);
+    let mut digest = Sha256::new();
+    for relative in files {
+        let path = root.join(&relative);
+        let metadata = fs::metadata(&path).unwrap();
+        let content = fs::read(&path).unwrap();
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(if metadata.permissions().mode() & 0o111 == 0 {
+            b"0"
+        } else {
+            b"1"
+        });
+        digest.update([0]);
+        digest.update((content.len() as u64).to_be_bytes());
+        digest.update(content);
+    }
+    format!("sha256:{:x}", digest.finalize())
 }
 
 struct GitBundleFixture {

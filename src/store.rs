@@ -28,8 +28,9 @@ use crate::protocol::{
     AttachmentHandshake, AuthorityEnvelope, CommissionAmendment, CommissionPlan,
     CommissionProposal, CommissionReplayCursor, CredentialExposure, CredentialGrantRequest,
     CredentialUseMode, ExecutionSpec, OperationReconciliationOutcome, OperationRequest,
-    PlannedAssignment, Request, ResourceCeilings, VerificationAmendment, VerificationDefect,
-    VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict, Verifier, VerifierType,
+    PlannedAssignment, Request, ResourceCeilings, SelectedSkillVersion, SkillSelectionProvenance,
+    SkillVersion, VerificationAmendment, VerificationDefect, VerificationDepth,
+    VerificationEvidenceSubmission, VerificationVerdict, Verifier, VerifierType,
     WorkerRequirements, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
@@ -4866,6 +4867,8 @@ impl Store {
         let worker_id = Uuid::new_v4().to_string();
         let worker_handle = next_worker_handle(&transaction, commission_id)?;
         let started_at_ms = unix_timestamp_millis()?;
+        let skill_defaults =
+            load_attempt_skill_defaults(&transaction, &ready.assignment_id, &configuration_value)?;
         transaction.execute(
             "INSERT INTO attempts (
                 id, assignment_id, worker_configuration, status, started_at, started_at_ms
@@ -4999,6 +5002,7 @@ impl Store {
             goal: ready.goal.clone(),
             execution,
             selected_configuration: configuration_value.clone(),
+            skill_defaults,
             criteria,
             authority,
             authorized_paths,
@@ -5018,6 +5022,22 @@ impl Store {
         let terminal_telemetry = worker.live_telemetry(&attempt_id);
         if let Some(telemetry) = terminal_telemetry.as_ref() {
             self.persist_worker_telemetry(&attempt_id, telemetry)?;
+            let observed_skill_versions =
+                serde_json::from_value::<Vec<SkillVersion>>(telemetry["skill_versions"].clone())?;
+            if !observed_skill_versions.is_empty() {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                record_observed_skill_defaults(
+                    &transaction,
+                    &ready.assignment_id,
+                    &assignment.skill_defaults,
+                    &observed_skill_versions,
+                    ready.plan_revision,
+                    execution_completed_at_ms / 1000,
+                )?;
+                transaction.commit()?;
+            }
         }
         let candidate = match execution_result {
             Ok(candidate) => candidate,
@@ -5213,6 +5233,15 @@ impl Store {
             &candidate_verification,
         )?;
         if !candidate_passed {
+            record_result_skill_outcomes(
+                &transaction,
+                commission_id,
+                &ready,
+                &attempt_id,
+                &result_id,
+                "failed",
+                &candidate.usage,
+            )?;
             recover_failed_verification(
                 &transaction,
                 commission_id,
@@ -5227,6 +5256,19 @@ impl Store {
         transaction.commit()?;
 
         if ready.competition_group.is_some() && ready.purpose != "reconciliation" {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            record_result_skill_outcomes(
+                &transaction,
+                commission_id,
+                &ready,
+                &attempt_id,
+                &result_id,
+                "passed",
+                &candidate.usage,
+            )?;
+            transaction.commit()?;
             self.finish_competing_candidate(
                 commission_id,
                 &ready,
@@ -5335,6 +5377,7 @@ impl Store {
                 assembled_criteria,
                 artifacts,
                 integrated,
+                &candidate.usage,
             );
         }
         let transaction = self
@@ -5429,6 +5472,15 @@ impl Store {
             integrated.artifact_revision.as_str(),
         )?;
         if !integrated_passed {
+            record_result_skill_outcomes(
+                &transaction,
+                commission_id,
+                &ready,
+                &attempt_id,
+                &result_id,
+                "failed",
+                &candidate.usage,
+            )?;
             finish_verification(
                 &transaction,
                 &assignment.assignment_id,
@@ -5439,6 +5491,16 @@ impl Store {
             transaction.commit()?;
             return Ok(());
         }
+
+        record_result_skill_outcomes(
+            &transaction,
+            commission_id,
+            &ready,
+            &attempt_id,
+            &result_id,
+            "passed",
+            &candidate.usage,
+        )?;
 
         let every_criterion_passed = transaction.query_row(
             "SELECT NOT EXISTS(
@@ -5491,6 +5553,7 @@ impl Store {
         assembled_criteria: Vec<worker::CriterionDefinition>,
         artifacts: Vec<worker::ArtifactRecord>,
         integrated: worker::IntegratedResult,
+        usage: &Value,
     ) -> Result<(), TyrionError> {
         let mut assembled_assignment = assignment.clone();
         assembled_assignment.criteria = assembled_criteria;
@@ -5667,6 +5730,15 @@ impl Store {
             commission_id,
             ready.mandate_revision,
             integrated.artifact_revision.as_str(),
+        )?;
+        record_result_skill_outcomes(
+            &transaction,
+            commission_id,
+            ready,
+            attempt_id,
+            result_id,
+            "passed",
+            usage,
         )?;
         accept_planned_result(
             &transaction,
@@ -6476,7 +6548,8 @@ impl Store {
                 "await_principal",
                 false,
             ),
-            TyrionError::WorkerConfigurationUnavailable { .. } => (
+            TyrionError::WorkerConfigurationUnavailable { .. }
+            | TyrionError::RequiredSkillUnavailable { .. } => (
                 WorkerLeaseStatus::Revoked,
                 AssignmentStatus::Ready,
                 "worker_configuration_unavailable".to_owned(),
@@ -6535,10 +6608,16 @@ impl Store {
                 now_ms,
             ],
         )?;
-        if let TyrionError::WorkerConfigurationUnavailable {
-            configuration_id, ..
-        } = error
-        {
+        let unavailable_configuration_id = match error {
+            TyrionError::WorkerConfigurationUnavailable {
+                configuration_id, ..
+            }
+            | TyrionError::RequiredSkillUnavailable {
+                configuration_id, ..
+            } => Some(configuration_id),
+            _ => None,
+        };
+        if let Some(configuration_id) = unavailable_configuration_id {
             transaction.execute(
                 "INSERT OR REPLACE INTO worker_configuration_failures (
                     attempt_id, assignment_id, configuration_id, reason, created_at
@@ -6575,6 +6654,25 @@ impl Store {
                     "configuration_id": configuration_id,
                 }),
             )?;
+            if let TyrionError::RequiredSkillUnavailable {
+                skill_name,
+                content_digest,
+                message,
+                ..
+            } = error
+            {
+                record_required_skill_failure_association(
+                    &transaction,
+                    commission_id,
+                    assignment_id,
+                    attempt_id,
+                    configuration_id,
+                    skill_name,
+                    content_digest,
+                    message,
+                    now_ms,
+                )?;
+            }
         } else if interrupted {
             transaction.execute(
                 "INSERT INTO attention_conditions (
@@ -6950,9 +7048,6 @@ fn proposal_plan_or_legacy(
     commission_id: &str,
     transaction: &Transaction<'_>,
 ) -> Result<CommissionPlan, TyrionError> {
-    if let Some(plan) = plan {
-        return Ok(plan);
-    }
     let (
         goal,
         max_storage_bytes,
@@ -6978,6 +7073,17 @@ fn proposal_plan_or_legacy(
             ))
         },
     )?;
+    let principal_requirements: WorkerRequirements =
+        serde_json::from_str(&worker_requirements_json)?;
+    if let Some(mut plan) = plan {
+        for assignment in &mut plan.assignments {
+            assignment.worker_requirements = merge_worker_requirements(
+                &principal_requirements,
+                &assignment.worker_requirements,
+            )?;
+        }
+        return Ok(plan);
+    }
     let criterion_ids = {
         let mut statement = transaction.prepare(
             "SELECT criterion_id FROM criteria WHERE commission_id = ?1 ORDER BY position",
@@ -7000,7 +7106,7 @@ fn proposal_plan_or_legacy(
                 max_model_spend_cents,
                 max_paid_service_spend_cents,
             },
-            worker_requirements: serde_json::from_str(&worker_requirements_json)?,
+            worker_requirements: principal_requirements,
             competition: None,
         }],
     })
@@ -7079,7 +7185,33 @@ fn route_ready_assignments(
         write_scopes_json,
     ) in assignments
     {
-        let requirements: WorkerRequirements = serde_json::from_str(&requirements_json)?;
+        let mut requirements: WorkerRequirements = serde_json::from_str(&requirements_json)?;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT skill_name, content_digest
+                 FROM assignment_skill_defaults
+                 WHERE assignment_id = ?1 AND provenance = 'worker'
+                 ORDER BY skill_name",
+            )?;
+            let rows = statement.query_map([&assignment_id], |row| {
+                Ok(SelectedSkillVersion {
+                    version: SkillVersion {
+                        name: row.get(0)?,
+                        content_digest: row.get(1)?,
+                    },
+                    provenance: SkillSelectionProvenance::Worker,
+                })
+            })?;
+            for selected in rows.collect::<Result<Vec<_>, _>>()? {
+                if !requirements
+                    .selected_skills
+                    .iter()
+                    .any(|existing| existing.name == selected.name)
+                {
+                    requirements.selected_skills.push(selected);
+                }
+            }
+        }
         let has_artifact_scopes = !serde_json::from_str::<Vec<String>>(&read_scopes_json)?
             .is_empty()
             || !serde_json::from_str::<Vec<String>>(&write_scopes_json)?.is_empty();
@@ -7352,6 +7484,42 @@ fn insert_ready_assignment(
          WHERE commission_id = ?2 AND logical_id = ?3",
         params![assignment_id, commission_id, logical_id, legacy],
     )?;
+    let requirements: WorkerRequirements = transaction.query_row(
+        "SELECT worker_requirements_json FROM planned_assignments
+         WHERE commission_id = ?1 AND logical_id = ?2",
+        params![commission_id, logical_id],
+        |row| {
+            let encoded = row.get::<_, String>(0)?;
+            serde_json::from_str(&encoded).map_err(|error| invalid_json_column(0, error))
+        },
+    )?;
+    let principal_requirements: WorkerRequirements = transaction.query_row(
+        "SELECT worker_requirements_json FROM commissions WHERE id = ?1",
+        [commission_id],
+        |row| {
+            let encoded = row.get::<_, String>(0)?;
+            serde_json::from_str(&encoded).map_err(|error| invalid_json_column(0, error))
+        },
+    )?;
+    for skill in &requirements.skills {
+        insert_assignment_skill_default(
+            transaction,
+            &assignment_id,
+            skill,
+            "required",
+            if principal_requirements
+                .skills
+                .iter()
+                .any(|principal| principal == skill)
+            {
+                "principal"
+            } else {
+                "plan"
+            },
+            plan_revision,
+            created_at,
+        )?;
+    }
     record_event_with_payload(
         transaction,
         commission_id,
@@ -7364,6 +7532,192 @@ fn insert_ready_assignment(
         }),
     )?;
     Ok(assignment_id)
+}
+
+fn insert_assignment_skill_default(
+    transaction: &Transaction<'_>,
+    assignment_id: &str,
+    skill: &SkillVersion,
+    requirement: &str,
+    provenance: &str,
+    plan_revision: i64,
+    selected_at: i64,
+) -> Result<(), TyrionError> {
+    transaction.execute(
+        "INSERT INTO assignment_skill_defaults (
+            assignment_id, skill_name, content_digest, requirement, provenance,
+            plan_revision, delegation, selected_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'native_unchanged', ?7)",
+        params![
+            assignment_id,
+            skill.name,
+            skill.content_digest,
+            requirement,
+            provenance,
+            plan_revision,
+            selected_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_attempt_skill_defaults(
+    transaction: &Transaction<'_>,
+    assignment_id: &str,
+    selected_configuration: &Value,
+) -> Result<Vec<worker::AssignmentSkillDefault>, TyrionError> {
+    let mut defaults = load_assignment_skill_defaults(transaction, assignment_id)?;
+    let requirements_json = transaction.query_row(
+        "SELECT planned_assignments.worker_requirements_json
+         FROM assignment_metadata
+         JOIN planned_assignments
+           ON planned_assignments.commission_id = assignment_metadata.commission_id
+          AND planned_assignments.logical_id = assignment_metadata.logical_id
+         WHERE assignment_metadata.assignment_id = ?1",
+        [assignment_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let requirements: WorkerRequirements = serde_json::from_str(&requirements_json)?;
+    let mut selected = requirements
+        .selected_skills
+        .iter()
+        .map(|skill| (skill.version(), skill.provenance.as_str()))
+        .collect::<Vec<_>>();
+    selected.extend(
+        serde_json::from_value::<Vec<SkillVersion>>(
+            selected_configuration["selected_skills"].clone(),
+        )?
+        .into_iter()
+        .map(|skill| (skill, SkillSelectionProvenance::Worker.as_str())),
+    );
+    for (skill, provenance) in selected {
+        match defaults.iter().find(|default| default.name == skill.name) {
+            Some(default) if default.content_digest != skill.content_digest => {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "invoked Skill Version {} conflicts with the Assignment default",
+                    skill.name
+                )));
+            }
+            Some(_) => {}
+            None => defaults.push(worker::AssignmentSkillDefault {
+                version: skill,
+                requirement: worker::AssignmentSkillRequirement::Selected,
+                provenance: SkillSelectionProvenance::parse(provenance).ok_or_else(|| {
+                    TyrionError::InvalidRequest(format!(
+                        "stored Skill provenance {provenance} is invalid"
+                    ))
+                })?,
+                delegation: worker::NativeSkillDelegation::NativeUnchanged,
+            }),
+        }
+    }
+    defaults.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(defaults)
+}
+
+fn record_observed_skill_defaults(
+    transaction: &Transaction<'_>,
+    assignment_id: &str,
+    launch_defaults: &[worker::AssignmentSkillDefault],
+    invoked_versions: &[SkillVersion],
+    plan_revision: i64,
+    invoked_at: i64,
+) -> Result<(), TyrionError> {
+    for skill in invoked_versions {
+        let launch_default = launch_defaults
+            .iter()
+            .find(|default| default.name == skill.name);
+        let (requirement, provenance) = match launch_default {
+            Some(default) if default.content_digest == skill.content_digest => {
+                (default.requirement.as_str(), default.provenance.as_str())
+            }
+            Some(_) => {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "invoked Skill Version {} conflicts with the Assignment default",
+                    skill.name
+                )))
+            }
+            None => ("selected", SkillSelectionProvenance::Worker.as_str()),
+        };
+        let pinned_digest = transaction
+            .query_row(
+                "SELECT content_digest FROM assignment_skill_defaults
+                 WHERE assignment_id = ?1 AND skill_name = ?2",
+                params![assignment_id, skill.name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match pinned_digest {
+            Some(content_digest) if content_digest != skill.content_digest => {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "invoked Skill Version {} conflicts with the Assignment default",
+                    skill.name
+                )))
+            }
+            Some(_) => {}
+            None => insert_assignment_skill_default(
+                transaction,
+                assignment_id,
+                skill,
+                requirement,
+                provenance,
+                plan_revision,
+                invoked_at,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn load_assignment_skill_defaults(
+    transaction: &Transaction<'_>,
+    assignment_id: &str,
+) -> Result<Vec<worker::AssignmentSkillDefault>, TyrionError> {
+    let mut statement = transaction.prepare(
+        "SELECT skill_name, content_digest, requirement, provenance, delegation
+         FROM assignment_skill_defaults
+         WHERE assignment_id = ?1 ORDER BY skill_name",
+    )?;
+    let rows = statement.query_map([assignment_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(
+            |(name, content_digest, requirement, provenance, delegation)| {
+                Ok(worker::AssignmentSkillDefault {
+                    version: SkillVersion {
+                        name,
+                        content_digest,
+                    },
+                    requirement: worker::AssignmentSkillRequirement::parse(&requirement)
+                        .ok_or_else(|| {
+                            TyrionError::InvalidRequest(format!(
+                                "stored Skill requirement {requirement} is invalid"
+                            ))
+                        })?,
+                    provenance: SkillSelectionProvenance::parse(&provenance).ok_or_else(|| {
+                        TyrionError::InvalidRequest(format!(
+                            "stored Skill provenance {provenance} is invalid"
+                        ))
+                    })?,
+                    delegation: worker::NativeSkillDelegation::parse(&delegation).ok_or_else(
+                        || {
+                            TyrionError::InvalidRequest(format!(
+                                "stored Skill delegation {delegation} is invalid"
+                            ))
+                        },
+                    )?,
+                })
+            },
+        )
+        .collect()
 }
 
 fn load_criteria(
@@ -9598,6 +9952,230 @@ fn block_ready_assignment(
     Ok(())
 }
 
+fn record_result_skill_outcomes(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    ready: &ReadyAssignmentDispatch,
+    attempt_id: &str,
+    result_id: &str,
+    verification_outcome: &str,
+    usage: &Value,
+) -> Result<(), TyrionError> {
+    let skill_defaults = load_assignment_skill_defaults(transaction, &ready.assignment_id)?;
+    if skill_defaults.is_empty() {
+        return Ok(());
+    }
+    let (worker_configuration, configuration_json, started_at_ms, completed_at_ms) = transaction
+        .query_row(
+            "SELECT attempts.worker_configuration, workers.configuration_json,
+                    attempts.started_at_ms,
+                    COALESCE(attempts.execution_completed_at_ms, attempts.completed_at_ms,
+                             attempts.started_at_ms)
+             FROM attempts
+             JOIN workers ON workers.attempt_id = attempts.id
+             WHERE attempts.id = ?1",
+            [attempt_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+    let configuration: Value = serde_json::from_str(&configuration_json)?;
+    let harness = configuration["harness"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
+    let corrections = transaction.query_row(
+        "SELECT COUNT(*) FROM attempt_recoveries WHERE assignment_id = ?1",
+        [&ready.assignment_id],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let principal_intervention = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM worker_commands
+            JOIN workers ON workers.id = worker_commands.worker_id
+            WHERE workers.attempt_id = ?1
+         )",
+        [attempt_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let evidence_ids = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM evidence WHERE result_id = ?1 ORDER BY created_at, rowid")?;
+        let rows = statement.query_map([result_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let cost_cents = usage["cost_cents"].as_u64().unwrap_or(0);
+    let latency_ms = completed_at_ms.saturating_sub(started_at_ms).max(0) as u64;
+    let observed_at = unix_timestamp()?;
+    let observation = if verification_outcome == "passed" {
+        "verified_success"
+    } else {
+        "verification_failure"
+    };
+    let confidence_basis_points = if verification_outcome == "passed" {
+        8000_u16
+    } else {
+        6500_u16
+    };
+    for skill in skill_defaults {
+        transaction.execute(
+            "INSERT OR IGNORE INTO result_skill_executions (
+                result_id, skill_name, content_digest, requirement, provenance,
+                worker_configuration, assignment_class, verification_outcome,
+                corrections, cost_cents, latency_ms, principal_intervention, delegation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                       ?13)",
+            params![
+                result_id,
+                skill.name,
+                skill.content_digest,
+                skill.requirement.as_str(),
+                skill.provenance.as_str(),
+                worker_configuration,
+                ready.purpose,
+                verification_outcome,
+                corrections,
+                cost_cents,
+                latency_ms,
+                principal_intervention,
+                skill.delegation.as_str(),
+            ],
+        )?;
+        let scope = serde_json::json!({
+            "commission_id": commission_id,
+            "assignment_id": ready.assignment_id,
+            "worker_configuration": worker_configuration,
+            "harness": harness,
+            "assignment_class": ready.purpose,
+        });
+        transaction.execute(
+            "INSERT OR IGNORE INTO skill_associations (
+                id, commission_id, assignment_id, attempt_id, result_id,
+                skill_name, content_digest, worker_configuration, harness,
+                assignment_class, observation, verification_outcome, corrections,
+                cost_cents, latency_ms, principal_intervention, evidence_ids_json,
+                scope_json, confidence_basis_points, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                       ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                Uuid::new_v4().to_string(),
+                commission_id,
+                ready.assignment_id,
+                attempt_id,
+                result_id,
+                skill.name,
+                skill.content_digest,
+                worker_configuration,
+                harness,
+                ready.purpose,
+                observation,
+                verification_outcome,
+                corrections,
+                cost_cents,
+                latency_ms,
+                principal_intervention,
+                serde_json::to_string(&evidence_ids)?,
+                serde_json::to_string(&scope)?,
+                confidence_basis_points,
+                observed_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_required_skill_failure_association(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    assignment_id: &str,
+    attempt_id: &str,
+    worker_configuration: &str,
+    skill_name: &str,
+    content_digest: &str,
+    message: &str,
+    observed_at_ms: i64,
+) -> Result<(), TyrionError> {
+    let (configuration_json, assignment_class, started_at_ms) = transaction.query_row(
+        "SELECT workers.configuration_json, assignment_metadata.purpose,
+                attempts.started_at_ms
+         FROM workers
+         JOIN attempts ON attempts.id = workers.attempt_id
+         JOIN assignment_metadata ON assignment_metadata.assignment_id = attempts.assignment_id
+         WHERE attempts.id = ?1",
+        [attempt_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let configuration: Value = serde_json::from_str(&configuration_json)?;
+    let harness = configuration["harness"].as_str().unwrap_or("unknown");
+    let corrections = transaction.query_row(
+        "SELECT COUNT(*) FROM attempt_recoveries WHERE assignment_id = ?1",
+        [assignment_id],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let principal_intervention = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM worker_commands
+            JOIN workers ON workers.id = worker_commands.worker_id
+            WHERE workers.attempt_id = ?1
+         )",
+        [attempt_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let evidence = serde_json::json!([{
+        "kind": "harness_report",
+        "attempt_id": attempt_id,
+        "message": message,
+    }]);
+    let scope = serde_json::json!({
+        "commission_id": commission_id,
+        "assignment_id": assignment_id,
+        "worker_configuration": worker_configuration,
+        "harness": harness,
+        "assignment_class": assignment_class,
+    });
+    transaction.execute(
+        "INSERT OR IGNORE INTO skill_associations (
+            id, commission_id, assignment_id, attempt_id, result_id,
+            skill_name, content_digest, worker_configuration, harness,
+            assignment_class, observation, verification_outcome, corrections,
+            cost_cents, latency_ms, principal_intervention, evidence_ids_json,
+            scope_json, confidence_basis_points, observed_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9,
+                   'required_skill_failure', 'uncertain', ?10, 0, ?11, ?12,
+                   ?13, ?14, 6000, ?15)",
+        params![
+            Uuid::new_v4().to_string(),
+            commission_id,
+            assignment_id,
+            attempt_id,
+            skill_name,
+            content_digest,
+            worker_configuration,
+            harness,
+            assignment_class,
+            corrections,
+            observed_at_ms.saturating_sub(started_at_ms).max(0),
+            principal_intervention,
+            serde_json::to_string(&evidence)?,
+            serde_json::to_string(&scope)?,
+            observed_at_ms / 1000,
+        ],
+    )?;
+    Ok(())
+}
+
 fn record_attempt_recovery(
     transaction: &Transaction<'_>,
     recovery: AttemptRecovery<'_>,
@@ -10012,7 +10590,10 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     if proposal.goal.trim().is_empty() {
         return Err(TyrionError::InvalidRequest("goal must not be empty".into()));
     }
-    validate_worker_requirements(&proposal.worker_requirements)?;
+    validate_worker_requirements(
+        &proposal.worker_requirements,
+        SkillSelectionProvenance::Principal,
+    )?;
     validate_acceptance_criteria(&proposal.execution, &proposal.criteria)?;
     if proposal.resource_ceilings.max_attempts == 0
         || proposal.resource_ceilings.max_elapsed_seconds == 0
@@ -10163,7 +10744,14 @@ fn validate_commission_plan(
                 assignment.id
             )));
         }
-        validate_worker_requirements(&assignment.worker_requirements)?;
+        validate_worker_requirements(
+            &assignment.worker_requirements,
+            SkillSelectionProvenance::Plan,
+        )?;
+        merge_worker_requirements(
+            &proposal.worker_requirements,
+            &assignment.worker_requirements,
+        )?;
         for criterion_id in &assignment.criterion_ids {
             if !criterion_ids.contains(criterion_id.as_str()) {
                 return Err(TyrionError::InvalidRequest(format!(
@@ -10372,11 +10960,13 @@ fn validate_commission_plan(
     Ok(())
 }
 
-fn validate_worker_requirements(requirements: &WorkerRequirements) -> Result<(), TyrionError> {
+fn validate_worker_requirements(
+    requirements: &WorkerRequirements,
+    expected_selection_provenance: SkillSelectionProvenance,
+) -> Result<(), TyrionError> {
     let named_sets = [
         ("capability", &requirements.capabilities),
         ("tool", &requirements.tools),
-        ("Skill", &requirements.skills),
         (
             "Assignment constraint",
             &requirements.assignment_constraints,
@@ -10405,6 +10995,46 @@ fn validate_worker_requirements(requirements: &WorkerRequirements) -> Result<(),
             }
         }
     }
+    let mut skill_names = HashSet::new();
+    for skill in &requirements.skills {
+        if !skill.is_content_identified() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Required Skill Version {} requires a lowercase sha256 content digest",
+                skill.name
+            )));
+        }
+        if !skill_names.insert(skill.name.as_str()) {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Required Skill Version {} is duplicated",
+                skill.name
+            )));
+        }
+    }
+    let mut selected_names = HashSet::new();
+    for selected in &requirements.selected_skills {
+        let version = selected.version();
+        if !version.is_content_identified() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Selected Skill Version {} requires a lowercase sha256 content digest",
+                selected.name
+            )));
+        }
+        if selected.provenance != expected_selection_provenance {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Selected Skill Version {} must use {} provenance in this constraint",
+                selected.name,
+                expected_selection_provenance.as_str()
+            )));
+        }
+        if !selected_names.insert(selected.name.as_str())
+            || skill_names.contains(selected.name.as_str())
+        {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Skill Version {} cannot be selected more than once or also be required",
+                selected.name
+            )));
+        }
+    }
     if requirements
         .context_strategy
         .as_deref()
@@ -10424,6 +11054,56 @@ fn validate_worker_requirements(requirements: &WorkerRequirements) -> Result<(),
         ));
     }
     Ok(())
+}
+
+fn merge_worker_requirements(
+    principal: &WorkerRequirements,
+    planned: &WorkerRequirements,
+) -> Result<WorkerRequirements, TyrionError> {
+    let mut skills = principal.skills.clone();
+    for skill in &planned.skills {
+        if let Some(existing) = skills.iter().find(|existing| existing.name == skill.name) {
+            if existing != skill {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Required Skill Version {} conflicts between Principal and plan constraints",
+                    skill.name
+                )));
+            }
+        } else {
+            skills.push(skill.clone());
+        }
+    }
+    let mut selected_skills = principal.selected_skills.clone();
+    for selected in &planned.selected_skills {
+        if let Some(existing) = selected_skills
+            .iter()
+            .find(|existing| existing.name == selected.name)
+        {
+            if existing.content_digest != selected.content_digest {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Selected Skill Version {} conflicts between Principal and plan constraints",
+                    selected.name
+                )));
+            }
+        } else {
+            selected_skills.push(selected.clone());
+        }
+    }
+    for skill in &skills {
+        if selected_skills
+            .iter()
+            .any(|selected| selected.name == skill.name)
+        {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Skill Version {} cannot be both required and optionally selected",
+                skill.name
+            )));
+        }
+    }
+    let mut merged = planned.clone();
+    merged.skills = skills;
+    merged.selected_skills = selected_skills;
+    Ok(merged)
 }
 
 fn comparison_resources(

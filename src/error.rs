@@ -69,6 +69,15 @@ pub enum TyrionError {
         message: String,
     },
     #[error(
+        "Worker Configuration {configuration_id} could not execute Required Skill Version {skill_name}@{content_digest}: {message}"
+    )]
+    RequiredSkillUnavailable {
+        configuration_id: String,
+        skill_name: String,
+        content_digest: String,
+        message: String,
+    },
+    #[error(
         "max_storage_bytes exceeded: Git artifacts require at least {required_bytes} bytes; start a new Commission with max_storage_bytes of {required_bytes} or more (current ceiling: {ceiling_bytes})."
     )]
     StorageCeilingExceeded {
@@ -103,6 +112,7 @@ impl TyrionError {
             | Self::WorkerInterrupted
             | Self::WatchdogContained { .. }
             | Self::WorkerConfigurationUnavailable { .. }
+            | Self::RequiredSkillUnavailable { .. }
             | Self::StorageCeilingExceeded { .. }
             | Self::IntegrationFailure { .. } => ErrorCode::InvalidRequest,
             Self::Io(_) | Self::Database(_) | Self::Serialization(_) => ErrorCode::Internal,

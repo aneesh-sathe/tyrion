@@ -18,6 +18,14 @@ struct RunningDaemon {
     socket_path: PathBuf,
 }
 
+fn skill_version(name: &str) -> Value {
+    let marker = if name == "backend" { "2" } else { "3" };
+    json!({
+        "name": name,
+        "content_digest": format!("sha256:{}", marker.repeat(64)),
+    })
+}
+
 impl RunningDaemon {
     fn start(data_dir: &Path, worker_config: &Path, _fake_state: &Path) -> Self {
         Self::start_with_arguments(data_dir, worker_config, &[])
@@ -402,7 +410,7 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
             "model": format!("{harness}-fixture-model"),
             "settings": {"mode": "structured_git"},
             "tools": ["git"],
-            "skills": [skill],
+            "skills": [skill_version(skill)],
             "context": {"strategy": "fresh", "capacity_tokens": 100000},
             "resource_limits": {
                 "max_concurrency_slots": 1,
@@ -451,14 +459,14 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
     value["plan"]["assignments"][0]["worker_requirements"] = json!({
         "capabilities": ["structured_lifecycle", "semantic_interrupt"],
         "tools": ["git"],
-        "skills": ["backend"],
+        "skills": [skill_version("backend")],
         "min_context_tokens": 100000,
         "assignment_constraints": ["coding"]
     });
     value["plan"]["assignments"][1]["worker_requirements"] = json!({
         "capabilities": ["structured_lifecycle", "semantic_interrupt"],
         "tools": ["git"],
-        "skills": ["frontend"],
+        "skills": [skill_version("frontend")],
         "min_context_tokens": 100000,
         "assignment_constraints": ["coding"]
     });
@@ -1960,7 +1968,7 @@ fn daemon_responds(socket_path: &Path) -> bool {
         return false;
     };
     let request = json!({
-        "protocol_version": 1,
+        "protocol_version": 2,
         "command": {"type": "inspect_commission", "commission_id": "readiness-probe"}
     });
     if serde_json::to_writer(&mut stream, &request).is_err()

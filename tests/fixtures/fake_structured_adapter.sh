@@ -6,13 +6,69 @@ case "$launch" in
   *) echo 'missing structured launch' >&2; exit 2 ;;
 esac
 kind=${1:?adapter kind is required}
+case "$launch:$kind" in
+  *'report malformed required Skill failure'*:claude)
+    printf '%s\n' '{"type":"tyrion.adapter.unavailable","code":"required_skill_failure","skill":{"name":"code-review","content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"message":"malformed fixture report"}'
+    exit 7
+    ;;
+  *'fail required Skill on preferred harness'*:claude)
+    printf '%s\n' "$launch" | python3 -c '
+import json, sys
+launch = json.load(sys.stdin)
+skill = next(item for item in launch["skill_defaults"] if item["requirement"] == "required")
+print(json.dumps({
+    "type": "tyrion.adapter.unavailable",
+    "code": "required_skill_failure",
+    "skill": {"name": skill["name"], "content_digest": skill["content_digest"]},
+    "message": "Claude native Skill activation failed in the fixture",
+}, separators=(",", ":")))
+'
+    exit 7
+    ;;
+esac
+printf '%s\n' "$launch" | TYRION_FIXTURE_KIND="$kind" python3 -c '
+import json, os, sys
+launch = json.load(sys.stdin)
+kind = os.environ["TYRION_FIXTURE_KIND"]
+session = "codex-thread-fixture" if kind == "codex" else "claude-session-fixture"
+inventory = launch["worker_configuration"].get("skills", [])
+names = sorted(skill["name"] if isinstance(skill, dict) else skill for skill in inventory)
+preparations = [
+    {
+        "name": skill["name"],
+        "content_digest": skill["content_digest"],
+        "source": "fixture",
+    }
+    for skill in launch.get("skill_defaults", [])
+]
+print(json.dumps({
+    "type": "tyrion.adapter.ready",
+    "native_session_id": session,
+    "native_skills": names,
+    "native_skill_preparations": preparations,
+    "configuration_fingerprint": os.environ["TYRION_CONFIGURATION_FINGERPRINT"],
+}, separators=(",", ":")))
+for skill in preparations:
+    print(json.dumps({"type": "tyrion.skill.invoked", **skill}, separators=(",", ":")))
+if "invoke native Worker-selected Skill" in launch["goal"]:
+    skill = next(skill for skill in inventory if skill["name"] == "frontend")
+    print(json.dumps({
+        "type": "tyrion.skill.invoked",
+        "name": skill["name"],
+        "content_digest": skill["content_digest"],
+        "source": "fixture",
+    }, separators=(",", ":")))
+'
+case "$launch" in
+  *'invoke native Worker-selected Skill then exit nonzero'*)
+    exit 9
+    ;;
+esac
 if [ "$kind" = codex ]; then
   printf '%s\n' \
-    "{\"type\":\"tyrion.adapter.ready\",\"native_session_id\":\"codex-thread-fixture\",\"native_skills\":[\"code-review\",\"backend\",\"frontend\"],\"native_skill_outcomes\":[{\"name\":\"code-review\",\"outcome\":\"activated\",\"source\":\"fixture\"},{\"name\":\"backend\",\"outcome\":\"activated\",\"source\":\"fixture\"},{\"name\":\"frontend\",\"outcome\":\"activated\",\"source\":\"fixture\"}],\"configuration_fingerprint\":\"$TYRION_CONFIGURATION_FINGERPRINT\"}" \
     '{"method":"turn/started","params":{"turn":{"status":"inProgress"}}}'
 else
   printf '%s\n' \
-    "{\"type\":\"tyrion.adapter.ready\",\"native_session_id\":\"claude-session-fixture\",\"native_skills\":[\"code-review\",\"backend\",\"frontend\"],\"native_skill_outcomes\":[{\"name\":\"code-review\",\"outcome\":\"activated\",\"source\":\"fixture\"},{\"name\":\"backend\",\"outcome\":\"activated\",\"source\":\"fixture\"},{\"name\":\"frontend\",\"outcome\":\"activated\",\"source\":\"fixture\"}],\"configuration_fingerprint\":\"$TYRION_CONFIGURATION_FINGERPRINT\"}" \
     '{"type":"session.status_running"}'
 fi
 if [ -n "${TYRION_CANDIDATE_BUNDLE:-}" ]; then
@@ -89,6 +145,6 @@ else
     '{"type":"span.model_request_end","usage":{"input_tokens":10,"output_tokens":5}}' \
     '{"type":"session.status_idle"}'
 fi
-printf '{"type":"tyrion.result","commission_id":"%s","assignment_id":"%s","attempt_id":"%s","mandate_revision":%s,"plan_revision":%s,"summary":"return a routed greeting","known_effects":[]}\n' \
+printf '{"type":"tyrion.result","commission_id":"%s","assignment_id":"%s","attempt_id":"%s","mandate_revision":%s,"plan_revision":%s,"summary":"return a routed greeting","known_effects":[],"cost_cents":0}\n' \
   "$TYRION_COMMISSION_ID" "$TYRION_ASSIGNMENT_ID" "$TYRION_ATTEMPT_ID" \
   "$TYRION_MANDATE_REVISION" "$TYRION_PLAN_REVISION"

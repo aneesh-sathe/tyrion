@@ -10,8 +10,10 @@ use super::contained_codex::{ContainedCodexRuntime, StructuredGitAttempt};
 use super::routing::{WorkerAdapterKind, WorkerConfiguration};
 use super::{AssignmentContext, WorkerControl};
 use crate::adapter_contract::{
-    validate_trace, AdapterContractExpectation, AdapterContractReport, StructuredAdapterKind,
+    validate_observed_skill_invocations, validate_trace, AdapterContractExpectation,
+    AdapterContractReport, StructuredAdapterKind,
 };
+use crate::protocol::SkillVersion;
 use crate::TyrionError;
 
 pub(super) fn execute(
@@ -78,6 +80,7 @@ pub(super) fn execute(
                 },
                 "lease_expires_at": assignment.lease_expires_at,
                 "worker_configuration": configuration,
+                "skill_defaults": assignment.skill_defaults,
                 "configuration_fingerprint": configuration_fingerprint,
                 "git_artifacts": git_attempt.map(StructuredGitAttempt::launch_payload),
             }),
@@ -183,7 +186,53 @@ pub(super) fn execute(
     let stderr = error_reader
         .join()
         .map_err(|_| TyrionError::InvalidRequest("adapter error reader panicked".into()))??;
+    if events
+        .first()
+        .is_some_and(|event| event["type"] == "tyrion.adapter.ready")
+    {
+        let observed = validate_observed_skill_invocations(&events, &configuration.skills)?;
+        control.record_validated_skill_versions(&observed)?;
+    }
     if !status.success() {
+        if let Some(failure) = events.iter().find(|event| {
+            event["type"] == "tyrion.adapter.unavailable"
+                && event["code"] == "required_skill_failure"
+        }) {
+            let skill_name = failure["skill"]["name"].as_str().ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "required Skill failure report is missing its Skill name".into(),
+                )
+            })?;
+            let content_digest = failure["skill"]["content_digest"].as_str().ok_or_else(|| {
+                TyrionError::InvalidRequest(
+                    "required Skill failure report is missing its content identity".into(),
+                )
+            })?;
+            let pinned = assignment
+                .skill_defaults
+                .iter()
+                .any(|skill| skill.name == skill_name && skill.content_digest == content_digest);
+            if !pinned {
+                return Err(TyrionError::InvalidRequest(
+                    "required Skill failure report does not match an exact pinned Assignment default"
+                        .into(),
+                ));
+            }
+            let message = failure["message"]
+                .as_str()
+                .filter(|message| !message.is_empty())
+                .ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "required Skill failure report is missing its message".into(),
+                    )
+                })?;
+            return Err(TyrionError::RequiredSkillUnavailable {
+                configuration_id: configuration.id.clone(),
+                skill_name: skill_name.to_owned(),
+                content_digest: content_digest.to_owned(),
+                message: message.to_owned(),
+            });
+        }
         let message = format!(
             "structured Worker adapter {} exited with {status}: {}",
             configuration.id,
@@ -197,12 +246,22 @@ pub(super) fn execute(
         }
         return Err(TyrionError::InvalidRequest(message));
     }
+    let expected_skills = assignment
+        .skill_defaults
+        .iter()
+        .map(|skill| SkillVersion {
+            name: skill.name.clone(),
+            content_digest: skill.content_digest.clone(),
+        })
+        .collect::<Vec<_>>();
     let report = validate_trace(
         kind,
         &events,
         AdapterContractExpectation {
+            configuration_id: &configuration.id,
             containment_profile: &configuration.containment_profile,
-            required_skills: &configuration.skills,
+            expected_skills: &expected_skills,
+            allowed_skills: &configuration.skills,
             commission_id: &assignment.commission_id,
             assignment_id: &assignment.assignment_id,
             attempt_id: &assignment.attempt_id,

@@ -10,8 +10,8 @@ use serde::Serialize;
 use crate::artifact::ArtifactRevision;
 use crate::domain::EvidenceOutcome;
 use crate::protocol::{
-    AssignmentResources, AuthorityEnvelope, ExecutionSpec, VerificationDefect, VerificationDepth,
-    Verifier, VerifierType, WorkerRequirements,
+    AssignmentResources, AuthorityEnvelope, ExecutionSpec, SkillVersion, VerificationDefect,
+    VerificationDepth, Verifier, VerifierType, WorkerRequirements,
 };
 use crate::TyrionError;
 
@@ -78,6 +78,7 @@ struct LiveWorkerTelemetry {
     input_tokens: u64,
     output_tokens: u64,
     usage_reported: bool,
+    skill_versions: Vec<SkillVersion>,
 }
 
 impl WorkerControl {
@@ -209,6 +210,19 @@ impl WorkerControl {
         }
         Ok(())
     }
+
+    pub(in crate::worker) fn record_validated_skill_versions(
+        &self,
+        skill_versions: &[SkillVersion],
+    ) -> Result<(), TyrionError> {
+        self.telemetry
+            .lock()
+            .map_err(|_| {
+                TyrionError::InvalidRequest("Worker telemetry channel is unavailable".into())
+            })?
+            .skill_versions = skill_versions.to_vec();
+        Ok(())
+    }
 }
 
 fn write_adapter_control(
@@ -231,6 +245,7 @@ pub(crate) struct AssignmentContext {
     pub goal: String,
     pub execution: ExecutionSpec,
     pub selected_configuration: serde_json::Value,
+    pub skill_defaults: Vec<AssignmentSkillDefault>,
     pub criteria: Vec<CriterionDefinition>,
     pub authority: AuthorityEnvelope,
     pub authorized_paths: Vec<String>,
@@ -240,6 +255,68 @@ pub(crate) struct AssignmentContext {
     pub max_model_spend_cents: u64,
     pub max_paid_service_spend_cents: u64,
     pub lease_expires_at: i64,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct AssignmentSkillDefault {
+    #[serde(flatten)]
+    pub version: crate::protocol::SkillVersion,
+    pub requirement: AssignmentSkillRequirement,
+    pub provenance: crate::protocol::SkillSelectionProvenance,
+    pub delegation: NativeSkillDelegation,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AssignmentSkillRequirement {
+    Required,
+    Selected,
+}
+
+impl AssignmentSkillRequirement {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Selected => "selected",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "required" => Some(Self::Required),
+            "selected" => Some(Self::Selected),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeSkillDelegation {
+    NativeUnchanged,
+}
+
+impl NativeSkillDelegation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeUnchanged => "native_unchanged",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "native_unchanged" => Some(Self::NativeUnchanged),
+            _ => None,
+        }
+    }
+}
+
+impl std::ops::Deref for AssignmentSkillDefault {
+    type Target = crate::protocol::SkillVersion;
+
+    fn deref(&self) -> &Self::Target {
+        &self.version
+    }
 }
 
 #[derive(Clone)]
@@ -648,6 +725,7 @@ impl WorkerRuntime {
             } else {
                 serde_json::json!({})
             },
+            "skill_versions": telemetry.skill_versions,
         }))
     }
 
@@ -785,6 +863,7 @@ impl WorkerRuntime {
                         usage: serde_json::json!({
                             "input_tokens": report.input_tokens,
                             "output_tokens": report.output_tokens,
+                            "cost_cents": report.cost_cents,
                         }),
                         latest_meaningful_activity: report.latest_meaningful_activity,
                         state: CandidateState::Deterministic,
@@ -835,6 +914,7 @@ impl WorkerRuntime {
                         usage: serde_json::json!({
                             "input_tokens": report.input_tokens,
                             "output_tokens": report.output_tokens,
+                            "cost_cents": report.cost_cents,
                         }),
                         latest_meaningful_activity: report.latest_meaningful_activity,
                         state: CandidateState::CodexGit(candidate.state),

@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 
+from native_skill import RequiredSkillFailure, skill_content_digest
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -17,6 +19,7 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolUseBlock,
 )
 
 
@@ -75,9 +78,17 @@ def prompt(launch):
         "fresh": "Start from only this accepted Assignment context; do not resume prior session context.",
         "fresh_with_retrieval": "Start fresh, use the accepted context below, and retrieve relevant workspace context with the configured tools and Skills before acting.",
     }[context_strategy]
-    return "\n".join(
+    selected_skills = launch.get("skill_defaults", [])
+    assignment = "\n".join(
         [
             context_instruction,
+            (
+                "Before doing any other work, invoke these exact names through the "
+                "native Skill tool: "
+                + ", ".join(skill["name"] for skill in selected_skills)
+                if selected_skills
+                else "No native Skill invocation is pinned for this Assignment."
+            ),
             "Complete this Tyrion Assignment inside the current workspace.",
             f"Goal: {launch['goal']}",
             f"Acceptance criteria: {json.dumps(launch['criteria'], separators=(',', ':'))}",
@@ -87,6 +98,7 @@ def prompt(launch):
             "Return JSON with a non-empty summary and known_effects as an empty array.",
         ]
     )
+    return assignment
 
 
 def clarification_text(control):
@@ -132,6 +144,47 @@ def native_init_list(data, field):
     return sorted(set(value))
 
 
+def claude_skill_path(repository, name, configured_paths):
+    if not isinstance(configured_paths, dict):
+        raise RuntimeError("Claude native_skill_paths setting must be an object")
+    configured = configured_paths.get(name)
+    if configured is not None:
+        if not isinstance(configured, str) or not os.path.isabs(configured):
+            raise RuntimeError(f"Claude native Skill path for {name} must be absolute")
+        if not os.path.isfile(configured):
+            raise RuntimeError(f"Claude native Skill {name} is unavailable at {configured}")
+        return configured
+
+    config_root = os.environ.get(
+        "CLAUDE_CONFIG_DIR", os.path.join(os.path.expanduser("~"), ".claude")
+    )
+    candidates = [os.path.join(config_root, "skills", name, "SKILL.md")]
+    repository = os.path.abspath(repository)
+    result = subprocess.run(
+        ["git", "-C", repository, "rev-parse", "--show-toplevel"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    project_root = result.stdout.strip() if result.returncode == 0 else repository
+    directory = repository
+    while True:
+        candidates.append(os.path.join(directory, ".claude", "skills", name, "SKILL.md"))
+        if directory == project_root:
+            break
+        parent = os.path.dirname(directory)
+        if parent == directory or os.path.commonpath([project_root, parent]) != project_root:
+            break
+        directory = parent
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise RuntimeError(
+        f"Claude native discovery found no inspectable package path for Skill {name}"
+    )
+
+
 async def run():
     launch = json.loads(await asyncio.to_thread(sys.stdin.readline))
     if launch.get("type") != "tyrion.assignment.launch":
@@ -145,7 +198,7 @@ async def run():
         raise RuntimeError("Claude adapter does not permit paid service spend")
     model_budget_usd = resource_limits["max_model_spend_cents"] / 100
     settings = configuration.get("settings", {})
-    supported = {"effort", "max_turns"}
+    supported = {"effort", "max_turns", "native_skill_paths"}
     unknown = sorted(set(settings) - supported)
     if unknown:
         raise RuntimeError(f"unsupported Claude settings: {', '.join(unknown)}")
@@ -153,8 +206,38 @@ async def run():
     input_queue = asyncio.Queue()
     control_lines = asyncio.Queue()
     interrupted = False
-    configured_tools = native_tools(configuration.get("tools", []))
-    configured_skills = sorted(set(configuration.get("skills", [])))
+    configured_tools = sorted(set(native_tools(configuration.get("tools", []))) | {"Skill"})
+    selected_skills = launch.get("skill_defaults", [])
+    configured_skills = sorted(skill["name"] for skill in selected_skills)
+    configured_versions = {
+        skill["name"]: skill["content_digest"]
+        for skill in configuration.get("skills", [])
+    }
+    selected_skill_paths = {}
+    invoked_skills = set()
+    for skill in selected_skills:
+        name = skill["name"]
+        if (
+            skill.get("delegation") != "native_unchanged"
+            or configured_versions.get(name) != skill["content_digest"]
+        ):
+            raise RequiredSkillFailure(
+                skill, f"Claude selected a different Skill Version for {name}"
+            )
+        try:
+            path = claude_skill_path(
+                repository, name, settings.get("native_skill_paths", {})
+            )
+        except RuntimeError as error:
+            raise RequiredSkillFailure(skill, str(error)) from error
+        actual_digest = skill_content_digest(path)
+        if actual_digest != skill["content_digest"]:
+            raise RequiredSkillFailure(
+                skill,
+                f"Claude native Skill {name} content changed: expected "
+                f"{skill['content_digest']}, actual {actual_digest}",
+            )
+        selected_skill_paths[name] = path
 
     async def inputs():
         yield {
@@ -173,8 +256,7 @@ async def run():
         permission_mode="bypassPermissions",
         tools=configured_tools,
         allowed_tools=configured_tools,
-        skills=configured_skills,
-        setting_sources=["project"],
+        skills="all",
         effort=settings.get("effort"),
         max_turns=settings.get("max_turns"),
         max_budget_usd=model_budget_usd,
@@ -242,15 +324,17 @@ async def run():
                 effective_skills = native_init_list(message.data, "skills")
                 missing_skills = sorted(set(configured_skills) - set(effective_skills))
                 if missing_skills:
-                    raise RuntimeError(
-                        "Claude did not load required Skills: " + ", ".join(missing_skills)
+                    skill = next(
+                        skill
+                        for skill in selected_skills
+                        if skill["name"] == missing_skills[0]
+                    )
+                    raise RequiredSkillFailure(
+                        skill,
+                        "Claude did not load required Skill " + missing_skills[0],
                     )
                 effective_tools = native_init_list(message.data, "tools")
-                expected_tools = sorted(
-                    set(configured_tools)
-                    | ({"Skill"} if configured_skills else set())
-                )
-                if effective_tools != expected_tools:
+                if effective_tools != configured_tools:
                     raise RuntimeError(
                         "Claude native tool inventory does not match the selected configuration"
                     )
@@ -261,13 +345,13 @@ async def run():
                         "type": "tyrion.adapter.ready",
                         "native_session_id": session_id,
                         "native_skills": effective_skills,
-                        "native_skill_outcomes": [
+                        "native_skill_preparations": [
                             {
-                                "name": name,
-                                "outcome": "activated",
-                                "source": "claude-sdk-init",
+                                "name": skill["name"],
+                                "content_digest": skill["content_digest"],
+                                "source": selected_skill_paths[skill["name"]],
                             }
-                            for name in configured_skills
+                            for skill in selected_skills
                         ],
                         "configuration_fingerprint": os.environ[
                             "TYRION_CONFIGURATION_FINGERPRINT"
@@ -277,8 +361,51 @@ async def run():
                 emit({"type": "session.status_running"})
                 ready = True
             if isinstance(message, AssistantMessage):
+                if not ready:
+                    raise RuntimeError("Claude produced output before native initialization")
                 if message.model != configuration["model"]:
                     raise RuntimeError("Claude Agent SDK selected a different model")
+                for block in message.content:
+                    if not isinstance(block, ToolUseBlock) or block.name != "Skill":
+                        continue
+                    name = block.input.get("skill") or block.input.get("name")
+                    if not isinstance(name, str) or not name:
+                        raise RuntimeError("Claude Skill invocation did not name its native Skill")
+                    expected_digest = configured_versions.get(name)
+                    if expected_digest is None:
+                        raise RuntimeError(
+                            f"Claude invoked Skill {name} outside the Worker capability inventory"
+                        )
+                    dynamic_skill = {
+                        "name": name,
+                        "content_digest": expected_digest,
+                        "requirement": "selected",
+                        "provenance": "worker",
+                        "delegation": "native_unchanged",
+                    }
+                    try:
+                        path = claude_skill_path(
+                            repository, name, settings.get("native_skill_paths", {})
+                        )
+                    except RuntimeError as error:
+                        raise RequiredSkillFailure(dynamic_skill, str(error)) from error
+                    actual_digest = skill_content_digest(path)
+                    if actual_digest != expected_digest:
+                        raise RequiredSkillFailure(
+                            dynamic_skill,
+                            f"Claude native Skill {name} content changed: expected "
+                            f"{expected_digest}, actual {actual_digest}",
+                        )
+                    if name not in invoked_skills:
+                        emit(
+                            {
+                                "type": "tyrion.skill.invoked",
+                                "name": name,
+                                "content_digest": expected_digest,
+                                "source": path,
+                            }
+                        )
+                        invoked_skills.add(name)
                 content = [
                     {"type": "text", "text": block.text}
                     for block in message.content
@@ -338,6 +465,7 @@ async def run():
                             "plan_revision": launch["plan_revision"],
                             "summary": result_summary(message),
                             "known_effects": [],
+                            "cost_cents": round(total_cost_usd * 100),
                         }
                     )
         if terminal is None:
@@ -354,6 +482,9 @@ async def run():
 if __name__ == "__main__":
     try:
         asyncio.run(run())
+    except RequiredSkillFailure as error:
+        emit(error.event())
+        raise
     except Exception as error:
         emit({"type": "session.error", "message": str(error)})
         raise

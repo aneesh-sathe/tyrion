@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 
+from native_skill import RequiredSkillFailure, skill_content_digest
+
 
 def emit(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -147,7 +149,9 @@ def prompt(launch):
         "fresh": "Start from only this accepted Assignment context; do not resume prior session context.",
         "fresh_with_retrieval": "Start fresh, use the accepted context below, and retrieve relevant workspace context with the configured tools and Skills before acting.",
     }[context_strategy]
-    required_skills = " ".join(f"${name}" for name in launch["worker_configuration"].get("skills", []))
+    required_skills = " ".join(
+        f"${skill['name']}" for skill in launch.get("skill_defaults", [])
+    )
     return "\n".join(
         [
             context_instruction,
@@ -247,25 +251,55 @@ def main():
             if skill.get("enabled") and isinstance(skill.get("name"), str)
         }
         native_skills = sorted(skill_entries)
-        missing = sorted(set(configuration.get("skills", [])) - set(native_skills))
+        selected_skills = launch.get("skill_defaults", [])
+        selected_names = [skill["name"] for skill in selected_skills]
+        missing = sorted(set(selected_names) - set(native_skills))
         if missing:
-            raise RuntimeError(f"Codex did not load required Skills: {', '.join(missing)}")
+            skill = next(skill for skill in selected_skills if skill["name"] == missing[0])
+            raise RequiredSkillFailure(
+                skill, f"Codex did not load required Skill {missing[0]}"
+            )
+        configured_versions = {
+            skill["name"]: skill["content_digest"]
+            for skill in configuration.get("skills", [])
+        }
         skill_inputs = []
-        skill_outcomes = []
-        for name in configuration.get("skills", []):
+        skill_preparations = []
+        for skill in selected_skills:
+            name = skill["name"]
+            if (
+                skill.get("delegation") != "native_unchanged"
+                or configured_versions.get(name) != skill["content_digest"]
+            ):
+                raise RequiredSkillFailure(
+                    skill, f"Codex selected a different Skill Version for {name}"
+                )
             path = skill_entries[name].get("path")
             if not isinstance(path, str) or not os.path.isabs(path):
-                raise RuntimeError(f"Codex did not report an absolute path for Skill {name}")
+                raise RequiredSkillFailure(
+                    skill, f"Codex did not report an absolute path for Skill {name}"
+                )
+            actual_digest = skill_content_digest(path)
+            if actual_digest != skill["content_digest"]:
+                raise RequiredSkillFailure(
+                    skill,
+                    f"Codex native Skill {name} content changed: expected "
+                    f"{skill['content_digest']}, actual {actual_digest}",
+                )
             skill_inputs.append({"type": "skill", "name": name, "path": path})
-            skill_outcomes.append(
-                {"name": name, "outcome": "activated", "source": path}
+            skill_preparations.append(
+                {
+                    "name": name,
+                    "content_digest": skill["content_digest"],
+                    "source": path,
+                }
             )
         emit(
             {
                 "type": "tyrion.adapter.ready",
                 "native_session_id": thread_id,
                 "native_skills": native_skills,
-                "native_skill_outcomes": skill_outcomes,
+                "native_skill_preparations": skill_preparations,
                 "configuration_fingerprint": os.environ["TYRION_CONFIGURATION_FINGERPRINT"],
             }
         )
@@ -290,6 +324,8 @@ def main():
             },
         )
         turn_id = turn["turn"]["id"]
+        for skill in skill_preparations:
+            emit({"type": "tyrion.skill.invoked", **skill})
         last_text = ""
         terminal = None
         pending = app.take_buffered()
@@ -360,6 +396,7 @@ def main():
                     "plan_revision": launch["plan_revision"],
                     "summary": result_summary(last_text),
                     "known_effects": [],
+                    "cost_cents": 0,
                 }
             )
     finally:
@@ -371,6 +408,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except RequiredSkillFailure as error:
+        emit(error.event())
+        raise
     except Exception as error:
         emit({"method": "error", "params": {"message": str(error)}})
         raise

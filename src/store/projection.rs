@@ -228,7 +228,7 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
-    let assignments = query_values(
+    let mut assignments = query_values(
         connection,
         "SELECT assignments.id, assignment_metadata.logical_id,
                 assignments.plan_revision, assignments.status, assignments.created_at,
@@ -307,6 +307,49 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
+    let assignment_skills = query_values(
+        connection,
+        "SELECT assignment_skill_defaults.assignment_id,
+                assignment_skill_defaults.skill_name,
+                assignment_skill_defaults.content_digest,
+                assignment_skill_defaults.requirement,
+                assignment_skill_defaults.provenance,
+                assignment_skill_defaults.plan_revision,
+                assignment_skill_defaults.delegation,
+                assignment_skill_defaults.selected_at
+         FROM assignment_skill_defaults
+         JOIN assignments ON assignments.id = assignment_skill_defaults.assignment_id
+         WHERE assignments.commission_id = ?1
+         ORDER BY assignment_skill_defaults.assignment_id,
+                  assignment_skill_defaults.skill_name",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "assignment_id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "content_digest": row.get::<_, String>(2)?,
+                "requirement": row.get::<_, String>(3)?,
+                "provenance": row.get::<_, String>(4)?,
+                "plan_revision": row.get::<_, i64>(5)?,
+                "delegation": row.get::<_, String>(6)?,
+                "selected_at": row.get::<_, i64>(7)?,
+            }))
+        },
+    )?;
+    for assignment in &mut assignments {
+        let assignment_id = assignment["id"].as_str();
+        assignment["skill_defaults"] = Value::Array(
+            assignment_skills
+                .iter()
+                .filter(|skill| skill["assignment_id"].as_str() == assignment_id)
+                .map(|skill| {
+                    let mut skill = skill.clone();
+                    skill.as_object_mut().unwrap().remove("assignment_id");
+                    skill
+                })
+                .collect(),
+        );
+    }
     let attempts = query_values(
         connection,
         "SELECT attempts.id, attempts.assignment_id, attempts.worker_configuration,
@@ -619,7 +662,7 @@ pub(super) fn inspect_commission(
             }))
         },
     )?;
-    let results = query_values(
+    let mut results = query_values(
         connection,
         "SELECT results.id, results.attempt_id, results.output, results.artifact_revision,
                 results.status, results.created_at, results.mandate_revision,
@@ -650,6 +693,99 @@ pub(super) fn inspect_commission(
                 "known_effects": json_column(row, 13)?,
                 "integrated_artifact_revision": row.get::<_, Option<String>>(14)?,
                 "revision_disposition": row.get::<_, String>(15)?,
+            }))
+        },
+    )?;
+    let result_skill_executions = query_values(
+        connection,
+        "SELECT result_skill_executions.result_id,
+                result_skill_executions.skill_name,
+                result_skill_executions.content_digest,
+                result_skill_executions.requirement,
+                result_skill_executions.provenance,
+                result_skill_executions.worker_configuration,
+                result_skill_executions.assignment_class,
+                result_skill_executions.verification_outcome,
+                result_skill_executions.corrections,
+                result_skill_executions.cost_cents,
+                result_skill_executions.latency_ms,
+                result_skill_executions.principal_intervention,
+                result_skill_executions.delegation
+         FROM result_skill_executions
+         JOIN results ON results.id = result_skill_executions.result_id
+         JOIN attempts ON attempts.id = results.attempt_id
+         JOIN assignments ON assignments.id = attempts.assignment_id
+         WHERE assignments.commission_id = ?1
+         ORDER BY result_skill_executions.result_id,
+                  result_skill_executions.skill_name",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "result_id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "content_digest": row.get::<_, String>(2)?,
+                "requirement": row.get::<_, String>(3)?,
+                "provenance": row.get::<_, String>(4)?,
+                "worker_configuration": row.get::<_, String>(5)?,
+                "assignment_class": row.get::<_, String>(6)?,
+                "verification_outcome": row.get::<_, String>(7)?,
+                "corrections": row.get::<_, u64>(8)?,
+                "cost_cents": row.get::<_, u64>(9)?,
+                "latency_ms": row.get::<_, u64>(10)?,
+                "principal_intervention": row.get::<_, bool>(11)?,
+                "delegation": row.get::<_, String>(12)?,
+            }))
+        },
+    )?;
+    for result in &mut results {
+        let result_id = result["id"].as_str();
+        result["skill_executions"] = Value::Array(
+            result_skill_executions
+                .iter()
+                .filter(|skill| skill["result_id"].as_str() == result_id)
+                .map(|skill| {
+                    let mut skill = skill.clone();
+                    skill.as_object_mut().unwrap().remove("result_id");
+                    skill
+                })
+                .collect(),
+        );
+    }
+    let skill_associations = query_values(
+        connection,
+        "SELECT id, assignment_id, attempt_id, result_id, skill_name, content_digest,
+                worker_configuration, harness, assignment_class, observation,
+                verification_outcome, corrections, cost_cents, latency_ms,
+                principal_intervention, evidence_ids_json, scope_json,
+                confidence_basis_points, observed_at
+         FROM skill_associations WHERE commission_id = ?1
+         ORDER BY observed_at, id",
+        commission_id,
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "assignment_id": row.get::<_, String>(1)?,
+                "attempt_id": row.get::<_, String>(2)?,
+                "result_id": row.get::<_, Option<String>>(3)?,
+                "skill_version": {
+                    "name": row.get::<_, String>(4)?,
+                    "content_digest": row.get::<_, String>(5)?,
+                },
+                "worker_configuration": row.get::<_, String>(6)?,
+                "harness": row.get::<_, String>(7)?,
+                "assignment_class": row.get::<_, String>(8)?,
+                "observation": row.get::<_, String>(9)?,
+                "verification_outcome": row.get::<_, String>(10)?,
+                "corrections": row.get::<_, u64>(11)?,
+                "cost_cents": row.get::<_, u64>(12)?,
+                "latency_ms": row.get::<_, u64>(13)?,
+                "principal_intervention": row.get::<_, bool>(14)?,
+                "evidence": json_column(row, 15)?,
+                "scope": json_column(row, 16)?,
+                "confidence_basis_points": row.get::<_, u64>(17)?,
+                "observed_at": row.get::<_, i64>(18)?,
+                "causal": false,
+                "global_ban": false,
             }))
         },
     )?;
@@ -1200,6 +1336,7 @@ pub(super) fn inspect_commission(
         "credential_exposure_grants": credential_exposure_grants,
         "commission_amendments": commission_amendments,
         "results": results,
+        "skill_associations": skill_associations,
         "evidence": evidence,
         "briefing": briefing,
         "events": events,

@@ -79,7 +79,7 @@ fn daemon_responds(socket_path: &Path) -> bool {
         return false;
     };
     let request = json!({
-        "protocol_version": 1,
+        "protocol_version": 2,
         "command": {"type": "inspect_commission", "commission_id": "readiness-probe"}
     });
     if serde_json::to_writer(&mut stream, &request).is_err()
@@ -289,7 +289,7 @@ fn attachment_fixture<'a>(
         adapter_version,
         native_session_id,
         capabilities,
-        protocol_version: 1,
+        protocol_version: 2,
     }
 }
 
@@ -1667,14 +1667,17 @@ fn rejected_attachment_handshakes_never_fall_back_or_consume_a_valid_token() {
         "incompatible-session",
         &full,
     );
-    incompatible_fixture.protocol_version = 2;
+    incompatible_fixture.protocol_version = 3;
     let incompatible = connect_attachment(
         &daemon,
         incompatible["launch_token"].as_str().unwrap(),
         &incompatible_fixture,
         "connect-incompatible-session",
     );
-    assert_attachment_rejected(&incompatible, "protocol version 2 is incompatible");
+    assert_attachment_rejected(
+        &incompatible,
+        "adapter protocol version 3 is incompatible with 2",
+    );
 
     let expired = issue_launch_token_with_ttl(
         &daemon,
@@ -1709,10 +1712,11 @@ fn assert_attachment_rejected(output: &Output, expected_message: &str) {
     let error: Value = serde_json::from_slice(&output.stderr)
         .expect("attachment failure should be structured JSON");
     assert_eq!(error["code"], "attachment_rejected");
-    assert!(error["message"]
-        .as_str()
-        .unwrap()
-        .contains(expected_message));
+    let actual_message = error["message"].as_str().unwrap();
+    assert!(
+        actual_message.contains(expected_message),
+        "expected attachment error containing {expected_message:?}, got {actual_message:?}"
+    );
 }
 
 #[test]
