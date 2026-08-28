@@ -1941,6 +1941,8 @@ fn structured_adapters_receive_steering_and_interruption() {
         proposal["goal"] = json!("hold for structured control");
         proposal["criteria"][0]["verifier"]["expected"] = json!("hold for structured control");
         proposal["worker_requirements"]["require_configurations"] = json!([configuration_id]);
+        proposal["known_uncertainties"] =
+            json!(["The structured Worker interruption will exercise durable recovery."]);
         if configuration_id == "pi-rpc-qualified" {
             proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
         }
@@ -1991,6 +1993,29 @@ fn structured_adapters_receive_steering_and_interruption() {
                 &format!("steer-{configuration_id}"),
             ],
         );
+        let unaccepted_plan = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+            .args(["--socket", path_text(&daemon.socket_path)])
+            .args([
+                "--attachment-token",
+                &attachment_token,
+                "worker",
+                "interrupt",
+                commission_id,
+                "Arya",
+                "--reason",
+                "Stop the structured adapter.",
+                "--planned-uncertainty",
+                "An ad hoc interruption not accepted in the mandate.",
+                "--expected-revision",
+                "1",
+                "--idempotency-key",
+                &format!("reject-unplanned-interrupt-{configuration_id}"),
+            ])
+            .output()
+            .expect("CLI should run");
+        assert!(!unaccepted_plan.status.success());
+        assert!(String::from_utf8_lossy(&unaccepted_plan.stderr)
+            .contains("must exactly match an accepted known uncertainty"));
         run_cli(
             &daemon.socket_path,
             &[
@@ -2002,7 +2027,8 @@ fn structured_adapters_receive_steering_and_interruption() {
                 "Arya",
                 "--reason",
                 "Stop the structured adapter.",
-                "--planned",
+                "--planned-uncertainty",
+                "The structured Worker interruption will exercise durable recovery.",
                 "--expected-revision",
                 "1",
                 "--idempotency-key",
@@ -2014,13 +2040,22 @@ fn structured_adapters_receive_steering_and_interruption() {
         assert_eq!(interrupted["attempts"][0]["status"], "interrupted");
         assert_eq!(interrupted["worker_commands"][0]["kind"], "steer");
         assert_eq!(interrupted["worker_commands"][1]["kind"], "interrupt");
+        assert!(interrupted["worker_commands"][0]["payload"]["planning_provenance"].is_null());
         assert_eq!(
-            interrupted["worker_commands"][0]["payload"]["planned"],
-            false
+            interrupted["worker_commands"][1]["payload"]["planning_provenance"],
+            json!({
+                "kind": "accepted_known_uncertainty",
+                "description":
+                    "The structured Worker interruption will exercise durable recovery."
+            })
         );
         assert_eq!(
-            interrupted["worker_commands"][1]["payload"]["planned"],
-            true
+            interrupted["run_report"]["planned_principal_controls"]["worker_controls"],
+            1
+        );
+        assert_eq!(
+            interrupted["run_report"]["unplanned_principal_interventions"]["worker_controls"],
+            1
         );
         assert!(interrupted["workers"][0]["native_session_id"]
             .as_str()

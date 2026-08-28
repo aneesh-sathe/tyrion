@@ -14,7 +14,7 @@ On 2026-08-28, the public CLI and daemon seam completed the smallest safe fixtur
 
 This is product and record-format verification only. Fixture-backed Worker evidence is not production containment attestation, and separate scenarios are not the single real Commission required by issue 16.
 
-The captured smoke export is checked in at [`dogfood-records/2026-08-28-safe-smoke.json`](dogfood-records/2026-08-28-safe-smoke.json). Recreate a fresh fixture-backed record without accessing production credentials or host runtime state:
+The captured smoke export is checked in at [`dogfood-records/2026-08-28-safe-smoke.json`](dogfood-records/2026-08-28-safe-smoke.json). Its `dogfood_readiness.status` is `blocked` with the `fixture_backed_evidence` reason. Recreate a fresh fixture-backed record without accessing production credentials or host runtime state:
 
 ```sh
 mkdir -p .scratch/test-tmp
@@ -59,6 +59,7 @@ Review these fields before making a readiness claim:
 - `.record.operation_requests` and `.record.approval_gates` for the exact controlled effect and single-use authorization path.
 - `.record.restart_recoveries`, `.record.recovery_history`, and `.record.events` for the planned failure, cleanup, replay, and continued work.
 - `.record.briefing.learning_receipts` for advisory Profile Claim application.
-- `.record.run_report` for separate Approval Gate, intervention, correction, context-transfer, reconciliation, concurrency, conflict, cost, timing, failure, and recovery metrics. Verified Completion also copies this report into `.record.briefing.run_report`.
+- `.record.run_report` for separate Approval Gate, mandate-bound planned control, unplanned intervention, correction, context-transfer, reconciliation, concurrency, conflict, cost, timing, failure, and recovery metrics. Verified Completion also copies this report into `.record.briefing.run_report`.
+- `.dogfood_readiness` for the fail-closed readiness assessment. `blocked` names machine-readable blockers; `unassessed` still requires a Principal review of every issue 16 criterion. The exporter never emits `ready`.
 
-Any nonzero `.record.run_report.failures.security_invariant_failures` blocks readiness until the corresponding claim is explicitly withdrawn or a new production record demonstrates the invariant.
+Any nonzero `.record.run_report.failures.security_invariant_failures` forces `.dogfood_readiness.status` to `blocked` until the corresponding claim is explicitly withdrawn or a new production record demonstrates the invariant. OpenShell containment preflight failures use the explicit `security_invariant_failure` blocker code rather than message-text classification.

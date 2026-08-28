@@ -258,7 +258,7 @@ target/debug/tyrion --socket "$TYRION_SOCKET" \
   commission export-record COMMISSION_ID > commission-record.json
 ```
 
-The `sha256:` checksum covers the complete `record` value, while `exported_at` remains export metadata. The record includes the accepted mandate, routing and Worker configurations, Attempts, Results, Integration, Evidence, effects and Approval Gates, recovery, learning receipts, terminal events, and a metric-separated final run report. Its summary states that exported containment Evidence is not independent runtime attestation and calls out fixture-backed Workers explicitly.
+The `sha256:` checksum covers the complete `record` value, while `exported_at` remains export metadata. The record includes the accepted mandate, routing and Worker configurations, Attempts, Results, Integration, Evidence, effects and Approval Gates, recovery, learning receipts, terminal events, and a metric-separated final run report. Its summary states that exported containment Evidence is not independent runtime attestation and calls out fixture-backed Workers explicitly. `dogfood_readiness.status` is fail closed: fixture evidence, an incomplete Commission, a Security Invariant failure, or an unreconciled effect produces `blocked`; an otherwise clean export remains `unassessed` and never automatically claims readiness.
 
 The Active Attachment can steer or interrupt a live structured Worker when both the Entry Session and selected Worker Configuration support that command:
 
@@ -274,12 +274,12 @@ The Active Attachment can steer or interrupt a live structured Worker when both 
   --attachment-token "$ATTACHMENT_SESSION_TOKEN" \
   worker interrupt "$COMMISSION_ID" Arya \
   --reason "Stop this Attempt." \
-  --planned \
+  --planned-uncertainty "The interruption will exercise durable recovery." \
   --expected-revision CURRENT_REVISION \
   --idempotency-key interrupt-arya
 ```
 
-Steering may clarify an Assignment. It cannot change the Goal, criteria, authority, or ceilings. Interruption revokes the live Lease and preserves the Attempt in history. Use `--planned` only for a control action intentionally included in the accepted Commission exercise; the final briefing reports planned controls separately from unplanned Principal interventions.
+Steering may clarify an Assignment. It cannot change the Goal, criteria, authority, or ceilings. Interruption revokes the live Lease and preserves the Attempt in history. `--planned-uncertainty` must exactly match a known uncertainty in the accepted mandate, which prevents an ad hoc intervention from being relabeled after the fact. The final briefing reports those mandate-bound controls separately from unplanned Principal interventions.
 
 Use the built-in help for the full command tree:
 

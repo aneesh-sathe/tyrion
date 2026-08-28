@@ -1053,7 +1053,6 @@ pub(super) fn inspect_commission(
         results: &results,
         evidence: &evidence,
         events: &events,
-        blockers: &blockers,
         recovery_history: &recovery_history,
         restart_recoveries: &restart_recoveries,
         watchdog_findings: &watchdog_findings,
@@ -1580,7 +1579,6 @@ struct RunReportInput<'a> {
     results: &'a [Value],
     evidence: &'a [Value],
     events: &'a [Value],
-    blockers: &'a [Value],
     recovery_history: &'a [Value],
     restart_recoveries: &'a [Value],
     watchdog_findings: &'a [Value],
@@ -1597,7 +1595,9 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
     let planned_worker_controls = input
         .worker_commands
         .iter()
-        .filter(|command| command["payload"]["planned"] == true)
+        .filter(|command| {
+            command["payload"]["planning_provenance"]["kind"] == "accepted_known_uncertainty"
+        })
         .count();
     let unplanned_worker_controls = input
         .worker_commands
@@ -1667,16 +1667,10 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
         .watchdog_findings
         .iter()
         .filter(|finding| finding["signal"] == "invalid_authority");
-    let explicit_security_blockers = input.blockers.iter().filter(|blocker| {
-        let code = blocker["code"].as_str().unwrap_or_default();
-        let requirement = blocker["requirement"]
-            .as_str()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        code.contains("containment")
-            || code.contains("security_invariant")
-            || requirement.contains("containment failure")
-    });
+    let explicit_security_recoveries = input
+        .recovery_history
+        .iter()
+        .filter(|recovery| recovery["cause"] == "security_invariant_failure");
     let abnormal_resource_findings = input
         .watchdog_findings
         .iter()
@@ -1685,7 +1679,7 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
         + containment_effect_failures.count()
         + invalid_authority_findings.count()
         + abnormal_resource_findings.count()
-        + explicit_security_blockers.count();
+        + explicit_security_recoveries.count();
     let principal_effect_reconciliations = input
         .operation_requests
         .iter()
@@ -1701,10 +1695,14 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
             "invalidated_or_revoked": count(input.approval_gates, "status", "invalidated")
                 + count(input.approval_gates, "status", "revoked"),
         },
+        "planned_principal_controls": {
+            "total": planned_worker_controls,
+            "worker_controls": planned_worker_controls,
+            "provenance": "accepted_known_uncertainty",
+        },
         "unplanned_principal_interventions": {
             "total": unplanned_worker_controls + accepted_amendments,
             "worker_controls": unplanned_worker_controls,
-            "planned_worker_controls": planned_worker_controls,
             "commission_amendments": accepted_amendments,
             "required_approval_gate_actions_excluded": true,
         },
