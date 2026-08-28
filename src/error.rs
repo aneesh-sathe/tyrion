@@ -65,6 +65,8 @@ pub enum TyrionError {
     WorkerInterrupted,
     #[error("Watchdog contained the Attempt after detecting {signal}")]
     WatchdogContained { signal: &'static str },
+    #[error("Security Invariant failed: {0}")]
+    SecurityInvariantViolation(String),
     #[error("Worker Configuration {configuration_id} is unavailable: {message}")]
     WorkerConfigurationUnavailable {
         configuration_id: String,
@@ -115,6 +117,7 @@ impl TyrionError {
             Self::WorkerLeaseExpired { .. }
             | Self::WorkerInterrupted
             | Self::WatchdogContained { .. }
+            | Self::SecurityInvariantViolation(_)
             | Self::WorkerConfigurationUnavailable { .. }
             | Self::RequiredSkillUnavailable { .. }
             | Self::StorageCeilingExceeded { .. }

@@ -31,7 +31,7 @@ use crate::protocol::{
     OperationRequest, PlannedAssignment, Request, ResourceCeilings, ReusablePreference,
     SelectedSkillVersion, SkillSelectionProvenance, SkillVersion, VerificationAmendment,
     VerificationDefect, VerificationDepth, VerificationEvidenceSubmission, VerificationVerdict,
-    Verifier, VerifierType, WorkerRequirements, PROTOCOL_VERSION,
+    Verifier, VerifierType, WorkerControlPlanningProvenance, WorkerRequirements, PROTOCOL_VERSION,
 };
 use crate::TyrionError;
 use crate::{attachment, worker};
@@ -286,7 +286,7 @@ struct WorkerControlCommand<'a> {
     commission_id: &'a str,
     worker_handle: &'a str,
     message: &'a str,
-    planned: bool,
+    planning_provenance: Option<&'a WorkerControlPlanningProvenance>,
     action: WorkerControlAction,
 }
 
@@ -2696,7 +2696,7 @@ impl Store {
         commission_id: &str,
         worker_handle: &str,
         clarification: &str,
-        planned: bool,
+        planning_provenance: Option<&WorkerControlPlanningProvenance>,
         worker: &worker::WorkerRuntime,
     ) -> Result<Value, TyrionError> {
         control_worker(
@@ -2706,7 +2706,7 @@ impl Store {
                 commission_id,
                 worker_handle,
                 message: clarification,
-                planned,
+                planning_provenance,
                 action: WorkerControlAction::Steer,
             },
             worker,
@@ -2719,7 +2719,7 @@ impl Store {
         commission_id: &str,
         worker_handle: &str,
         reason: &str,
-        planned: bool,
+        planning_provenance: Option<&WorkerControlPlanningProvenance>,
         worker: &worker::WorkerRuntime,
     ) -> Result<Value, TyrionError> {
         control_worker(
@@ -2729,7 +2729,7 @@ impl Store {
                 commission_id,
                 worker_handle,
                 message: reason,
-                planned,
+                planning_provenance,
                 action: WorkerControlAction::Interrupt,
             },
             worker,
@@ -5501,6 +5501,47 @@ impl Store {
         } else {
             "This export preserves containment Evidence but does not independently attest the runtime."
         };
+        let status = record["commission"]["status"].as_str().unwrap_or("unknown");
+        let security_invariant_failures = record["run_report"]["failures"]
+            ["security_invariant_failures"]
+            .as_u64()
+            .unwrap_or(0);
+        let failed_or_uncertain_effects = record["run_report"]["failures"]
+            ["failed_or_uncertain_effects"]
+            .as_u64()
+            .unwrap_or(0);
+        let mut readiness_blockers = Vec::new();
+        if status != CommissionStatus::VerifiedComplete.as_str() {
+            readiness_blockers.push(serde_json::json!({
+                "code": "commission_not_verified_complete",
+                "observed_status": status,
+            }));
+        }
+        if fixture_backed {
+            readiness_blockers.push(serde_json::json!({
+                "code": "fixture_backed_evidence",
+                "requirement": "Run the accepted mandate with production Worker configurations and containment Evidence.",
+            }));
+        }
+        if security_invariant_failures > 0 {
+            readiness_blockers.push(serde_json::json!({
+                "code": "security_invariant_failures",
+                "count": security_invariant_failures,
+                "requirement": "Withdraw the affected readiness claim and produce a new production record after correcting the invariant.",
+            }));
+        }
+        if failed_or_uncertain_effects > 0 {
+            readiness_blockers.push(serde_json::json!({
+                "code": "failed_or_uncertain_effects",
+                "count": failed_or_uncertain_effects,
+                "requirement": "Reconcile every consequential effect before evaluating dogfood readiness.",
+            }));
+        }
+        let readiness_status = if readiness_blockers.is_empty() {
+            "unassessed"
+        } else {
+            "blocked"
+        };
         let criteria = record["criteria"].as_array().map_or(0, Vec::len);
         let passed = record["criteria"]
             .as_array()
@@ -5508,9 +5549,8 @@ impl Store {
             .flatten()
             .filter(|criterion| criterion["status"] == "passed")
             .count();
-        let status = record["commission"]["status"].as_str().unwrap_or("unknown");
         let summary_markdown = format!(
-            "# Tyrion Commission Record\n\nChecksum: `{checksum}`\n\nCommission: `{commission_id}`\n\nStatus: `{status}`\n\nAcceptance Criteria: `{passed}/{criteria}` passed\n\nContainment scope: {containment_note}\n"
+            "# Tyrion Commission Record\n\nChecksum: `{checksum}`\n\nCommission: `{commission_id}`\n\nStatus: `{status}`\n\nDogfood readiness: `{readiness_status}`\n\nAcceptance Criteria: `{passed}/{criteria}` passed\n\nContainment scope: {containment_note}\n"
         );
         Ok(serde_json::json!({
             "format": "tyrion.commission",
@@ -5518,6 +5558,11 @@ impl Store {
             "exported_at": unix_timestamp_millis()?,
             "checksum": checksum,
             "record": record,
+            "dogfood_readiness": {
+                "status": readiness_status,
+                "blockers": readiness_blockers,
+                "automatic_ready_claims_supported": false,
+            },
             "summary_markdown": summary_markdown,
         }))
     }
@@ -9082,6 +9127,16 @@ impl Store {
                 "reroute",
                 true,
             ),
+            TyrionError::SecurityInvariantViolation(_) => (
+                WorkerLeaseStatus::Revoked,
+                AssignmentStatus::VerificationFailed,
+                "security_invariant_failure".to_owned(),
+                error.to_string(),
+                "authority",
+                "security_invariant_failure",
+                "block",
+                false,
+            ),
             _ => (
                 WorkerLeaseStatus::Revoked,
                 AssignmentStatus::VerificationFailed,
@@ -9371,7 +9426,7 @@ fn control_worker(
         commission_id,
         worker_handle,
         message,
-        planned,
+        planning_provenance,
         action,
     } = control;
     if worker_handle.trim().is_empty() {
@@ -9458,6 +9513,23 @@ fn control_worker(
             "Commission {commission_id} is {status}"
         )));
     }
+    if let Some(WorkerControlPlanningProvenance::AcceptedKnownUncertainty { description }) =
+        planning_provenance
+    {
+        let accepted = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM known_uncertainties
+                WHERE commission_id = ?1 AND description = ?2
+             )",
+            params![commission_id, description],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !accepted {
+            return Err(TyrionError::ControlDenied(
+                "planned Worker control must exactly match an accepted known uncertainty".into(),
+            ));
+        }
+    }
     let (worker_id, attempt_id, worker_status, configuration) = transaction
         .query_row(
             "SELECT id, attempt_id, status, configuration_json
@@ -9514,7 +9586,7 @@ fn control_worker(
                 action.as_str(),
                 serde_json::to_string(&serde_json::json!({
                     (action.message_field()): message,
-                    "planned": planned,
+                    "planning_provenance": planning_provenance,
                 }))?,
                 revision,
                 idempotency_key,
@@ -9561,7 +9633,7 @@ fn control_worker(
             "worker_handle": worker_handle,
             "attempt_id": attempt_id,
             (action.message_field()): message,
-            "planned": planned,
+            "planning_provenance": planning_provenance,
             "mandate_revision": revision,
             "mandate_changed": false,
         }),

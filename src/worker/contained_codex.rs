@@ -1147,16 +1147,19 @@ impl<'a> Sandbox<'a> {
         let probe = format!(
             "set -eu; printf tyrion-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; memory_kib=$(awk '/MemTotal/ {{print $2}}' /proc/meminfo); test \"$memory_kib\" -ge 1900000; test \"$memory_kib\" -le 2097152; storage_kib=$(df -Pk /sandbox | awk 'NR==2 {{print $2}}'); test \"$storage_kib\" -le 4194304; test ! -e {host_repository}; test ! -e {host_repository_parent}; test ! -e {host_state}; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test ! -e /home/sandbox/.codex; test ! -e /home/sandbox/.claude; test ! -e /home/sandbox/.pi; test -z \"${{OPENAI_API_KEY:-}}${{ANTHROPIC_API_KEY:-}}${{GEMINI_API_KEY:-}}${{XAI_API_KEY:-}}${{GROQ_API_KEY:-}}${{OPENROUTER_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; test ! -r /opt/openshell/auth/sandbox.jwt; test ! -r /opt/openshell/tls/tls.key; if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; printf allowed >/sandbox/tyrion-probe; command -v curl >/dev/null; if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; sleep 600 >/dev/null 2>&1 & descendant=$!; kill -0 \"$descendant\"; printf descendant-live"
         );
-        self.exec_checked(&["sh", "-c", &probe], None, deadline)?;
+        self.exec_checked(&["sh", "-c", &probe], None, deadline)
+            .map_err(|error| TyrionError::SecurityInvariantViolation(error.to_string()))?;
         let logs = self
             .runtime
-            .openshell(&["logs", &self.name, "-n", "300"], deadline)?;
-        let logs = require_success("OpenShell logs", logs)?;
+            .openshell(&["logs", &self.name, "-n", "300"], deadline)
+            .map_err(|error| TyrionError::SecurityInvariantViolation(error.to_string()))?;
+        let logs = require_success("OpenShell logs", logs)
+            .map_err(|error| TyrionError::SecurityInvariantViolation(error.to_string()))?;
         let logs = String::from_utf8_lossy(&logs.stdout);
         if !logs.contains("Landlock ruleset built")
             || logs.contains("runtime cgroup pids.max is unavailable")
         {
-            return Err(TyrionError::InvalidRequest(
+            return Err(TyrionError::SecurityInvariantViolation(
                 "OpenShell did not attest the hard Landlock and process boundary".into(),
             ));
         }

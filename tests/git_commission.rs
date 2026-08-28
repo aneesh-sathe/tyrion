@@ -525,6 +525,7 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
             "corrections".to_owned(),
             "cost".to_owned(),
             "failures".to_owned(),
+            "planned_principal_controls".to_owned(),
             "reconciliation".to_owned(),
             "recovery_events".to_owned(),
             "timing".to_owned(),
@@ -534,6 +535,10 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
     );
     assert_eq!(
         exported["record"]["briefing"]["run_report"]["approval_gates"]["required"],
+        0
+    );
+    assert_eq!(
+        exported["record"]["briefing"]["run_report"]["planned_principal_controls"]["total"],
         0
     );
     assert_eq!(
@@ -557,6 +562,12 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
         .as_str()
         .unwrap()
         .contains("fixture-backed Worker evidence is not production containment attestation"));
+    assert_eq!(exported["dogfood_readiness"]["status"], "blocked");
+    assert!(exported["dogfood_readiness"]["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker["code"] == "fixture_backed_evidence"));
     let expected_checksum = format!(
         "sha256:{:x}",
         Sha256::digest(serde_json::to_vec(&exported["record"]).unwrap())
@@ -1293,7 +1304,7 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
     assert_eq!(failed["attempts"][0]["status"], "failed");
     assert_eq!(failed["attempts"][0]["lease"]["status"], "revoked");
     assert_eq!(failed["results"], json!([]));
-    assert_eq!(failed["blockers"][0]["code"], "worker_execution_failed");
+    assert_eq!(failed["blockers"][0]["code"], "security_invariant_failure");
     assert!(failed["blockers"][0]["requirement"]
         .as_str()
         .unwrap()
@@ -1302,6 +1313,22 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
         failed["run_report"]["failures"]["security_invariant_failures"],
         1
     );
+    let exported = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "commission",
+            "export-record",
+            &commission_id,
+        ],
+    );
+    assert_eq!(exported["dogfood_readiness"]["status"], "blocked");
+    assert!(exported["dogfood_readiness"]["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker["code"] == "security_invariant_failures"));
     assert!(!data_dir.join("integrations").exists());
     assert!(!principal_checkout.join("issue-4.txt").exists());
 

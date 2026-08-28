@@ -33,6 +33,12 @@ pub struct ReusablePreference {
     pub statement: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerControlPlanningProvenance {
+    AcceptedKnownUncertainty { description: String },
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LearningObservationKind {
@@ -651,15 +657,15 @@ pub enum Command {
         commission_id: String,
         worker_handle: String,
         clarification: String,
-        #[serde(default)]
-        planned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        planning_provenance: Option<WorkerControlPlanningProvenance>,
     },
     InterruptWorker {
         commission_id: String,
         worker_handle: String,
         reason: String,
-        #[serde(default)]
-        planned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        planning_provenance: Option<WorkerControlPlanningProvenance>,
     },
     RetryWorker {
         commission_id: String,

@@ -12,7 +12,8 @@ use tyrion::protocol::{
     AdapterIdentity, AttachmentHandshake, Command, CommissionAmendment, CommissionProposal,
     CommissionReplayCursor, CredentialGrantRequest, LearningObservationKind,
     OperationReconciliationOutcome, OperationRequest, Request, ReusablePreference,
-    VerificationAmendment, VerificationEvidenceSubmission, PROTOCOL_VERSION,
+    VerificationAmendment, VerificationEvidenceSubmission, WorkerControlPlanningProvenance,
+    PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -221,7 +222,7 @@ enum WorkerCommand {
         #[arg(long)]
         clarification: String,
         #[arg(long)]
-        planned: bool,
+        planned_uncertainty: Option<String>,
         #[arg(long)]
         expected_revision: i64,
         #[arg(long)]
@@ -233,7 +234,7 @@ enum WorkerCommand {
         #[arg(long)]
         reason: String,
         #[arg(long)]
-        planned: bool,
+        planned_uncertainty: Option<String>,
         #[arg(long)]
         expected_revision: i64,
         #[arg(long)]
@@ -1018,7 +1019,7 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                         commission_id,
                         worker_handle,
                         clarification,
-                        planned,
+                        planned_uncertainty,
                         expected_revision,
                         idempotency_key,
                     },
@@ -1027,7 +1028,11 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     commission_id: commission_id.clone(),
                     worker_handle: worker_handle.clone(),
                     clarification: clarification.clone(),
-                    planned: *planned,
+                    planning_provenance: planned_uncertainty.as_ref().map(|description| {
+                        WorkerControlPlanningProvenance::AcceptedKnownUncertainty {
+                            description: description.clone(),
+                        }
+                    }),
                 },
                 Some(idempotency_key.clone()),
                 Some(*expected_revision),
@@ -1039,7 +1044,7 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                         commission_id,
                         worker_handle,
                         reason,
-                        planned,
+                        planned_uncertainty,
                         expected_revision,
                         idempotency_key,
                     },
@@ -1048,7 +1053,11 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     commission_id: commission_id.clone(),
                     worker_handle: worker_handle.clone(),
                     reason: reason.clone(),
-                    planned: *planned,
+                    planning_provenance: planned_uncertainty.as_ref().map(|description| {
+                        WorkerControlPlanningProvenance::AcceptedKnownUncertainty {
+                            description: description.clone(),
+                        }
+                    }),
                 },
                 Some(idempotency_key.clone()),
                 Some(*expected_revision),

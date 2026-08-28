@@ -1,17 +1,27 @@
 {
-  "checksum": "sha256:8b5749792b3369bf653e9b37418179d35020f0c3f57dc05a61f882f1ff6ab602",
-  "exported_at": 1787945733098,
+  "checksum": "sha256:d0f7987eabe037ec718bd919e0736001916e70bb75f1ebd28a445c19a49aa1e8",
+  "dogfood_readiness": {
+    "automatic_ready_claims_supported": false,
+    "blockers": [
+      {
+        "code": "fixture_backed_evidence",
+        "requirement": "Run the accepted mandate with production Worker configurations and containment Evidence."
+      }
+    ],
+    "status": "blocked"
+  },
+  "exported_at": 1787946373914,
   "format": "tyrion.commission",
   "record": {
     "activity_journal": {
       "useful_concurrency": {
-        "elapsed_time_reduction_millis": 905,
-        "end_to_end_elapsed_millis": 2059,
+        "elapsed_time_reduction_millis": 845,
+        "end_to_end_elapsed_millis": 1962,
         "occurred": true,
-        "overlap_millis": 905,
-        "parallel_execution_window_millis": 1001,
-        "serial_attempt_millis": 1906,
-        "serial_execution_millis": 1906,
+        "overlap_millis": 845,
+        "parallel_execution_window_millis": 963,
+        "serial_attempt_millis": 1808,
+        "serial_execution_millis": 1808,
         "success_metric": "verified execution elapsed-time reduction"
       }
     },
@@ -19,8 +29,8 @@
     "assignments": [
       {
         "competition": null,
-        "created_at": 1787945730,
-        "id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+        "created_at": 1787946371,
+        "id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
         "logical_id": "backend",
         "plan_revision": 1,
         "position": 0,
@@ -33,7 +43,7 @@
           "max_storage_bytes": 5242880
         },
         "route": {
-          "decided_at": 1787945731,
+          "decided_at": 1787946371,
           "rationale": {
             "eligible": [
               "codex-structured-git"
@@ -60,7 +70,7 @@
           "selected_configuration": {
             "adapter": {
               "command": [
-                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
                 "codex"
               ],
               "kind": "codex_app_server",
@@ -88,7 +98,7 @@
               "result_submission",
               "contained"
             ],
-            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "containment_profile": "openshell-repaired-v0.0.104-456fef3203bf685a",
             "context": {
               "capacity_tokens": 100000,
               "strategy": "fresh"
@@ -135,7 +145,7 @@
             "plan_revision": 1,
             "provenance": "plan",
             "requirement": "required",
-            "selected_at": 1787945730
+            "selected_at": 1787946371
           }
         ],
         "status": "accepted",
@@ -145,8 +155,8 @@
       },
       {
         "competition": null,
-        "created_at": 1787945730,
-        "id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+        "created_at": 1787946371,
+        "id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
         "logical_id": "frontend",
         "plan_revision": 1,
         "position": 1,
@@ -159,7 +169,7 @@
           "max_storage_bytes": 5242880
         },
         "route": {
-          "decided_at": 1787945731,
+          "decided_at": 1787946371,
           "rationale": {
             "eligible": [
               "claude-structured-git"
@@ -186,7 +196,7 @@
           "selected_configuration": {
             "adapter": {
               "command": [
-                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
                 "claude"
               ],
               "kind": "claude_agent_sdk",
@@ -214,7 +224,7 @@
               "result_submission",
               "contained"
             ],
-            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "containment_profile": "openshell-repaired-v0.0.104-456fef3203bf685a",
             "context": {
               "capacity_tokens": 100000,
               "strategy": "fresh"
@@ -261,7 +271,7 @@
             "plan_revision": 1,
             "provenance": "plan",
             "requirement": "required",
-            "selected_at": 1787945730
+            "selected_at": 1787946371
           }
         ],
         "status": "accepted",
@@ -275,8 +285,8 @@
         "adapter_identity": "codex-mcp-entry",
         "adapter_version": "1.0.0",
         "harness": "codex",
-        "id": "47877488-1023-43ee-8543-e4531bedf537",
-        "joined_at": 1787945730,
+        "id": "353a8755-bdcb-4c47-86dd-732f4663bce4",
+        "joined_at": 1787946371,
         "mode": "full",
         "native_session_id": "git-commission-session",
         "role": "active"
@@ -284,18 +294,18 @@
     ],
     "attempts": [
       {
-        "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+        "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
         "cleanup_pending": false,
-        "completed_at": 1787945733,
-        "completed_at_ms": 1787945733067,
-        "execution_completed_at_ms": 1787945732009,
-        "id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "completed_at": 1787946373,
+        "completed_at_ms": 1787946373880,
+        "execution_completed_at_ms": 1787946372882,
+        "id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
         "lease": {
-          "expires_at": 1787945760,
-          "id": "e6675223-68c8-42bb-b400-02ca12025e2d",
-          "issued_at": 1787945731,
+          "expires_at": 1787946401,
+          "id": "e8edc6a9-b518-4121-8bcd-8f14716ee0ac",
+          "issued_at": 1787946371,
           "mandate_revision": 1,
-          "released_at": 1787945733,
+          "released_at": 1787946373,
           "status": "released"
         },
         "reservation": {
@@ -306,8 +316,8 @@
           "storage_bytes": 5242880
         },
         "revision_disposition": "current",
-        "started_at": 1787945731,
-        "started_at_ms": 1787945731008,
+        "started_at": 1787946371,
+        "started_at_ms": 1787946371919,
         "status": "succeeded",
         "worker_configuration": "codex-structured-git",
         "worker_context_packet": {
@@ -359,7 +369,7 @@
                 "frontend.txt"
               ],
               "repositories": [
-                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/principal-checkout"
               ]
             },
             "commission_constraints": [],
@@ -369,9 +379,9 @@
             "current_repository_evidence": {
               "artifact_revision": null,
               "execution": {
-                "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+                "base_revision": "5db264b42dfc922a22291fb2356230bb6c996f6b",
                 "kind": "codex_git",
-                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/principal-checkout"
               },
               "project_id": null
             },
@@ -397,18 +407,18 @@
         }
       },
       {
-        "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+        "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
         "cleanup_pending": false,
-        "completed_at": 1787945732,
-        "completed_at_ms": 1787945732659,
-        "execution_completed_at_ms": 1787945731917,
-        "id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "completed_at": 1787946373,
+        "completed_at_ms": 1787946373485,
+        "execution_completed_at_ms": 1787946372768,
+        "id": "6edba797-1749-4a3c-9b79-ddb266108041",
         "lease": {
-          "expires_at": 1787945760,
-          "id": "492a363b-fa5f-4b18-bf7f-cf4730ad3fe8",
-          "issued_at": 1787945731,
+          "expires_at": 1787946401,
+          "id": "d6e9f218-9252-4af1-811e-c12770b30e13",
+          "issued_at": 1787946371,
           "mandate_revision": 1,
-          "released_at": 1787945732,
+          "released_at": 1787946373,
           "status": "released"
         },
         "reservation": {
@@ -419,8 +429,8 @@
           "storage_bytes": 5242880
         },
         "revision_disposition": "current",
-        "started_at": 1787945731,
-        "started_at_ms": 1787945731012,
+        "started_at": 1787946371,
+        "started_at_ms": 1787946371923,
         "status": "succeeded",
         "worker_configuration": "claude-structured-git",
         "worker_context_packet": {
@@ -472,7 +482,7 @@
                 "frontend.txt"
               ],
               "repositories": [
-                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/principal-checkout"
               ]
             },
             "commission_constraints": [],
@@ -482,9 +492,9 @@
             "current_repository_evidence": {
               "artifact_revision": null,
               "execution": {
-                "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+                "base_revision": "5db264b42dfc922a22291fb2356230bb6c996f6b",
                 "kind": "codex_git",
-                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/principal-checkout"
               },
               "project_id": null
             },
@@ -513,23 +523,23 @@
     "attention_conditions": [],
     "blockers": [],
     "briefing": {
-      "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
-      "commission_id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+      "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
+      "commission_id": "96d8a24d-b688-4fbb-bca8-a46c7f9ae230",
       "completion_revision": 2,
       "criteria": [
         {
           "criterion_id": "backend-file",
           "description": "The assembled repository contains the backend artifact",
           "evidence": {
-            "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
-            "created_at": 1787945733,
+            "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
+            "created_at": 1787946373,
             "criterion_id": "backend-file",
             "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
-            "id": "c4b26f6c-2356-439c-8f9c-a86f8ac5479f",
+            "id": "94c3a6b3-91c2-4a3a-afd7-e8d8e38d4d2c",
             "mandate_revision": 1,
             "observed": "exit=0; stdout=; stderr=",
             "outcome": "passed",
-            "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+            "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
             "verifier_kind": "command"
           },
           "status": "passed"
@@ -538,15 +548,15 @@
           "criterion_id": "frontend-file",
           "description": "The assembled repository contains the frontend artifact",
           "evidence": {
-            "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
-            "created_at": 1787945733,
+            "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
+            "created_at": 1787946373,
             "criterion_id": "frontend-file",
             "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
-            "id": "7289b27a-1e45-4fa8-b4f1-f03a6804b30c",
+            "id": "24506881-2a68-409b-aa32-07a598ccbf75",
             "mandate_revision": 1,
             "observed": "exit=0; stdout=; stderr=",
             "outcome": "passed",
-            "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+            "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
             "verifier_kind": "command"
           },
           "status": "passed"
@@ -586,6 +596,11 @@
           "security_invariant_failures": 0,
           "uncertain_evidence": 0
         },
+        "planned_principal_controls": {
+          "provenance": "accepted_known_uncertainty",
+          "total": 0,
+          "worker_controls": 0
+        },
         "reconciliation": {
           "assignments": 0,
           "principal_effect_reconciliations": 0
@@ -596,27 +611,26 @@
           "watchdog_findings": 0
         },
         "timing": {
-          "accepted_at": 1787945730,
-          "completed_at": 1787945733,
-          "created_at": 1787945730,
-          "total_elapsed_millis": 3000,
-          "worker_execution_millis": 1906
+          "accepted_at": 1787946371,
+          "completed_at": 1787946373,
+          "created_at": 1787946371,
+          "total_elapsed_millis": 2000,
+          "worker_execution_millis": 1808
         },
         "unplanned_principal_interventions": {
           "commission_amendments": 0,
-          "planned_worker_controls": 0,
           "required_approval_gate_actions_excluded": true,
           "total": 0,
           "worker_controls": 0
         },
         "useful_concurrency": {
-          "elapsed_time_reduction_millis": 905,
-          "end_to_end_elapsed_millis": 2059,
+          "elapsed_time_reduction_millis": 845,
+          "end_to_end_elapsed_millis": 1962,
           "occurred": true,
-          "overlap_millis": 905,
-          "parallel_execution_window_millis": 1001,
-          "serial_attempt_millis": 1906,
-          "serial_execution_millis": 1906,
+          "overlap_millis": 845,
+          "parallel_execution_window_millis": 963,
+          "serial_attempt_millis": 1808,
+          "serial_execution_millis": 1808,
           "success_metric": "verified execution elapsed-time reduction"
         }
       },
@@ -624,8 +638,8 @@
       "title": "Verified Completion"
     },
     "commission": {
-      "accepted_at": 1787945730,
-      "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+      "accepted_at": 1787946371,
+      "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
       "authority": {
         "actions": [
           "codex.git_change"
@@ -637,20 +651,20 @@
           "frontend.txt"
         ],
         "repositories": [
-          "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+          "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/principal-checkout"
         ]
       },
-      "completed_at": 1787945733,
+      "completed_at": 1787946373,
       "constraints": [],
       "control_revision": 0,
-      "created_at": 1787945730,
+      "created_at": 1787946371,
       "execution": {
-        "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+        "base_revision": "5db264b42dfc922a22291fb2356230bb6c996f6b",
         "kind": "codex_git",
-        "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+        "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/principal-checkout"
       },
       "goal": "Add independently implemented backend and frontend artifacts.",
-      "id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+      "id": "96d8a24d-b688-4fbb-bca8-a46c7f9ae230",
       "known_uncertainties": [],
       "project_id": null,
       "proposed_plan": {
@@ -842,16 +856,16 @@
     "events": [
       {
         "commission_revision": 0,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {},
         "sequence": 1,
         "type": "commission_proposed"
       },
       {
         "commission_revision": 0,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {
-          "attachment_id": "47877488-1023-43ee-8543-e4531bedf537",
+          "attachment_id": "353a8755-bdcb-4c47-86dd-732f4663bce4",
           "role": "active"
         },
         "sequence": 2,
@@ -859,9 +873,9 @@
       },
       {
         "commission_revision": 0,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {
-          "active_attachment_id": "47877488-1023-43ee-8543-e4531bedf537",
+          "active_attachment_id": "353a8755-bdcb-4c47-86dd-732f4663bce4",
           "previous_active_attachment_id": null
         },
         "sequence": 3,
@@ -869,14 +883,14 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {},
         "sequence": 4,
         "type": "commission_accepted"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {
           "plan_revision": 1,
           "reason": "initial_decomposition",
@@ -887,9 +901,9 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
           "logical_id": "backend",
           "plan_revision": 1
         },
@@ -898,9 +912,9 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "payload": {
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
           "logical_id": "frontend",
           "plan_revision": 1
         },
@@ -909,16 +923,16 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "payload": {
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
           "logical_id": "backend",
           "plan_revision": 1,
-          "started_at_ms": 1787945731008,
+          "started_at_ms": 1787946371919,
           "worker_configuration": {
             "adapter": {
               "command": [
-                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
                 "codex"
               ],
               "kind": "codex_app_server",
@@ -946,7 +960,7 @@
               "result_submission",
               "contained"
             ],
-            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "containment_profile": "openshell-repaired-v0.0.104-456fef3203bf685a",
             "context": {
               "capacity_tokens": 100000,
               "strategy": "fresh"
@@ -984,29 +998,29 @@
             ]
           },
           "worker_handle": "Arya",
-          "worker_id": "33cba832-2c16-413a-9e25-74c252c916c8"
+          "worker_id": "a068bdcb-a769-462c-9187-1326ae80d21e"
         },
         "sequence": 8,
         "type": "attempt_started"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "payload": {
           "activity": "Worker launched",
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
           "worker_handle": "Arya",
-          "worker_id": "33cba832-2c16-413a-9e25-74c252c916c8"
+          "worker_id": "a068bdcb-a769-462c-9187-1326ae80d21e"
         },
         "sequence": 9,
         "type": "worker_activity"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "payload": {
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
-          "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
+          "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
           "concurrency_slots": 1,
           "model_spend_cents": 0,
           "paid_service_spend_cents": 0,
@@ -1018,16 +1032,16 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "payload": {
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
           "logical_id": "frontend",
           "plan_revision": 1,
-          "started_at_ms": 1787945731012,
+          "started_at_ms": 1787946371923,
           "worker_configuration": {
             "adapter": {
               "command": [
-                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
                 "claude"
               ],
               "kind": "claude_agent_sdk",
@@ -1055,7 +1069,7 @@
               "result_submission",
               "contained"
             ],
-            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "containment_profile": "openshell-repaired-v0.0.104-456fef3203bf685a",
             "context": {
               "capacity_tokens": 100000,
               "strategy": "fresh"
@@ -1093,29 +1107,29 @@
             ]
           },
           "worker_handle": "Brienne",
-          "worker_id": "535d4d61-b329-46f8-b599-877987525613"
+          "worker_id": "313a3281-ba43-4ecc-adad-3bb36c569a82"
         },
         "sequence": 11,
         "type": "attempt_started"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "payload": {
           "activity": "Worker launched",
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
           "worker_handle": "Brienne",
-          "worker_id": "535d4d61-b329-46f8-b599-877987525613"
+          "worker_id": "313a3281-ba43-4ecc-adad-3bb36c569a82"
         },
         "sequence": 12,
         "type": "worker_activity"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "payload": {
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
-          "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
+          "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
           "concurrency_slots": 1,
           "model_spend_cents": 0,
           "paid_service_spend_cents": 0,
@@ -1127,18 +1141,18 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946372,
         "payload": {},
         "sequence": 14,
         "type": "result_submitted"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945731,
+        "created_at": 1787946372,
         "payload": {
           "activity": "Claude produced a structured Result",
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
-          "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
+          "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
           "native_session_id": "claude-session-fixture",
           "usage": {
             "cost_cents": 0,
@@ -1151,18 +1165,18 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946372,
         "payload": {},
         "sequence": 16,
         "type": "result_submitted"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946372,
         "payload": {
           "activity": "Codex produced a structured Result",
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
-          "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
+          "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
           "native_session_id": "codex-thread-fixture",
           "usage": {
             "cost_cents": 0,
@@ -1175,27 +1189,27 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 18,
         "type": "evidence_recorded"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 19,
         "type": "evidence_recorded"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {
-          "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "artifact_revision": "7a494d01831503094f3d847c262ea78e253a387f",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
           "logical_id": "frontend",
           "plan_revision": 1,
-          "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+          "result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
           "serialized": true
         },
         "sequence": 20,
@@ -1203,50 +1217,50 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 21,
         "type": "evidence_recorded"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 22,
         "type": "evidence_recorded"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
-          "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
-          "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0"
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
+          "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
+          "result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a"
         },
         "sequence": 23,
         "type": "result_accepted"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "payload": {
           "execution_frontier": [],
           "plan_revision": 2,
           "reason": "evidence_advanced_frontier",
-          "source_result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0"
+          "source_result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a"
         },
         "sequence": 24,
         "type": "plan_revised"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {
-          "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
           "logical_id": "backend",
           "plan_revision": 1,
-          "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+          "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
           "serialized": true
         },
         "sequence": 25,
@@ -1254,63 +1268,63 @@
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 26,
         "type": "evidence_recorded"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 27,
         "type": "evidence_recorded"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
-          "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
-          "result_id": "666837ed-2e34-47d5-9a70-2819de47976d"
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
+          "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
+          "result_id": "956af69b-96f9-433c-8aa8-cbf449257169"
         },
         "sequence": 28,
         "type": "result_accepted"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {
           "attempt_ids": [
-            "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
-            "cd430bbc-59d9-49e0-b9ce-f5c84a07d700"
+            "4beedf1a-d3de-4395-aac2-d1565e8d076b",
+            "6edba797-1749-4a3c-9b79-ddb266108041"
           ],
-          "elapsed_time_reduction_millis": 905,
-          "end_to_end_elapsed_millis": 2059,
-          "overlap_millis": 905,
-          "parallel_execution_window_millis": 1001,
-          "serial_execution_millis": 1906,
+          "elapsed_time_reduction_millis": 845,
+          "end_to_end_elapsed_millis": 1962,
+          "overlap_millis": 845,
+          "parallel_execution_window_millis": 963,
+          "serial_execution_millis": 1808,
           "success_metric": "verified execution elapsed-time reduction",
-          "trigger_attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29"
+          "trigger_attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b"
         },
         "sequence": 29,
         "type": "useful_concurrency_observed"
       },
       {
         "commission_revision": 1,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {
           "execution_frontier": [],
           "plan_revision": 3,
           "reason": "evidence_advanced_frontier",
-          "source_result_id": "666837ed-2e34-47d5-9a70-2819de47976d"
+          "source_result_id": "956af69b-96f9-433c-8aa8-cbf449257169"
         },
         "sequence": 30,
         "type": "plan_revised"
       },
       {
         "commission_revision": 2,
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "payload": {},
         "sequence": 31,
         "type": "commission_verified_complete"
@@ -1318,15 +1332,15 @@
     ],
     "evidence": [
       {
-        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
-        "created_at": 1787945732,
+        "artifact_revision": "7a494d01831503094f3d847c262ea78e253a387f",
+        "created_at": 1787946373,
         "criterion_id": "frontend-file",
         "current": false,
         "defect": null,
         "environment": "tyrion-controlled-v1",
         "evidence_type": "command_output",
         "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
-        "id": "4e0f7342-747a-4805-b042-470ddd5ba244",
+        "id": "f358a60d-9404-4d7c-bb86-747ac7e9c1a7",
         "mandate_revision": 1,
         "material_contradiction": false,
         "observed": "exit=0; stdout=; stderr=",
@@ -1340,24 +1354,24 @@
           "kind": "command"
         },
         "producer_attempt_id": null,
-        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
         "scope": "candidate",
-        "verification_attempt_id": "c42141de-1ae9-4944-bcd6-ef8944737fbe",
+        "verification_attempt_id": "1933d546-ffa1-47c2-882b-8fcae34af8cf",
         "verifier_configuration": "contained-command-v1",
         "verifier_identity": "contained-command-1",
         "verifier_kind": "command",
         "verifier_type": "deterministic"
       },
       {
-        "artifact_revision": "28739b5d57a43910b7090e476331a510daf2f949",
-        "created_at": 1787945732,
+        "artifact_revision": "b2c606fe70e52a85be1b51225c96cac66cc1f618",
+        "created_at": 1787946373,
         "criterion_id": "backend-file",
         "current": false,
         "defect": null,
         "environment": "tyrion-controlled-v1",
         "evidence_type": "command_output",
         "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
-        "id": "d73a2656-ed3c-438a-9daa-6f67cb2fb550",
+        "id": "3b5ee311-db2f-4a2e-bce2-b31bf1a416a8",
         "mandate_revision": 1,
         "material_contradiction": false,
         "observed": "exit=0; stdout=; stderr=",
@@ -1371,24 +1385,24 @@
           "kind": "command"
         },
         "producer_attempt_id": null,
-        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
         "scope": "candidate",
-        "verification_attempt_id": "87676180-d558-47c5-851a-57c1f0ae24c3",
+        "verification_attempt_id": "7978864f-eb86-49ad-aef8-f7289135b0bf",
         "verifier_configuration": "contained-command-v1",
         "verifier_identity": "contained-command-1",
         "verifier_kind": "command",
         "verifier_type": "deterministic"
       },
       {
-        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
-        "created_at": 1787945732,
+        "artifact_revision": "7a494d01831503094f3d847c262ea78e253a387f",
+        "created_at": 1787946373,
         "criterion_id": "backend-file",
         "current": false,
         "defect": "result",
         "environment": "tyrion-controlled-v1",
         "evidence_type": "command_output",
         "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
-        "id": "d34fa731-27fe-4459-8ff8-f77b3e89b5cb",
+        "id": "aca3d60d-8ca9-400f-93ac-7988f6ba4253",
         "mandate_revision": 1,
         "material_contradiction": false,
         "observed": "exit=1; stdout=; stderr=cat: backend.txt: No such file or directory\n",
@@ -1402,24 +1416,24 @@
           "kind": "command"
         },
         "producer_attempt_id": null,
-        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
         "scope": "integrated",
-        "verification_attempt_id": "64cc2b11-9e9f-4241-849a-6140d266f7b5",
+        "verification_attempt_id": "e6d24af0-c141-405b-98d8-3ae3210a1511",
         "verifier_configuration": "contained-command-v1",
         "verifier_identity": "contained-command-1",
         "verifier_kind": "command",
         "verifier_type": "deterministic"
       },
       {
-        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
-        "created_at": 1787945732,
+        "artifact_revision": "7a494d01831503094f3d847c262ea78e253a387f",
+        "created_at": 1787946373,
         "criterion_id": "frontend-file",
         "current": false,
         "defect": null,
         "environment": "tyrion-controlled-v1",
         "evidence_type": "command_output",
         "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
-        "id": "ad9d4cbe-bf49-48c7-884d-883baa5ac024",
+        "id": "67b96267-cdb4-4a7c-8cb6-7a03b1c54308",
         "mandate_revision": 1,
         "material_contradiction": false,
         "observed": "exit=0; stdout=; stderr=",
@@ -1433,24 +1447,24 @@
           "kind": "command"
         },
         "producer_attempt_id": null,
-        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
         "scope": "integrated",
-        "verification_attempt_id": "ba6fba35-fb5c-4b32-a677-8956aff06d44",
+        "verification_attempt_id": "5af0a3c5-b0bd-40aa-b784-dbc7138f7e90",
         "verifier_configuration": "contained-command-v1",
         "verifier_identity": "contained-command-1",
         "verifier_kind": "command",
         "verifier_type": "deterministic"
       },
       {
-        "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
-        "created_at": 1787945733,
+        "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
+        "created_at": 1787946373,
         "criterion_id": "backend-file",
         "current": true,
         "defect": null,
         "environment": "tyrion-controlled-v1",
         "evidence_type": "command_output",
         "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
-        "id": "c4b26f6c-2356-439c-8f9c-a86f8ac5479f",
+        "id": "94c3a6b3-91c2-4a3a-afd7-e8d8e38d4d2c",
         "mandate_revision": 1,
         "material_contradiction": false,
         "observed": "exit=0; stdout=; stderr=",
@@ -1464,24 +1478,24 @@
           "kind": "command"
         },
         "producer_attempt_id": null,
-        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
         "scope": "integrated",
-        "verification_attempt_id": "489589ef-1c61-441d-96f0-5e839bf5927c",
+        "verification_attempt_id": "4e9b652b-5485-4019-80d6-09d0d9924678",
         "verifier_configuration": "contained-command-v1",
         "verifier_identity": "contained-command-1",
         "verifier_kind": "command",
         "verifier_type": "deterministic"
       },
       {
-        "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
-        "created_at": 1787945733,
+        "artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
+        "created_at": 1787946373,
         "criterion_id": "frontend-file",
         "current": true,
         "defect": null,
         "environment": "tyrion-controlled-v1",
         "evidence_type": "command_output",
         "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
-        "id": "7289b27a-1e45-4fa8-b4f1-f03a6804b30c",
+        "id": "24506881-2a68-409b-aa32-07a598ccbf75",
         "mandate_revision": 1,
         "material_contradiction": false,
         "observed": "exit=0; stdout=; stderr=",
@@ -1495,9 +1509,9 @@
           "kind": "command"
         },
         "producer_attempt_id": null,
-        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
         "scope": "integrated",
-        "verification_attempt_id": "cbdb9051-ea42-4b5a-bde8-d3bb86b39dba",
+        "verification_attempt_id": "bd8f931b-0d00-4734-8fba-71bb3aa5e654",
         "verifier_configuration": "contained-command-v1",
         "verifier_identity": "contained-command-1",
         "verifier_kind": "command",
@@ -1509,7 +1523,7 @@
     "operation_requests": [],
     "plans": [
       {
-        "created_at": 1787945730,
+        "created_at": 1787946371,
         "reason": "initial decomposition exposed the first safe Execution Frontier",
         "revision": 1,
         "snapshot": {
@@ -1601,7 +1615,7 @@
         "source": "entry_model"
       },
       {
-        "created_at": 1787945732,
+        "created_at": 1787946373,
         "reason": "current Evidence advanced the safe Execution Frontier",
         "revision": 2,
         "snapshot": {
@@ -1689,13 +1703,13 @@
               ]
             }
           ],
-          "evidence_result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+          "evidence_result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
           "execution_frontier": []
         },
         "source": "control_plane"
       },
       {
-        "created_at": 1787945733,
+        "created_at": 1787946373,
         "reason": "current Evidence advanced the safe Execution Frontier",
         "revision": 3,
         "snapshot": {
@@ -1783,7 +1797,7 @@
               ]
             }
           ],
-          "evidence_result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+          "evidence_result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
           "execution_frontier": []
         },
         "source": "control_plane"
@@ -1799,38 +1813,38 @@
     "restart_recoveries": [],
     "results": [
       {
-        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "artifact_revision": "7a494d01831503094f3d847c262ea78e253a387f",
         "artifacts": [
           {
             "kind": "base_git_bundle",
-            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/cd430bbc-59d9-49e0-b9ce-f5c84a07d700/base.bundle",
-            "sha256": "e191d7207701efe0de1254fb9abc07b992cef1e9a00989cba5f49bf3f0be92df",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/artifacts/96d8a24d-b688-4fbb-bca8-a46c7f9ae230/6edba797-1749-4a3c-9b79-ddb266108041/base.bundle",
+            "sha256": "a6a4d6fbf7790ef44a8ec8b2e94fdd1eb7c9e95bda24273639dfc399d14b6e30",
             "size_bytes": 311
           },
           {
             "kind": "candidate_git_bundle",
-            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/cd430bbc-59d9-49e0-b9ce-f5c84a07d700/candidate.bundle",
-            "sha256": "945f690d60834c7337ec76827d0971aff79c2a4e362118688d5b618a3cadf029",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/artifacts/96d8a24d-b688-4fbb-bca8-a46c7f9ae230/6edba797-1749-4a3c-9b79-ddb266108041/candidate.bundle",
+            "sha256": "507bf319c500f5dbb4e6d863a861768b195b5891f4344d7f243254ecdd93edac",
             "size_bytes": 597
           },
           {
             "kind": "integrated_git_bundle",
-            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/cd430bbc-59d9-49e0-b9ce-f5c84a07d700/integrated.bundle",
-            "sha256": "21bd53ef2205e0347ca5bf5530d96a96c7990f81437f9580bbc530552c802667",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/artifacts/96d8a24d-b688-4fbb-bca8-a46c7f9ae230/6edba797-1749-4a3c-9b79-ddb266108041/integrated.bundle",
+            "sha256": "e8bf2297ac5a4c1ba45f7f9582a86d4c711acf7f8378726f193cafc002f56346",
             "size_bytes": 602
           }
         ],
-        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
-        "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+        "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
+        "base_revision": "5db264b42dfc922a22291fb2356230bb6c996f6b",
         "candidate_commits": [
-          "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407"
+          "7a494d01831503094f3d847c262ea78e253a387f"
         ],
         "changed_paths": [
           "frontend.txt"
         ],
-        "created_at": 1787945731,
-        "id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
-        "integrated_artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "created_at": 1787946372,
+        "id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
+        "integrated_artifact_revision": "7a494d01831503094f3d847c262ea78e253a387f",
         "known_effects": [],
         "mandate_revision": 1,
         "output": "return a routed greeting",
@@ -1844,7 +1858,7 @@
             "corrections": 0,
             "cost_cents": 0,
             "delegation": "native_unchanged",
-            "latency_ms": 905,
+            "latency_ms": 845,
             "name": "frontend",
             "principal_intervention": false,
             "provenance": "plan",
@@ -1874,7 +1888,7 @@
             },
             "producer_attempt_id": null,
             "scope": "candidate",
-            "verification_attempt_id": "c42141de-1ae9-4944-bcd6-ef8944737fbe",
+            "verification_attempt_id": "1933d546-ffa1-47c2-882b-8fcae34af8cf",
             "verifier_configuration": "contained-command-v1",
             "verifier_identity": "contained-command-1",
             "verifier_kind": "command",
@@ -1899,7 +1913,7 @@
             },
             "producer_attempt_id": null,
             "scope": "integrated",
-            "verification_attempt_id": "64cc2b11-9e9f-4241-849a-6140d266f7b5",
+            "verification_attempt_id": "e6d24af0-c141-405b-98d8-3ae3210a1511",
             "verifier_configuration": "contained-command-v1",
             "verifier_identity": "contained-command-1",
             "verifier_kind": "command",
@@ -1924,7 +1938,7 @@
             },
             "producer_attempt_id": null,
             "scope": "integrated",
-            "verification_attempt_id": "ba6fba35-fb5c-4b32-a677-8956aff06d44",
+            "verification_attempt_id": "5af0a3c5-b0bd-40aa-b784-dbc7138f7e90",
             "verifier_configuration": "contained-command-v1",
             "verifier_identity": "contained-command-1",
             "verifier_kind": "command",
@@ -1933,38 +1947,38 @@
         ]
       },
       {
-        "artifact_revision": "28739b5d57a43910b7090e476331a510daf2f949",
+        "artifact_revision": "b2c606fe70e52a85be1b51225c96cac66cc1f618",
         "artifacts": [
           {
             "kind": "base_git_bundle",
-            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/7dea20c9-e9ba-4ac8-b502-8285971c2e29/base.bundle",
-            "sha256": "e191d7207701efe0de1254fb9abc07b992cef1e9a00989cba5f49bf3f0be92df",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/artifacts/96d8a24d-b688-4fbb-bca8-a46c7f9ae230/4beedf1a-d3de-4395-aac2-d1565e8d076b/base.bundle",
+            "sha256": "a6a4d6fbf7790ef44a8ec8b2e94fdd1eb7c9e95bda24273639dfc399d14b6e30",
             "size_bytes": 311
           },
           {
             "kind": "candidate_git_bundle",
-            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/7dea20c9-e9ba-4ac8-b502-8285971c2e29/candidate.bundle",
-            "sha256": "8c0c7c7806e8b561a985f2781b10db4360f0b21ee99d054f78180005978b0e7a",
-            "size_bytes": 593
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/artifacts/96d8a24d-b688-4fbb-bca8-a46c7f9ae230/4beedf1a-d3de-4395-aac2-d1565e8d076b/candidate.bundle",
+            "sha256": "1e221bab3accf8b1cb1516e9eb89624c71915bb60f5b39843630d684053ca9e1",
+            "size_bytes": 594
           },
           {
             "kind": "integrated_git_bundle",
-            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/7dea20c9-e9ba-4ac8-b502-8285971c2e29/integrated.bundle",
-            "sha256": "d297a410df1204aa719829246e8270cb72b7b2e39ac424300c6d3a26273e4d06",
-            "size_bytes": 885
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/artifacts/96d8a24d-b688-4fbb-bca8-a46c7f9ae230/4beedf1a-d3de-4395-aac2-d1565e8d076b/integrated.bundle",
+            "sha256": "ad95d7937073a64221d3631aef985f5fa0585317db16a6e2e2cc0870a29a2c4d",
+            "size_bytes": 884
           }
         ],
-        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
-        "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+        "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
+        "base_revision": "5db264b42dfc922a22291fb2356230bb6c996f6b",
         "candidate_commits": [
-          "28739b5d57a43910b7090e476331a510daf2f949"
+          "b2c606fe70e52a85be1b51225c96cac66cc1f618"
         ],
         "changed_paths": [
           "backend.txt"
         ],
-        "created_at": 1787945732,
-        "id": "666837ed-2e34-47d5-9a70-2819de47976d",
-        "integrated_artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+        "created_at": 1787946372,
+        "id": "956af69b-96f9-433c-8aa8-cbf449257169",
+        "integrated_artifact_revision": "09d97c7e39bc32d879d8b2e75d7bd10f1166eca7",
         "known_effects": [],
         "mandate_revision": 1,
         "output": "return a routed greeting",
@@ -1978,7 +1992,7 @@
             "corrections": 0,
             "cost_cents": 0,
             "delegation": "native_unchanged",
-            "latency_ms": 1001,
+            "latency_ms": 963,
             "name": "backend",
             "principal_intervention": false,
             "provenance": "plan",
@@ -2008,7 +2022,7 @@
             },
             "producer_attempt_id": null,
             "scope": "candidate",
-            "verification_attempt_id": "87676180-d558-47c5-851a-57c1f0ae24c3",
+            "verification_attempt_id": "7978864f-eb86-49ad-aef8-f7289135b0bf",
             "verifier_configuration": "contained-command-v1",
             "verifier_identity": "contained-command-1",
             "verifier_kind": "command",
@@ -2033,7 +2047,7 @@
             },
             "producer_attempt_id": null,
             "scope": "integrated",
-            "verification_attempt_id": "489589ef-1c61-441d-96f0-5e839bf5927c",
+            "verification_attempt_id": "4e9b652b-5485-4019-80d6-09d0d9924678",
             "verifier_configuration": "contained-command-v1",
             "verifier_identity": "contained-command-1",
             "verifier_kind": "command",
@@ -2058,7 +2072,7 @@
             },
             "producer_attempt_id": null,
             "scope": "integrated",
-            "verification_attempt_id": "cbdb9051-ea42-4b5a-bde8-d3bb86b39dba",
+            "verification_attempt_id": "bd8f931b-0d00-4734-8fba-71bb3aa5e654",
             "verifier_configuration": "contained-command-v1",
             "verifier_identity": "contained-command-1",
             "verifier_kind": "command",
@@ -2069,15 +2083,15 @@
     ],
     "retention_materials": [
       {
-        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
         "captured_adapter_events": 7,
         "captured_worker_output": true,
         "content_available": true,
         "content_bytes": 1401,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "expired_at": null,
-        "expires_at": 1790537733,
-        "id": "transcript:7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "expires_at": 1790538373,
+        "id": "transcript:4beedf1a-d3de-4395-aac2-d1565e8d076b",
         "kind": "raw_worker_transcript",
         "pinned": false,
         "result_id": null,
@@ -2086,15 +2100,15 @@
         "retained_for_uncertain_effect": false
       },
       {
-        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
         "captured_adapter_events": 7,
         "captured_worker_output": true,
         "content_available": true,
         "content_bytes": 1288,
-        "created_at": 1787945731,
+        "created_at": 1787946371,
         "expired_at": null,
-        "expires_at": 1790537733,
-        "id": "transcript:cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "expires_at": 1790538373,
+        "id": "transcript:6edba797-1749-4a3c-9b79-ddb266108041",
         "kind": "raw_worker_transcript",
         "pinned": false,
         "result_id": null,
@@ -2136,6 +2150,11 @@
         "security_invariant_failures": 0,
         "uncertain_evidence": 0
       },
+      "planned_principal_controls": {
+        "provenance": "accepted_known_uncertainty",
+        "total": 0,
+        "worker_controls": 0
+      },
       "reconciliation": {
         "assignments": 0,
         "principal_effect_reconciliations": 0
@@ -2146,56 +2165,55 @@
         "watchdog_findings": 0
       },
       "timing": {
-        "accepted_at": 1787945730,
-        "completed_at": 1787945733,
-        "created_at": 1787945730,
-        "total_elapsed_millis": 3000,
-        "worker_execution_millis": 1906
+        "accepted_at": 1787946371,
+        "completed_at": 1787946373,
+        "created_at": 1787946371,
+        "total_elapsed_millis": 2000,
+        "worker_execution_millis": 1808
       },
       "unplanned_principal_interventions": {
         "commission_amendments": 0,
-        "planned_worker_controls": 0,
         "required_approval_gate_actions_excluded": true,
         "total": 0,
         "worker_controls": 0
       },
       "useful_concurrency": {
-        "elapsed_time_reduction_millis": 905,
-        "end_to_end_elapsed_millis": 2059,
+        "elapsed_time_reduction_millis": 845,
+        "end_to_end_elapsed_millis": 1962,
         "occurred": true,
-        "overlap_millis": 905,
-        "parallel_execution_window_millis": 1001,
-        "serial_attempt_millis": 1906,
-        "serial_execution_millis": 1906,
+        "overlap_millis": 845,
+        "parallel_execution_window_millis": 963,
+        "serial_attempt_millis": 1808,
+        "serial_execution_millis": 1808,
         "success_metric": "verified execution elapsed-time reduction"
       }
     },
     "skill_associations": [
       {
         "assignment_class": "critical_path",
-        "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
-        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
+        "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
         "causal": false,
         "confidence_basis_points": 8000,
         "corrections": 0,
         "cost_cents": 0,
         "evidence": [
-          "4e0f7342-747a-4805-b042-470ddd5ba244",
-          "d34fa731-27fe-4459-8ff8-f77b3e89b5cb",
-          "ad9d4cbe-bf49-48c7-884d-883baa5ac024"
+          "f358a60d-9404-4d7c-bb86-747ac7e9c1a7",
+          "aca3d60d-8ca9-400f-93ac-7988f6ba4253",
+          "67b96267-cdb4-4a7c-8cb6-7a03b1c54308"
         ],
         "global_ban": false,
         "harness": "claude",
-        "id": "6ea39fe9-23c5-4402-8ab2-a5b4ab1a4dd1",
-        "latency_ms": 905,
+        "id": "e3d0d68f-51fc-4d98-ae7e-224906de8db2",
+        "latency_ms": 845,
         "observation": "verified_success",
-        "observed_at": 1787945732,
+        "observed_at": 1787946373,
         "principal_intervention": false,
-        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "result_id": "7065d1ca-cc4b-4a4d-b62c-b885ba2b054a",
         "scope": {
           "assignment_class": "critical_path",
-          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
-          "commission_id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+          "assignment_id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
+          "commission_id": "96d8a24d-b688-4fbb-bca8-a46c7f9ae230",
           "harness": "claude",
           "worker_configuration": "claude-structured-git"
         },
@@ -2208,29 +2226,29 @@
       },
       {
         "assignment_class": "critical_path",
-        "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
-        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
+        "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
         "causal": false,
         "confidence_basis_points": 8000,
         "corrections": 0,
         "cost_cents": 0,
         "evidence": [
-          "d73a2656-ed3c-438a-9daa-6f67cb2fb550",
-          "c4b26f6c-2356-439c-8f9c-a86f8ac5479f",
-          "7289b27a-1e45-4fa8-b4f1-f03a6804b30c"
+          "3b5ee311-db2f-4a2e-bce2-b31bf1a416a8",
+          "94c3a6b3-91c2-4a3a-afd7-e8d8e38d4d2c",
+          "24506881-2a68-409b-aa32-07a598ccbf75"
         ],
         "global_ban": false,
         "harness": "codex",
-        "id": "e3bec5c2-c914-4434-bfca-c729888507ac",
-        "latency_ms": 1001,
+        "id": "e71184fa-f734-41b1-b7c8-9496348639ee",
+        "latency_ms": 963,
         "observation": "verified_success",
-        "observed_at": 1787945733,
+        "observed_at": 1787946373,
         "principal_intervention": false,
-        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "result_id": "956af69b-96f9-433c-8aa8-cbf449257169",
         "scope": {
           "assignment_class": "critical_path",
-          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
-          "commission_id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+          "assignment_id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
+          "commission_id": "96d8a24d-b688-4fbb-bca8-a46c7f9ae230",
           "harness": "codex",
           "worker_configuration": "codex-structured-git"
         },
@@ -2263,20 +2281,20 @@
     "worker_commands": [],
     "workers": [
       {
-        "activity_at_ms": 1787945733067,
+        "activity_at_ms": 1787946373880,
         "assignment": {
           "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
-          "id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "id": "dcdfa2bc-5e63-43ee-b194-64a7e490b257",
           "logical_id": "backend"
         },
-        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "attempt_id": "4beedf1a-d3de-4395-aac2-d1565e8d076b",
         "available_controls": [
           "inspect"
         ],
         "configuration": {
           "adapter": {
             "command": [
-              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
               "codex"
             ],
             "kind": "codex_app_server",
@@ -2304,7 +2322,7 @@
             "result_submission",
             "contained"
           ],
-          "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+          "containment_profile": "openshell-repaired-v0.0.104-456fef3203bf685a",
           "context": {
             "capacity_tokens": 100000,
             "strategy": "fresh"
@@ -2341,9 +2359,9 @@
             "git"
           ]
         },
-        "elapsed_time_ms": 1001,
+        "elapsed_time_ms": 963,
         "handle": "Arya",
-        "id": "33cba832-2c16-413a-9e25-74c252c916c8",
+        "id": "a068bdcb-a769-462c-9187-1326ae80d21e",
         "latest_meaningful_activity": "Result accepted",
         "native_session_id": "codex-thread-fixture",
         "routing_rationale": {
@@ -2369,7 +2387,7 @@
             "continuity"
           ]
         },
-        "started_at_ms": 1787945731008,
+        "started_at_ms": 1787946371919,
         "status": "succeeded",
         "usage": {
           "cost_cents": 0,
@@ -2378,20 +2396,20 @@
         }
       },
       {
-        "activity_at_ms": 1787945732659,
+        "activity_at_ms": 1787946373485,
         "assignment": {
           "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
-          "id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "id": "32628cf5-ac96-454e-98a6-e7e3b174cf2a",
           "logical_id": "frontend"
         },
-        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "attempt_id": "6edba797-1749-4a3c-9b79-ddb266108041",
         "available_controls": [
           "inspect"
         ],
         "configuration": {
           "adapter": {
             "command": [
-              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmpUX6GOT/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
               "claude"
             ],
             "kind": "claude_agent_sdk",
@@ -2419,7 +2437,7 @@
             "result_submission",
             "contained"
           ],
-          "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+          "containment_profile": "openshell-repaired-v0.0.104-456fef3203bf685a",
           "context": {
             "capacity_tokens": 100000,
             "strategy": "fresh"
@@ -2456,9 +2474,9 @@
             "git"
           ]
         },
-        "elapsed_time_ms": 905,
+        "elapsed_time_ms": 845,
         "handle": "Brienne",
-        "id": "535d4d61-b329-46f8-b599-877987525613",
+        "id": "313a3281-ba43-4ecc-adad-3bb36c569a82",
         "latest_meaningful_activity": "Result accepted",
         "native_session_id": "claude-session-fixture",
         "routing_rationale": {
@@ -2484,7 +2502,7 @@
             "continuity"
           ]
         },
-        "started_at_ms": 1787945731012,
+        "started_at_ms": 1787946371923,
         "status": "succeeded",
         "usage": {
           "cost_cents": 0,
@@ -2494,6 +2512,6 @@
       }
     ]
   },
-  "summary_markdown": "# Tyrion Commission Record\n\nChecksum: `sha256:8b5749792b3369bf653e9b37418179d35020f0c3f57dc05a61f882f1ff6ab602`\n\nCommission: `466a025a-a4b2-4f99-b7cc-88ac74968477`\n\nStatus: `verified_complete`\n\nAcceptance Criteria: `2/2` passed\n\nContainment scope: fixture-backed Worker evidence is not production containment attestation.\n",
+  "summary_markdown": "# Tyrion Commission Record\n\nChecksum: `sha256:d0f7987eabe037ec718bd919e0736001916e70bb75f1ebd28a445c19a49aa1e8`\n\nCommission: `96d8a24d-b688-4fbb-bca8-a46c7f9ae230`\n\nStatus: `verified_complete`\n\nDogfood readiness: `blocked`\n\nAcceptance Criteria: `2/2` passed\n\nContainment scope: fixture-backed Worker evidence is not production containment attestation.\n",
   "version": 1
 }
