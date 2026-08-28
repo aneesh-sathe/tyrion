@@ -561,6 +561,9 @@ pub enum Command {
     InspectCommission {
         commission_id: String,
     },
+    ExportCommissionRecord {
+        commission_id: String,
+    },
     AcceptCommission {
         commission_id: String,
     },
@@ -722,6 +725,7 @@ impl Command {
         !matches!(
             self,
             Self::InspectCommission { .. }
+                | Self::ExportCommissionRecord { .. }
                 | Self::InspectApprovalGate { .. }
                 | Self::InspectCommissionAmendment { .. }
                 | Self::ResumeAttachment { .. }

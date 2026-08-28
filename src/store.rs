@@ -5454,6 +5454,58 @@ impl Store {
         Ok(projection)
     }
 
+    pub fn export_commission_record(
+        &self,
+        request: &Request,
+        commission_id: &str,
+    ) -> Result<Value, TyrionError> {
+        let attachment_id = authenticated_attachment_id(&self.connection, request)?;
+        ensure_commission_attachment(
+            &self.connection,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let record = project_commission(&self.connection, commission_id)?;
+        let checksum = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&record)?));
+        let fixture_backed = record["workers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|worker| {
+                worker["configuration"]["adapter"]["version"]
+                    .as_str()
+                    .is_some_and(|version| version.contains("fixture"))
+                    || worker["configuration"]["model"]
+                        .as_str()
+                        .is_some_and(|model| model.contains("fixture"))
+            });
+        let containment_note = if fixture_backed {
+            "fixture-backed Worker evidence is not production containment attestation."
+        } else {
+            "This export preserves containment Evidence but does not independently attest the runtime."
+        };
+        let criteria = record["criteria"].as_array().map_or(0, Vec::len);
+        let passed = record["criteria"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|criterion| criterion["status"] == "passed")
+            .count();
+        let status = record["commission"]["status"].as_str().unwrap_or("unknown");
+        let summary_markdown = format!(
+            "# Tyrion Commission Record\n\nChecksum: `{checksum}`\n\nCommission: `{commission_id}`\n\nStatus: `{status}`\n\nAcceptance Criteria: `{passed}/{criteria}` passed\n\nContainment scope: {containment_note}\n"
+        );
+        Ok(serde_json::json!({
+            "format": "tyrion.commission",
+            "version": 1,
+            "exported_at": unix_timestamp_millis()?,
+            "checksum": checksum,
+            "record": record,
+            "summary_markdown": summary_markdown,
+        }))
+    }
+
     pub fn replay_events(
         &self,
         request: &Request,

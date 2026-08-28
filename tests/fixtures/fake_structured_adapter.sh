@@ -78,7 +78,7 @@ else
     '{"type":"session.status_running"}'
 fi
 if [ -n "${TYRION_CANDIDATE_BUNDLE:-}" ]; then
-  worktree=$(mktemp -d /tmp/tyrion-structured-git.XXXXXX)
+  worktree=$(mktemp -d "${TYRION_WORKSPACE_ROOT:?}/structured-git.XXXXXX")
   git clone -q -b tyrion-base "$TYRION_BASE_BUNDLE" "$worktree/repository"
   git -C "$worktree/repository" config user.name 'Tyrion Structured Fixture'
   git -C "$worktree/repository" config user.email 'structured-fixture@tyrion.invalid'

@@ -288,6 +288,19 @@ fn restart_expires_an_unproven_worker_and_retries_only_after_cleanup() {
     assert_eq!(recovery["proofs"]["current_authority"], true);
     assert_eq!(recovery["proofs"]["containment"], false);
     assert_eq!(recovery["cleanup_confirmed"], true);
+    assert_eq!(
+        completed["briefing"]["run_report"]["failures"]["failed_attempts"],
+        1
+    );
+    assert_eq!(
+        completed["briefing"]["run_report"]["recovery_events"]["restart_recoveries"],
+        1
+    );
+    assert_eq!(
+        completed["briefing"]["run_report"]["failures"]["security_invariant_failures"],
+        0,
+        "a failed reattachment proof followed by confirmed cleanup is safe recovery, not a failed Security Invariant"
+    );
 }
 
 #[test]

@@ -484,6 +484,11 @@ fn dispatch(
         Command::InspectCommission { commission_id } => Ok(DispatchOutcome::without_follow_up(
             store.inspect_commission(request, commission_id, worker)?,
         )),
+        Command::ExportCommissionRecord { commission_id } => {
+            Ok(DispatchOutcome::without_follow_up(
+                store.export_commission_record(request, commission_id)?,
+            ))
+        }
         Command::AcceptCommission { commission_id } => Ok(DispatchOutcome {
             data: store.accept_commission(request, commission_id, worker)?,
             follow_up: Some(FollowUp::RunReadyAssignment(commission_id.clone())),

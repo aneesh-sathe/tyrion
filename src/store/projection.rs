@@ -14,34 +14,35 @@ pub(super) fn inspect_commission(
 ) -> Result<Value, TyrionError> {
     let commission = connection
         .query_row(
-            "SELECT id, goal, status, revision, control_revision, accepted_at, completed_at,
+            "SELECT id, goal, status, revision, control_revision, created_at, accepted_at, completed_at,
                     artifact_revision, execution_json, plan_json, worker_requirements_json,
                     project_id, commission_constraints_json
              FROM commissions WHERE id = ?1",
             [commission_id],
             |row| {
-                let execution = json_column(row, 8)?;
+                let execution = json_column(row, 9)?;
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
                     "goal": row.get::<_, String>(1)?,
                     "status": row.get::<_, String>(2)?,
                     "revision": row.get::<_, i64>(3)?,
                     "control_revision": row.get::<_, i64>(4)?,
-                    "accepted_at": row.get::<_, Option<i64>>(5)?,
-                    "completed_at": row.get::<_, Option<i64>>(6)?,
-                    "artifact_revision": row.get::<_, Option<String>>(7)?,
+                    "created_at": row.get::<_, i64>(5)?,
+                    "accepted_at": row.get::<_, Option<i64>>(6)?,
+                    "completed_at": row.get::<_, Option<i64>>(7)?,
+                    "artifact_revision": row.get::<_, Option<String>>(8)?,
                     "execution": execution,
-                    "proposed_plan": row.get::<_, Option<String>>(9)?
+                    "proposed_plan": row.get::<_, Option<String>>(10)?
                         .map(|encoded| serde_json::from_str::<Value>(&encoded))
                         .transpose()
                         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
-                            9,
+                            10,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         ))?,
-                    "worker_requirements": json_column(row, 10)?,
-                    "project_id": row.get::<_, Option<String>>(11)?,
-                    "constraints": json_column(row, 12)?,
+                    "worker_requirements": json_column(row, 11)?,
+                    "project_id": row.get::<_, Option<String>>(12)?,
+                    "constraints": json_column(row, 13)?,
                 }))
             },
         )
@@ -886,7 +887,7 @@ pub(super) fn inspect_commission(
         commission_id,
         evidence_value,
     )?;
-    let briefing = completion_briefing(connection, commission_id)?;
+    let mut briefing = completion_briefing(connection, commission_id)?;
     let events = query_values(
         connection,
         "SELECT sequence, event_type, commission_revision, payload_json, created_at
@@ -1040,6 +1041,26 @@ pub(super) fn inspect_commission(
             "success_metric": "verified execution elapsed-time reduction",
         }
     });
+    if let Some(briefing) = briefing.as_mut() {
+        briefing["run_report"] = build_run_report(RunReportInput {
+            commission: &commission,
+            assignments: &assignments,
+            attempts: &attempts,
+            workers: &workers,
+            worker_commands: &worker_commands,
+            operation_requests: &operation_requests,
+            approval_gates: &approval_gates,
+            commission_amendments: &commission_amendments,
+            results: &results,
+            evidence: &evidence,
+            events: &events,
+            blockers: &blockers,
+            recovery_history: &recovery_history,
+            restart_recoveries: &restart_recoveries,
+            watchdog_findings: &watchdog_findings,
+            activity_journal: &activity_journal,
+        });
+    }
     let occupied = attempts
         .iter()
         .filter(|attempt| attempt["status"] == "running")
@@ -1543,6 +1564,175 @@ fn evidence_value_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result
         "expected": row.get::<_, String>(offset + 8)?,
         "created_at": row.get::<_, i64>(offset + 9)?,
     }))
+}
+
+struct RunReportInput<'a> {
+    commission: &'a Value,
+    assignments: &'a [Value],
+    attempts: &'a [Value],
+    workers: &'a [Value],
+    worker_commands: &'a [Value],
+    operation_requests: &'a [Value],
+    approval_gates: &'a [Value],
+    commission_amendments: &'a [Value],
+    results: &'a [Value],
+    evidence: &'a [Value],
+    events: &'a [Value],
+    blockers: &'a [Value],
+    recovery_history: &'a [Value],
+    restart_recoveries: &'a [Value],
+    watchdog_findings: &'a [Value],
+    activity_journal: &'a Value,
+}
+
+fn build_run_report(input: RunReportInput<'_>) -> Value {
+    let count = |values: &[Value], field: &str, expected: &str| {
+        values
+            .iter()
+            .filter(|value| value[field] == expected)
+            .count()
+    };
+    let worker_controls = input.worker_commands.len();
+    let accepted_amendments = count(input.commission_amendments, "status", "accepted");
+    let manual_clarifications = count(input.worker_commands, "kind", "steer");
+    let attachment_takeovers = input
+        .events
+        .iter()
+        .filter(|event| {
+            event["type"] == "active_attachment_changed"
+                && !event["payload"]["previous_active_attachment_id"].is_null()
+        })
+        .count();
+    let worker_reported_corrections = input
+        .results
+        .iter()
+        .filter_map(|result| result["skill_executions"].as_array())
+        .map(|skills| {
+            skills
+                .iter()
+                .filter_map(|skill| skill["corrections"].as_u64())
+                .max()
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let model_cost_cents = input
+        .workers
+        .iter()
+        .filter_map(|worker| worker["usage"]["cost_cents"].as_u64())
+        .sum::<u64>();
+    let reserved_model_spend_cents = input
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt["reservation"]["model_spend_cents"].as_u64())
+        .sum::<u64>();
+    let reserved_paid_service_spend_cents = input
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt["reservation"]["paid_service_spend_cents"].as_u64())
+        .sum::<u64>();
+    let worker_execution_millis = input
+        .attempts
+        .iter()
+        .filter_map(|attempt| {
+            Some(
+                attempt["execution_completed_at_ms"]
+                    .as_i64()?
+                    .saturating_sub(attempt["started_at_ms"].as_i64()?)
+                    .max(0) as u64,
+            )
+        })
+        .sum::<u64>();
+    let total_elapsed_millis = input.commission["completed_at"]
+        .as_i64()
+        .zip(input.commission["created_at"].as_i64())
+        .map(|(completed, created)| completed.saturating_sub(created).max(0) as u64 * 1000);
+    let containment_recovery_failures = input
+        .restart_recoveries
+        .iter()
+        .filter(|recovery| recovery["cleanup_confirmed"] == false);
+    let containment_effect_failures = input.operation_requests.iter().filter(|operation| {
+        operation["receipt"].is_object() && operation["receipt"]["containment_confirmed"] == false
+    });
+    let invalid_authority_findings = input
+        .watchdog_findings
+        .iter()
+        .filter(|finding| finding["signal"] == "invalid_authority");
+    let explicit_security_blockers = input.blockers.iter().filter(|blocker| {
+        let code = blocker["code"].as_str().unwrap_or_default();
+        code.contains("containment") || code.contains("security_invariant")
+    });
+    let security_invariant_failures = containment_recovery_failures.count()
+        + containment_effect_failures.count()
+        + invalid_authority_findings.count()
+        + explicit_security_blockers.count();
+    let principal_effect_reconciliations = input
+        .operation_requests
+        .iter()
+        .filter(|operation| operation["receipt"]["reconciliation"].is_object())
+        .count();
+
+    json!({
+        "approval_gates": {
+            "required": input.approval_gates.len(),
+            "open": count(input.approval_gates, "status", "open"),
+            "authorized": count(input.approval_gates, "status", "authorized"),
+            "consumed": count(input.approval_gates, "status", "consumed"),
+            "invalidated_or_revoked": count(input.approval_gates, "status", "invalidated")
+                + count(input.approval_gates, "status", "revoked"),
+        },
+        "unplanned_principal_interventions": {
+            "total": worker_controls + accepted_amendments,
+            "worker_controls": worker_controls,
+            "commission_amendments": accepted_amendments,
+            "required_approval_gate_actions_excluded": true,
+        },
+        "corrections": {
+            "attempt_recoveries": input.recovery_history.len(),
+            "worker_reported": worker_reported_corrections,
+        },
+        "context_transfer": {
+            "manual_worker_clarifications": manual_clarifications,
+            "attachment_takeovers": attachment_takeovers,
+            "manual_events": manual_clarifications + attachment_takeovers,
+        },
+        "reconciliation": {
+            "assignments": count(input.assignments, "purpose", "reconciliation"),
+            "principal_effect_reconciliations": principal_effect_reconciliations,
+        },
+        "useful_concurrency": input.activity_journal["useful_concurrency"].clone(),
+        "conflicts": {
+            "reconciliation_required_events": input.events.iter()
+                .filter(|event| event["type"] == "reconciliation_required")
+                .count(),
+        },
+        "cost": {
+            "reported_model_cents": model_cost_cents,
+            "reserved_model_spend_cents": reserved_model_spend_cents,
+            "reserved_paid_service_spend_cents": reserved_paid_service_spend_cents,
+        },
+        "timing": {
+            "created_at": input.commission["created_at"],
+            "accepted_at": input.commission["accepted_at"],
+            "completed_at": input.commission["completed_at"],
+            "total_elapsed_millis": total_elapsed_millis,
+            "worker_execution_millis": worker_execution_millis,
+        },
+        "failures": {
+            "failed_attempts": count(input.attempts, "status", "failed"),
+            "interrupted_attempts": count(input.attempts, "status", "interrupted"),
+            "failed_evidence": count(input.evidence, "outcome", "failed"),
+            "uncertain_evidence": count(input.evidence, "outcome", "uncertain"),
+            "failed_or_uncertain_effects": input.operation_requests.iter()
+                .filter(|operation| matches!(operation["status"].as_str(), Some("failed" | "uncertain")))
+                .count(),
+            "security_invariant_failures": security_invariant_failures,
+        },
+        "recovery_events": {
+            "attempt_recoveries": input.recovery_history.len(),
+            "restart_recoveries": input.restart_recoveries.len(),
+            "watchdog_findings": input.watchdog_findings.len(),
+        },
+    })
 }
 
 fn completion_briefing(

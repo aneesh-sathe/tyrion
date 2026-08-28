@@ -250,6 +250,16 @@ target/debug/tyriond \
 
 `commission inspect` returns the accepted mandate, plan revisions, Assignment frontier, Attempts, Worker Handles, routing decisions, reservations, Results, Evidence, recovery history, current controls, and completion briefing.
 
+Export a portable, integrity-checked Commission Record after completion or when preserving an actionable Blocker:
+
+```sh
+target/debug/tyrion --socket "$TYRION_SOCKET" \
+  --attachment-token "$ATTACHMENT_SESSION_TOKEN" \
+  commission export-record COMMISSION_ID > commission-record.json
+```
+
+The `sha256:` checksum covers the complete `record` value, while `exported_at` remains export metadata. The record includes the accepted mandate, routing and Worker configurations, Attempts, Results, Integration, Evidence, effects and Approval Gates, recovery, learning receipts, terminal events, and a metric-separated final run report. Its summary states that exported containment Evidence is not independent runtime attestation and calls out fixture-backed Workers explicitly.
+
 The Active Attachment can steer or interrupt a live structured Worker when both the Entry Session and selected Worker Configuration support that command:
 
 ```sh

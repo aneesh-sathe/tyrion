@@ -493,6 +493,75 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
         .unwrap()
         .iter()
         .all(|result| result["status"] == "accepted"));
+
+    let exported = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "commission",
+            "export-record",
+            &commission_id,
+        ],
+    );
+    assert_eq!(exported["format"], "tyrion.commission");
+    assert_eq!(exported["version"], 1);
+    assert_eq!(exported["record"]["commission"]["id"], commission_id);
+    assert_eq!(
+        exported["record"]["commission"]["status"],
+        "verified_complete"
+    );
+    assert_eq!(
+        exported["record"]["briefing"]["run_report"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "approval_gates".to_owned(),
+            "conflicts".to_owned(),
+            "context_transfer".to_owned(),
+            "corrections".to_owned(),
+            "cost".to_owned(),
+            "failures".to_owned(),
+            "reconciliation".to_owned(),
+            "recovery_events".to_owned(),
+            "timing".to_owned(),
+            "unplanned_principal_interventions".to_owned(),
+            "useful_concurrency".to_owned(),
+        ])
+    );
+    assert_eq!(
+        exported["record"]["briefing"]["run_report"]["approval_gates"]["required"],
+        0
+    );
+    assert_eq!(
+        exported["record"]["briefing"]["run_report"]["unplanned_principal_interventions"]["total"],
+        0
+    );
+    assert_eq!(
+        exported["record"]["briefing"]["run_report"]["context_transfer"]["manual_events"],
+        0
+    );
+    assert_eq!(
+        exported["record"]["briefing"]["run_report"]["failures"]["security_invariant_failures"],
+        0
+    );
+    assert!(
+        exported["record"]["briefing"]["run_report"]["useful_concurrency"]["occurred"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(exported["summary_markdown"]
+        .as_str()
+        .unwrap()
+        .contains("fixture-backed Worker evidence is not production containment attestation"));
+    let expected_checksum = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&exported["record"]).unwrap())
+    );
+    assert_eq!(exported["checksum"], expected_checksum);
 }
 
 #[test]

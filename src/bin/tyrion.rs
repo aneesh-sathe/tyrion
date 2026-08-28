@@ -144,6 +144,9 @@ enum CommissionCommand {
     Inspect {
         commission_id: String,
     },
+    ExportRecord {
+        commission_id: String,
+    },
     Accept {
         commission_id: String,
         #[arg(long)]
@@ -748,6 +751,16 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                 command: CommissionCommand::Inspect { commission_id },
             } => (
                 Command::InspectCommission {
+                    commission_id: commission_id.clone(),
+                },
+                None,
+                None,
+                None,
+            ),
+            TopLevelCommand::Commission {
+                command: CommissionCommand::ExportRecord { commission_id },
+            } => (
+                Command::ExportCommissionRecord {
                     commission_id: commission_id.clone(),
                 },
                 None,
