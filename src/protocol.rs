@@ -651,11 +651,15 @@ pub enum Command {
         commission_id: String,
         worker_handle: String,
         clarification: String,
+        #[serde(default)]
+        planned: bool,
     },
     InterruptWorker {
         commission_id: String,
         worker_handle: String,
         reason: String,
+        #[serde(default)]
+        planned: bool,
     },
     RetryWorker {
         commission_id: String,

@@ -751,11 +751,13 @@ fn dispatch(
             commission_id,
             worker_handle,
             clarification,
+            planned,
         } => Ok(DispatchOutcome::without_follow_up(store.steer_worker(
             request,
             commission_id,
             worker_handle,
             clarification,
+            *planned,
             worker,
         )?)),
         Command::ProposeCommissionAmendment {
@@ -788,11 +790,13 @@ fn dispatch(
             commission_id,
             worker_handle,
             reason,
+            planned,
         } => Ok(DispatchOutcome::without_follow_up(store.interrupt_worker(
             request,
             commission_id,
             worker_handle,
             reason,
+            *planned,
             worker,
         )?)),
         Command::RetryWorker {

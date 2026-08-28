@@ -14,6 +14,17 @@ On 2026-08-28, the public CLI and daemon seam completed the smallest safe fixtur
 
 This is product and record-format verification only. Fixture-backed Worker evidence is not production containment attestation, and separate scenarios are not the single real Commission required by issue 16.
 
+The captured smoke export is checked in at [`dogfood-records/2026-08-28-safe-smoke.json`](dogfood-records/2026-08-28-safe-smoke.json). Recreate a fresh fixture-backed record without accessing production credentials or host runtime state:
+
+```sh
+mkdir -p .scratch/test-tmp
+TMPDIR="$PWD/.scratch/test-tmp" \
+TYRION_CAPTURE_COMMISSION_RECORD="$PWD/.scratch/issue-16-safe-smoke.json" \
+  cargo test --test git_commission \
+  codex_and_claude_structured_adapters_complete_one_git_commission \
+  -- --exact
+```
+
 ## Current actionable Blocker
 
 Do not claim dogfood readiness until one small production Commission runs with an already provisioned, pinned repaired OpenShell runtime and eligible real Worker providers. The run must use the exact production Worker configurations in its exported record and combine all issue 16 criteria in that one Commission.
@@ -48,6 +59,6 @@ Review these fields before making a readiness claim:
 - `.record.operation_requests` and `.record.approval_gates` for the exact controlled effect and single-use authorization path.
 - `.record.restart_recoveries`, `.record.recovery_history`, and `.record.events` for the planned failure, cleanup, replay, and continued work.
 - `.record.briefing.learning_receipts` for advisory Profile Claim application.
-- `.record.briefing.run_report` for separate Approval Gate, intervention, correction, context-transfer, reconciliation, concurrency, conflict, cost, timing, failure, and recovery metrics.
+- `.record.run_report` for separate Approval Gate, intervention, correction, context-transfer, reconciliation, concurrency, conflict, cost, timing, failure, and recovery metrics. Verified Completion also copies this report into `.record.briefing.run_report`.
 
-Any nonzero `.record.briefing.run_report.failures.security_invariant_failures` blocks readiness until the corresponding claim is explicitly withdrawn or a new production record demonstrates the invariant.
+Any nonzero `.record.run_report.failures.security_invariant_failures` blocks readiness until the corresponding claim is explicitly withdrawn or a new production record demonstrates the invariant.

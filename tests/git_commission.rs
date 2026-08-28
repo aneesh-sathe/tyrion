@@ -562,6 +562,9 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
         Sha256::digest(serde_json::to_vec(&exported["record"]).unwrap())
     );
     assert_eq!(exported["checksum"], expected_checksum);
+    if let Some(record_path) = std::env::var_os("TYRION_CAPTURE_COMMISSION_RECORD") {
+        fs::write(record_path, serde_json::to_vec_pretty(&exported).unwrap()).unwrap();
+    }
 }
 
 #[test]
@@ -1295,6 +1298,10 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
         .as_str()
         .unwrap()
         .contains("simulated containment failure"));
+    assert_eq!(
+        failed["run_report"]["failures"]["security_invariant_failures"],
+        1
+    );
     assert!(!data_dir.join("integrations").exists());
     assert!(!principal_checkout.join("issue-4.txt").exists());
 

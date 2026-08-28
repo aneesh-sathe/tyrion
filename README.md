@@ -274,11 +274,12 @@ The Active Attachment can steer or interrupt a live structured Worker when both 
   --attachment-token "$ATTACHMENT_SESSION_TOKEN" \
   worker interrupt "$COMMISSION_ID" Arya \
   --reason "Stop this Attempt." \
+  --planned \
   --expected-revision CURRENT_REVISION \
   --idempotency-key interrupt-arya
 ```
 
-Steering may clarify an Assignment. It cannot change the Goal, criteria, authority, or ceilings. Interruption revokes the live Lease and preserves the Attempt in history.
+Steering may clarify an Assignment. It cannot change the Goal, criteria, authority, or ceilings. Interruption revokes the live Lease and preserves the Attempt in history. Use `--planned` only for a control action intentionally included in the accepted Commission exercise; the final briefing reports planned controls separately from unplanned Principal interventions.
 
 Use the built-in help for the full command tree:
 

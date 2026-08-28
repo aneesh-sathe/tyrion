@@ -2002,6 +2002,7 @@ fn structured_adapters_receive_steering_and_interruption() {
                 "Arya",
                 "--reason",
                 "Stop the structured adapter.",
+                "--planned",
                 "--expected-revision",
                 "1",
                 "--idempotency-key",
@@ -2013,6 +2014,14 @@ fn structured_adapters_receive_steering_and_interruption() {
         assert_eq!(interrupted["attempts"][0]["status"], "interrupted");
         assert_eq!(interrupted["worker_commands"][0]["kind"], "steer");
         assert_eq!(interrupted["worker_commands"][1]["kind"], "interrupt");
+        assert_eq!(
+            interrupted["worker_commands"][0]["payload"]["planned"],
+            false
+        );
+        assert_eq!(
+            interrupted["worker_commands"][1]["payload"]["planned"],
+            true
+        );
         assert!(interrupted["workers"][0]["native_session_id"]
             .as_str()
             .is_some_and(|session| !session.is_empty()));
