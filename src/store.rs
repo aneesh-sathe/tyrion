@@ -282,6 +282,14 @@ enum WorkerControlAction {
     Interrupt,
 }
 
+struct WorkerControlCommand<'a> {
+    commission_id: &'a str,
+    worker_handle: &'a str,
+    message: &'a str,
+    planned: bool,
+    action: WorkerControlAction,
+}
+
 impl WorkerControlAction {
     const fn as_str(self) -> &'static str {
         match self {
@@ -2688,15 +2696,19 @@ impl Store {
         commission_id: &str,
         worker_handle: &str,
         clarification: &str,
+        planned: bool,
         worker: &worker::WorkerRuntime,
     ) -> Result<Value, TyrionError> {
         control_worker(
             &mut self.connection,
             request,
-            commission_id,
-            worker_handle,
-            clarification,
-            WorkerControlAction::Steer,
+            WorkerControlCommand {
+                commission_id,
+                worker_handle,
+                message: clarification,
+                planned,
+                action: WorkerControlAction::Steer,
+            },
             worker,
         )
     }
@@ -2707,15 +2719,19 @@ impl Store {
         commission_id: &str,
         worker_handle: &str,
         reason: &str,
+        planned: bool,
         worker: &worker::WorkerRuntime,
     ) -> Result<Value, TyrionError> {
         control_worker(
             &mut self.connection,
             request,
-            commission_id,
-            worker_handle,
-            reason,
-            WorkerControlAction::Interrupt,
+            WorkerControlCommand {
+                commission_id,
+                worker_handle,
+                message: reason,
+                planned,
+                action: WorkerControlAction::Interrupt,
+            },
             worker,
         )
     }
@@ -9348,12 +9364,16 @@ impl Store {
 fn control_worker(
     connection: &mut Connection,
     request: &Request,
-    commission_id: &str,
-    worker_handle: &str,
-    message: &str,
-    action: WorkerControlAction,
+    control: WorkerControlCommand<'_>,
     runtime: &worker::WorkerRuntime,
 ) -> Result<Value, TyrionError> {
+    let WorkerControlCommand {
+        commission_id,
+        worker_handle,
+        message,
+        planned,
+        action,
+    } = control;
     if worker_handle.trim().is_empty() {
         return Err(TyrionError::InvalidRequest(
             "Worker Handle must not be empty".into(),
@@ -9494,6 +9514,7 @@ fn control_worker(
                 action.as_str(),
                 serde_json::to_string(&serde_json::json!({
                     (action.message_field()): message,
+                    "planned": planned,
                 }))?,
                 revision,
                 idempotency_key,
@@ -9540,6 +9561,7 @@ fn control_worker(
             "worker_handle": worker_handle,
             "attempt_id": attempt_id,
             (action.message_field()): message,
+            "planned": planned,
             "mandate_revision": revision,
             "mandate_changed": false,
         }),

@@ -1,0 +1,2499 @@
+{
+  "checksum": "sha256:8b5749792b3369bf653e9b37418179d35020f0c3f57dc05a61f882f1ff6ab602",
+  "exported_at": 1787945733098,
+  "format": "tyrion.commission",
+  "record": {
+    "activity_journal": {
+      "useful_concurrency": {
+        "elapsed_time_reduction_millis": 905,
+        "end_to_end_elapsed_millis": 2059,
+        "occurred": true,
+        "overlap_millis": 905,
+        "parallel_execution_window_millis": 1001,
+        "serial_attempt_millis": 1906,
+        "serial_execution_millis": 1906,
+        "success_metric": "verified execution elapsed-time reduction"
+      }
+    },
+    "approval_gates": [],
+    "assignments": [
+      {
+        "competition": null,
+        "created_at": 1787945730,
+        "id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+        "logical_id": "backend",
+        "plan_revision": 1,
+        "position": 0,
+        "purpose": "critical_path",
+        "read_scopes": [],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_model_spend_cents": 0,
+          "max_paid_service_spend_cents": 0,
+          "max_storage_bytes": 5242880
+        },
+        "route": {
+          "decided_at": 1787945731,
+          "rationale": {
+            "eligible": [
+              "codex-structured-git"
+            ],
+            "entry_harness": "codex",
+            "entry_harness_preference_applied": false,
+            "ineligible": [
+              {
+                "configuration_id": "claude-structured-git",
+                "failed_gates": [
+                  "required_skills"
+                ]
+              }
+            ],
+            "ordering": [
+              "expected_verified_correctness",
+              "preference_adherence",
+              "first_pass_acceptance",
+              "commission_elapsed_time_contribution",
+              "cost",
+              "continuity"
+            ]
+          },
+          "selected_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "codex"
+              ],
+              "kind": "codex_app_server",
+              "sha256": "22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "version": "contract-fixture-v1"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "context": {
+              "capacity_tokens": 100000,
+              "strategy": "fresh"
+            },
+            "harness": "codex",
+            "id": "codex-structured-git",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 0,
+              "expected_verified_correctness": 9500,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "codex-fixture-model",
+            "replacement_class": "structured-git",
+            "resource_limits": {
+              "max_concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "selected_skills": [],
+            "settings": {
+              "mode": "structured_git"
+            },
+            "skills": [
+              {
+                "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "name": "backend"
+              }
+            ],
+            "tools": [
+              "git"
+            ]
+          },
+          "status": "selected"
+        },
+        "skill_defaults": [
+          {
+            "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "delegation": "native_unchanged",
+            "name": "backend",
+            "plan_revision": 1,
+            "provenance": "plan",
+            "requirement": "required",
+            "selected_at": 1787945730
+          }
+        ],
+        "status": "accepted",
+        "write_scopes": [
+          "backend.txt"
+        ]
+      },
+      {
+        "competition": null,
+        "created_at": 1787945730,
+        "id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+        "logical_id": "frontend",
+        "plan_revision": 1,
+        "position": 1,
+        "purpose": "critical_path",
+        "read_scopes": [],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_model_spend_cents": 0,
+          "max_paid_service_spend_cents": 0,
+          "max_storage_bytes": 5242880
+        },
+        "route": {
+          "decided_at": 1787945731,
+          "rationale": {
+            "eligible": [
+              "claude-structured-git"
+            ],
+            "entry_harness": "codex",
+            "entry_harness_preference_applied": false,
+            "ineligible": [
+              {
+                "configuration_id": "codex-structured-git",
+                "failed_gates": [
+                  "required_skills"
+                ]
+              }
+            ],
+            "ordering": [
+              "expected_verified_correctness",
+              "preference_adherence",
+              "first_pass_acceptance",
+              "commission_elapsed_time_contribution",
+              "cost",
+              "continuity"
+            ]
+          },
+          "selected_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "claude"
+              ],
+              "kind": "claude_agent_sdk",
+              "sha256": "22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "version": "contract-fixture-v1"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "context": {
+              "capacity_tokens": 100000,
+              "strategy": "fresh"
+            },
+            "harness": "claude",
+            "id": "claude-structured-git",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 0,
+              "expected_verified_correctness": 9600,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "claude-fixture-model",
+            "replacement_class": "structured-git",
+            "resource_limits": {
+              "max_concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "selected_skills": [],
+            "settings": {
+              "mode": "structured_git"
+            },
+            "skills": [
+              {
+                "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                "name": "frontend"
+              }
+            ],
+            "tools": [
+              "git"
+            ]
+          },
+          "status": "selected"
+        },
+        "skill_defaults": [
+          {
+            "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "delegation": "native_unchanged",
+            "name": "frontend",
+            "plan_revision": 1,
+            "provenance": "plan",
+            "requirement": "required",
+            "selected_at": 1787945730
+          }
+        ],
+        "status": "accepted",
+        "write_scopes": [
+          "frontend.txt"
+        ]
+      }
+    ],
+    "attachments": [
+      {
+        "adapter_identity": "codex-mcp-entry",
+        "adapter_version": "1.0.0",
+        "harness": "codex",
+        "id": "47877488-1023-43ee-8543-e4531bedf537",
+        "joined_at": 1787945730,
+        "mode": "full",
+        "native_session_id": "git-commission-session",
+        "role": "active"
+      }
+    ],
+    "attempts": [
+      {
+        "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+        "cleanup_pending": false,
+        "completed_at": 1787945733,
+        "completed_at_ms": 1787945733067,
+        "execution_completed_at_ms": 1787945732009,
+        "id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "lease": {
+          "expires_at": 1787945760,
+          "id": "e6675223-68c8-42bb-b400-02ca12025e2d",
+          "issued_at": 1787945731,
+          "mandate_revision": 1,
+          "released_at": 1787945733,
+          "status": "released"
+        },
+        "reservation": {
+          "concurrency_slots": 1,
+          "model_spend_cents": 0,
+          "paid_service_spend_cents": 0,
+          "status": "released",
+          "storage_bytes": 5242880
+        },
+        "revision_disposition": "current",
+        "started_at": 1787945731,
+        "started_at_ms": 1787945731008,
+        "status": "succeeded",
+        "worker_configuration": "codex-structured-git",
+        "worker_context_packet": {
+          "advisory": {
+            "authority_effect": {
+              "approval_gates": false,
+              "credentials": false,
+              "resource_ceilings": false,
+              "routing": false
+            },
+            "budget": {
+              "accounting": "utf8_byte_upper_bound",
+              "complete_slice_limit_tokens": 15000,
+              "hard_max_tokens": 8000,
+              "target_tokens": 2000,
+              "tokens_used": 2,
+              "worker_context_fraction_basis_points": 800
+            },
+            "instruction": "Profile Claims are advisory and yield to every binding source above.",
+            "profile_claims": []
+          },
+          "binding": {
+            "acceptance_criteria": [
+              {
+                "id": "backend-file",
+                "required_evidence": "command_output",
+                "verification_depth": "standard",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {
+                  "argv": [
+                    "sh",
+                    "-c",
+                    "test \"$(cat backend.txt)\" = backend"
+                  ],
+                  "kind": "command"
+                },
+                "verifier_configuration": "contained-command-v1",
+                "verifier_type": "deterministic"
+              }
+            ],
+            "authority_envelope": {
+              "actions": [
+                "codex.git_change"
+              ],
+              "destinations": [],
+              "effects": [],
+              "paths": [
+                "backend.txt",
+                "frontend.txt"
+              ],
+              "repositories": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+              ]
+            },
+            "commission_constraints": [],
+            "current_principal_instructions": [
+              "Add independently implemented backend and frontend artifacts."
+            ],
+            "current_repository_evidence": {
+              "artifact_revision": null,
+              "execution": {
+                "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+                "kind": "codex_git",
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+              },
+              "project_id": null
+            },
+            "resource_ceilings": {
+              "max_attempts": 3,
+              "max_elapsed_seconds": 30,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760,
+              "max_worker_concurrency": 2
+            }
+          },
+          "precedence": [
+            "current_principal_instructions",
+            "commission_constraints",
+            "acceptance_criteria",
+            "authority_envelope",
+            "resource_ceilings",
+            "current_repository_evidence",
+            "advisory_profile_claims"
+          ],
+          "version": 1
+        }
+      },
+      {
+        "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+        "cleanup_pending": false,
+        "completed_at": 1787945732,
+        "completed_at_ms": 1787945732659,
+        "execution_completed_at_ms": 1787945731917,
+        "id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "lease": {
+          "expires_at": 1787945760,
+          "id": "492a363b-fa5f-4b18-bf7f-cf4730ad3fe8",
+          "issued_at": 1787945731,
+          "mandate_revision": 1,
+          "released_at": 1787945732,
+          "status": "released"
+        },
+        "reservation": {
+          "concurrency_slots": 1,
+          "model_spend_cents": 0,
+          "paid_service_spend_cents": 0,
+          "status": "released",
+          "storage_bytes": 5242880
+        },
+        "revision_disposition": "current",
+        "started_at": 1787945731,
+        "started_at_ms": 1787945731012,
+        "status": "succeeded",
+        "worker_configuration": "claude-structured-git",
+        "worker_context_packet": {
+          "advisory": {
+            "authority_effect": {
+              "approval_gates": false,
+              "credentials": false,
+              "resource_ceilings": false,
+              "routing": false
+            },
+            "budget": {
+              "accounting": "utf8_byte_upper_bound",
+              "complete_slice_limit_tokens": 15000,
+              "hard_max_tokens": 8000,
+              "target_tokens": 2000,
+              "tokens_used": 2,
+              "worker_context_fraction_basis_points": 800
+            },
+            "instruction": "Profile Claims are advisory and yield to every binding source above.",
+            "profile_claims": []
+          },
+          "binding": {
+            "acceptance_criteria": [
+              {
+                "id": "frontend-file",
+                "required_evidence": "command_output",
+                "verification_depth": "standard",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {
+                  "argv": [
+                    "sh",
+                    "-c",
+                    "test \"$(cat frontend.txt)\" = frontend"
+                  ],
+                  "kind": "command"
+                },
+                "verifier_configuration": "contained-command-v1",
+                "verifier_type": "deterministic"
+              }
+            ],
+            "authority_envelope": {
+              "actions": [
+                "codex.git_change"
+              ],
+              "destinations": [],
+              "effects": [],
+              "paths": [
+                "backend.txt",
+                "frontend.txt"
+              ],
+              "repositories": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+              ]
+            },
+            "commission_constraints": [],
+            "current_principal_instructions": [
+              "Add independently implemented backend and frontend artifacts."
+            ],
+            "current_repository_evidence": {
+              "artifact_revision": null,
+              "execution": {
+                "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+                "kind": "codex_git",
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+              },
+              "project_id": null
+            },
+            "resource_ceilings": {
+              "max_attempts": 3,
+              "max_elapsed_seconds": 30,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760,
+              "max_worker_concurrency": 2
+            }
+          },
+          "precedence": [
+            "current_principal_instructions",
+            "commission_constraints",
+            "acceptance_criteria",
+            "authority_envelope",
+            "resource_ceilings",
+            "current_repository_evidence",
+            "advisory_profile_claims"
+          ],
+          "version": 1
+        }
+      }
+    ],
+    "attention_conditions": [],
+    "blockers": [],
+    "briefing": {
+      "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+      "commission_id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+      "completion_revision": 2,
+      "criteria": [
+        {
+          "criterion_id": "backend-file",
+          "description": "The assembled repository contains the backend artifact",
+          "evidence": {
+            "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+            "created_at": 1787945733,
+            "criterion_id": "backend-file",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+            "id": "c4b26f6c-2356-439c-8f9c-a86f8ac5479f",
+            "mandate_revision": 1,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+            "verifier_kind": "command"
+          },
+          "status": "passed"
+        },
+        {
+          "criterion_id": "frontend-file",
+          "description": "The assembled repository contains the frontend artifact",
+          "evidence": {
+            "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+            "created_at": 1787945733,
+            "criterion_id": "frontend-file",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+            "id": "7289b27a-1e45-4fa8-b4f1-f03a6804b30c",
+            "mandate_revision": 1,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+            "verifier_kind": "command"
+          },
+          "status": "passed"
+        }
+      ],
+      "learning_receipts": [],
+      "run_report": {
+        "approval_gates": {
+          "authorized": 0,
+          "consumed": 0,
+          "invalidated_or_revoked": 0,
+          "open": 0,
+          "required": 0
+        },
+        "conflicts": {
+          "reconciliation_required_events": 0
+        },
+        "context_transfer": {
+          "attachment_takeovers": 0,
+          "manual_events": 0,
+          "manual_worker_clarifications": 0
+        },
+        "corrections": {
+          "attempt_recoveries": 0,
+          "worker_reported": 0
+        },
+        "cost": {
+          "reported_model_cents": 0,
+          "reserved_model_spend_cents": 0,
+          "reserved_paid_service_spend_cents": 0
+        },
+        "failures": {
+          "failed_attempts": 0,
+          "failed_evidence": 1,
+          "failed_or_uncertain_effects": 0,
+          "interrupted_attempts": 0,
+          "security_invariant_failures": 0,
+          "uncertain_evidence": 0
+        },
+        "reconciliation": {
+          "assignments": 0,
+          "principal_effect_reconciliations": 0
+        },
+        "recovery_events": {
+          "attempt_recoveries": 0,
+          "restart_recoveries": 0,
+          "watchdog_findings": 0
+        },
+        "timing": {
+          "accepted_at": 1787945730,
+          "completed_at": 1787945733,
+          "created_at": 1787945730,
+          "total_elapsed_millis": 3000,
+          "worker_execution_millis": 1906
+        },
+        "unplanned_principal_interventions": {
+          "commission_amendments": 0,
+          "planned_worker_controls": 0,
+          "required_approval_gate_actions_excluded": true,
+          "total": 0,
+          "worker_controls": 0
+        },
+        "useful_concurrency": {
+          "elapsed_time_reduction_millis": 905,
+          "end_to_end_elapsed_millis": 2059,
+          "occurred": true,
+          "overlap_millis": 905,
+          "parallel_execution_window_millis": 1001,
+          "serial_attempt_millis": 1906,
+          "serial_execution_millis": 1906,
+          "success_metric": "verified execution elapsed-time reduction"
+        }
+      },
+      "summary": "Verified Complete: Add independently implemented backend and frontend artifacts.",
+      "title": "Verified Completion"
+    },
+    "commission": {
+      "accepted_at": 1787945730,
+      "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+      "authority": {
+        "actions": [
+          "codex.git_change"
+        ],
+        "destinations": [],
+        "effects": [],
+        "paths": [
+          "backend.txt",
+          "frontend.txt"
+        ],
+        "repositories": [
+          "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+        ]
+      },
+      "completed_at": 1787945733,
+      "constraints": [],
+      "control_revision": 0,
+      "created_at": 1787945730,
+      "execution": {
+        "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+        "kind": "codex_git",
+        "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/principal-checkout"
+      },
+      "goal": "Add independently implemented backend and frontend artifacts.",
+      "id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+      "known_uncertainties": [],
+      "project_id": null,
+      "proposed_plan": {
+        "assignments": [
+          {
+            "criterion_ids": [
+              "backend-file"
+            ],
+            "dependencies": [],
+            "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+            "id": "backend",
+            "purpose": "critical_path",
+            "read_scopes": [],
+            "resources": {
+              "concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "worker_requirements": {
+              "assignment_constraints": [
+                "coding"
+              ],
+              "capabilities": [
+                "structured_lifecycle",
+                "semantic_interrupt"
+              ],
+              "exclude_configurations": [],
+              "min_context_tokens": 100000,
+              "require_configurations": [],
+              "selected_skills": [],
+              "skills": [
+                {
+                  "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "backend"
+                }
+              ],
+              "tools": [
+                "git"
+              ]
+            },
+            "write_scopes": [
+              "backend.txt"
+            ]
+          },
+          {
+            "criterion_ids": [
+              "frontend-file"
+            ],
+            "dependencies": [],
+            "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+            "id": "frontend",
+            "purpose": "critical_path",
+            "read_scopes": [],
+            "resources": {
+              "concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "worker_requirements": {
+              "assignment_constraints": [
+                "coding"
+              ],
+              "capabilities": [
+                "structured_lifecycle",
+                "semantic_interrupt"
+              ],
+              "exclude_configurations": [],
+              "min_context_tokens": 100000,
+              "require_configurations": [],
+              "selected_skills": [],
+              "skills": [
+                {
+                  "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                  "name": "frontend"
+                }
+              ],
+              "tools": [
+                "git"
+              ]
+            },
+            "write_scopes": [
+              "frontend.txt"
+            ]
+          }
+        ]
+      },
+      "resource_ceilings": {
+        "max_attempts": 3,
+        "max_elapsed_seconds": 30,
+        "max_model_spend_cents": 0,
+        "max_paid_service_spend_cents": 0,
+        "max_storage_bytes": 10485760,
+        "max_worker_concurrency": 2
+      },
+      "revision": 2,
+      "status": "verified_complete",
+      "worker_requirements": {
+        "assignment_constraints": [],
+        "capabilities": [],
+        "exclude_configurations": [],
+        "min_context_tokens": 0,
+        "require_configurations": [],
+        "selected_skills": [],
+        "skills": [],
+        "tools": []
+      }
+    },
+    "commission_amendments": [],
+    "credential_exposure_grants": [],
+    "credential_grants": [],
+    "criteria": [
+      {
+        "description": "The assembled repository contains the backend artifact",
+        "id": "backend-file",
+        "required_evidence": "command_output",
+        "status": "passed",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat backend.txt)\" = backend"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      },
+      {
+        "description": "The assembled repository contains the frontend artifact",
+        "id": "frontend-file",
+        "required_evidence": "command_output",
+        "status": "passed",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat frontend.txt)\" = frontend"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "criterion_versions": [
+      {
+        "description": "The assembled repository contains the backend artifact",
+        "id": "backend-file",
+        "mandate_revision": 1,
+        "required_evidence": "command_output",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat backend.txt)\" = backend"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      },
+      {
+        "description": "The assembled repository contains the frontend artifact",
+        "id": "frontend-file",
+        "mandate_revision": 1,
+        "required_evidence": "command_output",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat frontend.txt)\" = frontend"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "events": [
+      {
+        "commission_revision": 0,
+        "created_at": 1787945730,
+        "payload": {},
+        "sequence": 1,
+        "type": "commission_proposed"
+      },
+      {
+        "commission_revision": 0,
+        "created_at": 1787945730,
+        "payload": {
+          "attachment_id": "47877488-1023-43ee-8543-e4531bedf537",
+          "role": "active"
+        },
+        "sequence": 2,
+        "type": "attachment_joined"
+      },
+      {
+        "commission_revision": 0,
+        "created_at": 1787945730,
+        "payload": {
+          "active_attachment_id": "47877488-1023-43ee-8543-e4531bedf537",
+          "previous_active_attachment_id": null
+        },
+        "sequence": 3,
+        "type": "active_attachment_changed"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945730,
+        "payload": {},
+        "sequence": 4,
+        "type": "commission_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945730,
+        "payload": {
+          "plan_revision": 1,
+          "reason": "initial_decomposition",
+          "source": "entry_model"
+        },
+        "sequence": 5,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945730,
+        "payload": {
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "logical_id": "backend",
+          "plan_revision": 1
+        },
+        "sequence": 6,
+        "type": "assignment_ready"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945730,
+        "payload": {
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "logical_id": "frontend",
+          "plan_revision": 1
+        },
+        "sequence": 7,
+        "type": "assignment_ready"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "logical_id": "backend",
+          "plan_revision": 1,
+          "started_at_ms": 1787945731008,
+          "worker_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "codex"
+              ],
+              "kind": "codex_app_server",
+              "sha256": "22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "version": "contract-fixture-v1"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "context": {
+              "capacity_tokens": 100000,
+              "strategy": "fresh"
+            },
+            "harness": "codex",
+            "id": "codex-structured-git",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 0,
+              "expected_verified_correctness": 9500,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "codex-fixture-model",
+            "replacement_class": "structured-git",
+            "resource_limits": {
+              "max_concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "selected_skills": [],
+            "settings": {
+              "mode": "structured_git"
+            },
+            "skills": [
+              {
+                "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "name": "backend"
+              }
+            ],
+            "tools": [
+              "git"
+            ]
+          },
+          "worker_handle": "Arya",
+          "worker_id": "33cba832-2c16-413a-9e25-74c252c916c8"
+        },
+        "sequence": 8,
+        "type": "attempt_started"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "activity": "Worker launched",
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "worker_handle": "Arya",
+          "worker_id": "33cba832-2c16-413a-9e25-74c252c916c8"
+        },
+        "sequence": 9,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+          "concurrency_slots": 1,
+          "model_spend_cents": 0,
+          "paid_service_spend_cents": 0,
+          "reserved_atomically": true,
+          "storage_bytes": 5242880
+        },
+        "sequence": 10,
+        "type": "resources_reserved"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "logical_id": "frontend",
+          "plan_revision": 1,
+          "started_at_ms": 1787945731012,
+          "worker_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+                "claude"
+              ],
+              "kind": "claude_agent_sdk",
+              "sha256": "22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "version": "contract-fixture-v1"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+            "context": {
+              "capacity_tokens": 100000,
+              "strategy": "fresh"
+            },
+            "harness": "claude",
+            "id": "claude-structured-git",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 0,
+              "expected_verified_correctness": 9600,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "claude-fixture-model",
+            "replacement_class": "structured-git",
+            "resource_limits": {
+              "max_concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "selected_skills": [],
+            "settings": {
+              "mode": "structured_git"
+            },
+            "skills": [
+              {
+                "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                "name": "frontend"
+              }
+            ],
+            "tools": [
+              "git"
+            ]
+          },
+          "worker_handle": "Brienne",
+          "worker_id": "535d4d61-b329-46f8-b599-877987525613"
+        },
+        "sequence": 11,
+        "type": "attempt_started"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "activity": "Worker launched",
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "worker_handle": "Brienne",
+          "worker_id": "535d4d61-b329-46f8-b599-877987525613"
+        },
+        "sequence": 12,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+          "concurrency_slots": 1,
+          "model_spend_cents": 0,
+          "paid_service_spend_cents": 0,
+          "reserved_atomically": true,
+          "storage_bytes": 5242880
+        },
+        "sequence": 13,
+        "type": "resources_reserved"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {},
+        "sequence": 14,
+        "type": "result_submitted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945731,
+        "payload": {
+          "activity": "Claude produced a structured Result",
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+          "native_session_id": "claude-session-fixture",
+          "usage": {
+            "cost_cents": 0,
+            "input_tokens": 10,
+            "output_tokens": 5
+          }
+        },
+        "sequence": 15,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {},
+        "sequence": 16,
+        "type": "result_submitted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {
+          "activity": "Codex produced a structured Result",
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+          "native_session_id": "codex-thread-fixture",
+          "usage": {
+            "cost_cents": 0,
+            "input_tokens": 12,
+            "output_tokens": 4
+          }
+        },
+        "sequence": 17,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {},
+        "sequence": 18,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {},
+        "sequence": 19,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {
+          "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "logical_id": "frontend",
+          "plan_revision": 1,
+          "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+          "serialized": true
+        },
+        "sequence": 20,
+        "type": "result_integrated"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {},
+        "sequence": 21,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {},
+        "sequence": 22,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+          "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0"
+        },
+        "sequence": 23,
+        "type": "result_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945732,
+        "payload": {
+          "execution_frontier": [],
+          "plan_revision": 2,
+          "reason": "evidence_advanced_frontier",
+          "source_result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0"
+        },
+        "sequence": 24,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945733,
+        "payload": {
+          "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "logical_id": "backend",
+          "plan_revision": 1,
+          "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+          "serialized": true
+        },
+        "sequence": 25,
+        "type": "result_integrated"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945733,
+        "payload": {},
+        "sequence": 26,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945733,
+        "payload": {},
+        "sequence": 27,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945733,
+        "payload": {
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+          "result_id": "666837ed-2e34-47d5-9a70-2819de47976d"
+        },
+        "sequence": 28,
+        "type": "result_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945733,
+        "payload": {
+          "attempt_ids": [
+            "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+            "cd430bbc-59d9-49e0-b9ce-f5c84a07d700"
+          ],
+          "elapsed_time_reduction_millis": 905,
+          "end_to_end_elapsed_millis": 2059,
+          "overlap_millis": 905,
+          "parallel_execution_window_millis": 1001,
+          "serial_execution_millis": 1906,
+          "success_metric": "verified execution elapsed-time reduction",
+          "trigger_attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29"
+        },
+        "sequence": 29,
+        "type": "useful_concurrency_observed"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1787945733,
+        "payload": {
+          "execution_frontier": [],
+          "plan_revision": 3,
+          "reason": "evidence_advanced_frontier",
+          "source_result_id": "666837ed-2e34-47d5-9a70-2819de47976d"
+        },
+        "sequence": 30,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 2,
+        "created_at": 1787945733,
+        "payload": {},
+        "sequence": 31,
+        "type": "commission_verified_complete"
+      }
+    ],
+    "evidence": [
+      {
+        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "created_at": 1787945732,
+        "criterion_id": "frontend-file",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+        "id": "4e0f7342-747a-4805-b042-470ddd5ba244",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat frontend.txt)\" = frontend"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "scope": "candidate",
+        "verification_attempt_id": "c42141de-1ae9-4944-bcd6-ef8944737fbe",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "28739b5d57a43910b7090e476331a510daf2f949",
+        "created_at": 1787945732,
+        "criterion_id": "backend-file",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+        "id": "d73a2656-ed3c-438a-9daa-6f67cb2fb550",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat backend.txt)\" = backend"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "scope": "candidate",
+        "verification_attempt_id": "87676180-d558-47c5-851a-57c1f0ae24c3",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "created_at": 1787945732,
+        "criterion_id": "backend-file",
+        "current": false,
+        "defect": "result",
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+        "id": "d34fa731-27fe-4459-8ff8-f77b3e89b5cb",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=1; stdout=; stderr=cat: backend.txt: No such file or directory\n",
+        "outcome": "failed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat backend.txt)\" = backend"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "scope": "integrated",
+        "verification_attempt_id": "64cc2b11-9e9f-4241-849a-6140d266f7b5",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "created_at": 1787945732,
+        "criterion_id": "frontend-file",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+        "id": "ad9d4cbe-bf49-48c7-884d-883baa5ac024",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat frontend.txt)\" = frontend"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "scope": "integrated",
+        "verification_attempt_id": "ba6fba35-fb5c-4b32-a677-8956aff06d44",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+        "created_at": 1787945733,
+        "criterion_id": "backend-file",
+        "current": true,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+        "id": "c4b26f6c-2356-439c-8f9c-a86f8ac5479f",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat backend.txt)\" = backend"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "scope": "integrated",
+        "verification_attempt_id": "489589ef-1c61-441d-96f0-5e839bf5927c",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+        "created_at": 1787945733,
+        "criterion_id": "frontend-file",
+        "current": true,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+        "id": "7289b27a-1e45-4fa8-b4f1-f03a6804b30c",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat frontend.txt)\" = frontend"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "scope": "integrated",
+        "verification_attempt_id": "cbdb9051-ea42-4b5a-bde8-d3bb86b39dba",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "execution_frontier": [],
+    "frontier_holds": [],
+    "operation_requests": [],
+    "plans": [
+      {
+        "created_at": 1787945730,
+        "reason": "initial decomposition exposed the first safe Execution Frontier",
+        "revision": 1,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "backend-file"
+              ],
+              "dependencies": [],
+              "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+              "id": "backend",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [
+                  "structured_lifecycle",
+                  "semantic_interrupt"
+                ],
+                "exclude_configurations": [],
+                "min_context_tokens": 100000,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [
+                  {
+                    "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    "name": "backend"
+                  }
+                ],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "backend.txt"
+              ]
+            },
+            {
+              "criterion_ids": [
+                "frontend-file"
+              ],
+              "dependencies": [],
+              "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+              "id": "frontend",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [
+                  "structured_lifecycle",
+                  "semantic_interrupt"
+                ],
+                "exclude_configurations": [],
+                "min_context_tokens": 100000,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [
+                  {
+                    "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "name": "frontend"
+                  }
+                ],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "frontend.txt"
+              ]
+            }
+          ]
+        },
+        "source": "entry_model"
+      },
+      {
+        "created_at": 1787945732,
+        "reason": "current Evidence advanced the safe Execution Frontier",
+        "revision": 2,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "backend-file"
+              ],
+              "dependencies": [],
+              "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+              "id": "backend",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [
+                  "structured_lifecycle",
+                  "semantic_interrupt"
+                ],
+                "exclude_configurations": [],
+                "min_context_tokens": 100000,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [
+                  {
+                    "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    "name": "backend"
+                  }
+                ],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "backend.txt"
+              ]
+            },
+            {
+              "criterion_ids": [
+                "frontend-file"
+              ],
+              "dependencies": [],
+              "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+              "id": "frontend",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [
+                  "structured_lifecycle",
+                  "semantic_interrupt"
+                ],
+                "exclude_configurations": [],
+                "min_context_tokens": 100000,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [
+                  {
+                    "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "name": "frontend"
+                  }
+                ],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "frontend.txt"
+              ]
+            }
+          ],
+          "evidence_result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+          "execution_frontier": []
+        },
+        "source": "control_plane"
+      },
+      {
+        "created_at": 1787945733,
+        "reason": "current Evidence advanced the safe Execution Frontier",
+        "revision": 3,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "backend-file"
+              ],
+              "dependencies": [],
+              "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+              "id": "backend",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [
+                  "structured_lifecycle",
+                  "semantic_interrupt"
+                ],
+                "exclude_configurations": [],
+                "min_context_tokens": 100000,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [
+                  {
+                    "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    "name": "backend"
+                  }
+                ],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "backend.txt"
+              ]
+            },
+            {
+              "criterion_ids": [
+                "frontend-file"
+              ],
+              "dependencies": [],
+              "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+              "id": "frontend",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [
+                  "structured_lifecycle",
+                  "semantic_interrupt"
+                ],
+                "exclude_configurations": [],
+                "min_context_tokens": 100000,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [
+                  {
+                    "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "name": "frontend"
+                  }
+                ],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "frontend.txt"
+              ]
+            }
+          ],
+          "evidence_result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+          "execution_frontier": []
+        },
+        "source": "control_plane"
+      }
+    ],
+    "recovery": {
+      "cancellation": null,
+      "resumable": false,
+      "resumable_blocker": null,
+      "state": "recovered"
+    },
+    "recovery_history": [],
+    "restart_recoveries": [],
+    "results": [
+      {
+        "artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "artifacts": [
+          {
+            "kind": "base_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/cd430bbc-59d9-49e0-b9ce-f5c84a07d700/base.bundle",
+            "sha256": "e191d7207701efe0de1254fb9abc07b992cef1e9a00989cba5f49bf3f0be92df",
+            "size_bytes": 311
+          },
+          {
+            "kind": "candidate_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/cd430bbc-59d9-49e0-b9ce-f5c84a07d700/candidate.bundle",
+            "sha256": "945f690d60834c7337ec76827d0971aff79c2a4e362118688d5b618a3cadf029",
+            "size_bytes": 597
+          },
+          {
+            "kind": "integrated_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/cd430bbc-59d9-49e0-b9ce-f5c84a07d700/integrated.bundle",
+            "sha256": "21bd53ef2205e0347ca5bf5530d96a96c7990f81437f9580bbc530552c802667",
+            "size_bytes": 602
+          }
+        ],
+        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+        "candidate_commits": [
+          "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407"
+        ],
+        "changed_paths": [
+          "frontend.txt"
+        ],
+        "created_at": 1787945731,
+        "id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "integrated_artifact_revision": "62015fcc0c2c0f6d12e28f8c7fd591ad8e5e0407",
+        "known_effects": [],
+        "mandate_revision": 1,
+        "output": "return a routed greeting",
+        "plan_revision": 1,
+        "profile_claim_outcomes": [],
+        "revision_disposition": "current",
+        "skill_executions": [
+          {
+            "assignment_class": "critical_path",
+            "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "corrections": 0,
+            "cost_cents": 0,
+            "delegation": "native_unchanged",
+            "latency_ms": 905,
+            "name": "frontend",
+            "principal_intervention": false,
+            "provenance": "plan",
+            "requirement": "required",
+            "verification_outcome": "passed",
+            "worker_configuration": "claude-structured-git"
+          }
+        ],
+        "status": "accepted",
+        "verification_outcomes": [
+          {
+            "criterion_id": "frontend-file",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(cat frontend.txt)\" = frontend"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "candidate",
+            "verification_attempt_id": "c42141de-1ae9-4944-bcd6-ef8944737fbe",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "backend-file",
+            "defect": "result",
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+            "material_contradiction": false,
+            "observed": "exit=1; stdout=; stderr=cat: backend.txt: No such file or directory\n",
+            "outcome": "failed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(cat backend.txt)\" = backend"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "64cc2b11-9e9f-4241-849a-6140d266f7b5",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "frontend-file",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(cat frontend.txt)\" = frontend"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "ba6fba35-fb5c-4b32-a677-8956aff06d44",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          }
+        ]
+      },
+      {
+        "artifact_revision": "28739b5d57a43910b7090e476331a510daf2f949",
+        "artifacts": [
+          {
+            "kind": "base_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/7dea20c9-e9ba-4ac8-b502-8285971c2e29/base.bundle",
+            "sha256": "e191d7207701efe0de1254fb9abc07b992cef1e9a00989cba5f49bf3f0be92df",
+            "size_bytes": 311
+          },
+          {
+            "kind": "candidate_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/7dea20c9-e9ba-4ac8-b502-8285971c2e29/candidate.bundle",
+            "sha256": "8c0c7c7806e8b561a985f2781b10db4360f0b21ee99d054f78180005978b0e7a",
+            "size_bytes": 593
+          },
+          {
+            "kind": "integrated_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/artifacts/466a025a-a4b2-4f99-b7cc-88ac74968477/7dea20c9-e9ba-4ac8-b502-8285971c2e29/integrated.bundle",
+            "sha256": "d297a410df1204aa719829246e8270cb72b7b2e39ac424300c6d3a26273e4d06",
+            "size_bytes": 885
+          }
+        ],
+        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "base_revision": "cd0ef3d8ee51556471f88e06f54e688b41725017",
+        "candidate_commits": [
+          "28739b5d57a43910b7090e476331a510daf2f949"
+        ],
+        "changed_paths": [
+          "backend.txt"
+        ],
+        "created_at": 1787945732,
+        "id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "integrated_artifact_revision": "c13a46f3a6202985e18cfd12cfe0e40ed441bc5f",
+        "known_effects": [],
+        "mandate_revision": 1,
+        "output": "return a routed greeting",
+        "plan_revision": 1,
+        "profile_claim_outcomes": [],
+        "revision_disposition": "current",
+        "skill_executions": [
+          {
+            "assignment_class": "critical_path",
+            "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "corrections": 0,
+            "cost_cents": 0,
+            "delegation": "native_unchanged",
+            "latency_ms": 1001,
+            "name": "backend",
+            "principal_intervention": false,
+            "provenance": "plan",
+            "requirement": "required",
+            "verification_outcome": "passed",
+            "worker_configuration": "codex-structured-git"
+          }
+        ],
+        "status": "accepted",
+        "verification_outcomes": [
+          {
+            "criterion_id": "backend-file",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(cat backend.txt)\" = backend"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "candidate",
+            "verification_attempt_id": "87676180-d558-47c5-851a-57c1f0ae24c3",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "backend-file",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat backend.txt)\\\" = backend\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(cat backend.txt)\" = backend"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "489589ef-1c61-441d-96f0-5e839bf5927c",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "frontend-file",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(cat frontend.txt)\\\" = frontend\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(cat frontend.txt)\" = frontend"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "cbdb9051-ea42-4b5a-bde8-d3bb86b39dba",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          }
+        ]
+      }
+    ],
+    "retention_materials": [
+      {
+        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "captured_adapter_events": 7,
+        "captured_worker_output": true,
+        "content_available": true,
+        "content_bytes": 1401,
+        "created_at": 1787945731,
+        "expired_at": null,
+        "expires_at": 1790537733,
+        "id": "transcript:7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "kind": "raw_worker_transcript",
+        "pinned": false,
+        "result_id": null,
+        "retained_by_claim": false,
+        "retained_by_evidence": false,
+        "retained_for_uncertain_effect": false
+      },
+      {
+        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "captured_adapter_events": 7,
+        "captured_worker_output": true,
+        "content_available": true,
+        "content_bytes": 1288,
+        "created_at": 1787945731,
+        "expired_at": null,
+        "expires_at": 1790537733,
+        "id": "transcript:cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "kind": "raw_worker_transcript",
+        "pinned": false,
+        "result_id": null,
+        "retained_by_claim": false,
+        "retained_by_evidence": false,
+        "retained_for_uncertain_effect": false
+      }
+    ],
+    "run_report": {
+      "approval_gates": {
+        "authorized": 0,
+        "consumed": 0,
+        "invalidated_or_revoked": 0,
+        "open": 0,
+        "required": 0
+      },
+      "conflicts": {
+        "reconciliation_required_events": 0
+      },
+      "context_transfer": {
+        "attachment_takeovers": 0,
+        "manual_events": 0,
+        "manual_worker_clarifications": 0
+      },
+      "corrections": {
+        "attempt_recoveries": 0,
+        "worker_reported": 0
+      },
+      "cost": {
+        "reported_model_cents": 0,
+        "reserved_model_spend_cents": 0,
+        "reserved_paid_service_spend_cents": 0
+      },
+      "failures": {
+        "failed_attempts": 0,
+        "failed_evidence": 1,
+        "failed_or_uncertain_effects": 0,
+        "interrupted_attempts": 0,
+        "security_invariant_failures": 0,
+        "uncertain_evidence": 0
+      },
+      "reconciliation": {
+        "assignments": 0,
+        "principal_effect_reconciliations": 0
+      },
+      "recovery_events": {
+        "attempt_recoveries": 0,
+        "restart_recoveries": 0,
+        "watchdog_findings": 0
+      },
+      "timing": {
+        "accepted_at": 1787945730,
+        "completed_at": 1787945733,
+        "created_at": 1787945730,
+        "total_elapsed_millis": 3000,
+        "worker_execution_millis": 1906
+      },
+      "unplanned_principal_interventions": {
+        "commission_amendments": 0,
+        "planned_worker_controls": 0,
+        "required_approval_gate_actions_excluded": true,
+        "total": 0,
+        "worker_controls": 0
+      },
+      "useful_concurrency": {
+        "elapsed_time_reduction_millis": 905,
+        "end_to_end_elapsed_millis": 2059,
+        "occurred": true,
+        "overlap_millis": 905,
+        "parallel_execution_window_millis": 1001,
+        "serial_attempt_millis": 1906,
+        "serial_execution_millis": 1906,
+        "success_metric": "verified execution elapsed-time reduction"
+      }
+    },
+    "skill_associations": [
+      {
+        "assignment_class": "critical_path",
+        "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "causal": false,
+        "confidence_basis_points": 8000,
+        "corrections": 0,
+        "cost_cents": 0,
+        "evidence": [
+          "4e0f7342-747a-4805-b042-470ddd5ba244",
+          "d34fa731-27fe-4459-8ff8-f77b3e89b5cb",
+          "ad9d4cbe-bf49-48c7-884d-883baa5ac024"
+        ],
+        "global_ban": false,
+        "harness": "claude",
+        "id": "6ea39fe9-23c5-4402-8ab2-a5b4ab1a4dd1",
+        "latency_ms": 905,
+        "observation": "verified_success",
+        "observed_at": 1787945732,
+        "principal_intervention": false,
+        "result_id": "7385c875-398d-4dfc-ae9b-47eb99d24cc0",
+        "scope": {
+          "assignment_class": "critical_path",
+          "assignment_id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "commission_id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+          "harness": "claude",
+          "worker_configuration": "claude-structured-git"
+        },
+        "skill_version": {
+          "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "name": "frontend"
+        },
+        "verification_outcome": "passed",
+        "worker_configuration": "claude-structured-git"
+      },
+      {
+        "assignment_class": "critical_path",
+        "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "causal": false,
+        "confidence_basis_points": 8000,
+        "corrections": 0,
+        "cost_cents": 0,
+        "evidence": [
+          "d73a2656-ed3c-438a-9daa-6f67cb2fb550",
+          "c4b26f6c-2356-439c-8f9c-a86f8ac5479f",
+          "7289b27a-1e45-4fa8-b4f1-f03a6804b30c"
+        ],
+        "global_ban": false,
+        "harness": "codex",
+        "id": "e3bec5c2-c914-4434-bfca-c729888507ac",
+        "latency_ms": 1001,
+        "observation": "verified_success",
+        "observed_at": 1787945733,
+        "principal_intervention": false,
+        "result_id": "666837ed-2e34-47d5-9a70-2819de47976d",
+        "scope": {
+          "assignment_class": "critical_path",
+          "assignment_id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "commission_id": "466a025a-a4b2-4f99-b7cc-88ac74968477",
+          "harness": "codex",
+          "worker_configuration": "codex-structured-git"
+        },
+        "skill_version": {
+          "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "name": "backend"
+        },
+        "verification_outcome": "passed",
+        "worker_configuration": "codex-structured-git"
+      }
+    ],
+    "verification": {
+      "next_action": "closed",
+      "reason": "Every current Acceptance Criterion passes.",
+      "verdict": "passed"
+    },
+    "verification_gates": [],
+    "verification_recoveries": [],
+    "watchdog": {
+      "findings": [],
+      "monitored_signals": [
+        "stall",
+        "unhealthy_retry_pattern",
+        "repeated_verification_failure",
+        "abnormal_resource_use",
+        "lost_liveness",
+        "invalid_authority"
+      ]
+    },
+    "worker_commands": [],
+    "workers": [
+      {
+        "activity_at_ms": 1787945733067,
+        "assignment": {
+          "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+          "id": "b62a3322-a4fb-4373-b026-3c4a27b9c63b",
+          "logical_id": "backend"
+        },
+        "attempt_id": "7dea20c9-e9ba-4ac8-b502-8285971c2e29",
+        "available_controls": [
+          "inspect"
+        ],
+        "configuration": {
+          "adapter": {
+            "command": [
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "codex"
+            ],
+            "kind": "codex_app_server",
+            "sha256": "22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+            "version": "contract-fixture-v1"
+          },
+          "assignment_constraints": [
+            "coding"
+          ],
+          "authority_actions": [
+            "codex.git_change"
+          ],
+          "authority_scope_types": [
+            "repository",
+            "path",
+            "action"
+          ],
+          "available": true,
+          "capabilities": [
+            "structured_lifecycle",
+            "semantic_interrupt",
+            "terminal_state",
+            "usage",
+            "skills",
+            "result_submission",
+            "contained"
+          ],
+          "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+          "context": {
+            "capacity_tokens": 100000,
+            "strategy": "fresh"
+          },
+          "harness": "codex",
+          "id": "codex-structured-git",
+          "metrics": {
+            "commission_elapsed_time_contribution_ms": 1000,
+            "continuity": 0,
+            "cost_cents": 0,
+            "expected_verified_correctness": 9500,
+            "first_pass_acceptance": 9000,
+            "preference_adherence": 9000
+          },
+          "model": "codex-fixture-model",
+          "replacement_class": "structured-git",
+          "resource_limits": {
+            "max_concurrency_slots": 1,
+            "max_model_spend_cents": 0,
+            "max_paid_service_spend_cents": 0,
+            "max_storage_bytes": 5242880
+          },
+          "selected_skills": [],
+          "settings": {
+            "mode": "structured_git"
+          },
+          "skills": [
+            {
+              "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+              "name": "backend"
+            }
+          ],
+          "tools": [
+            "git"
+          ]
+        },
+        "elapsed_time_ms": 1001,
+        "handle": "Arya",
+        "id": "33cba832-2c16-413a-9e25-74c252c916c8",
+        "latest_meaningful_activity": "Result accepted",
+        "native_session_id": "codex-thread-fixture",
+        "routing_rationale": {
+          "eligible": [
+            "codex-structured-git"
+          ],
+          "entry_harness": "codex",
+          "entry_harness_preference_applied": false,
+          "ineligible": [
+            {
+              "configuration_id": "claude-structured-git",
+              "failed_gates": [
+                "required_skills"
+              ]
+            }
+          ],
+          "ordering": [
+            "expected_verified_correctness",
+            "preference_adherence",
+            "first_pass_acceptance",
+            "commission_elapsed_time_contribution",
+            "cost",
+            "continuity"
+          ]
+        },
+        "started_at_ms": 1787945731008,
+        "status": "succeeded",
+        "usage": {
+          "cost_cents": 0,
+          "input_tokens": 12,
+          "output_tokens": 4
+        }
+      },
+      {
+        "activity_at_ms": 1787945732659,
+        "assignment": {
+          "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+          "id": "8dd62672-5876-4906-a734-b50ca8cfec02",
+          "logical_id": "frontend"
+        },
+        "attempt_id": "cd430bbc-59d9-49e0-b9ce-f5c84a07d700",
+        "available_controls": [
+          "inspect"
+        ],
+        "configuration": {
+          "adapter": {
+            "command": [
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/test-tmp/.tmprtSscB/data/worker-adapters/22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+              "claude"
+            ],
+            "kind": "claude_agent_sdk",
+            "sha256": "22fc983e7dd674008c5befe14d36aba8cb2f849e0b518a807358a79f9f7656e9",
+            "version": "contract-fixture-v1"
+          },
+          "assignment_constraints": [
+            "coding"
+          ],
+          "authority_actions": [
+            "codex.git_change"
+          ],
+          "authority_scope_types": [
+            "repository",
+            "path",
+            "action"
+          ],
+          "available": true,
+          "capabilities": [
+            "structured_lifecycle",
+            "semantic_interrupt",
+            "terminal_state",
+            "usage",
+            "skills",
+            "result_submission",
+            "contained"
+          ],
+          "containment_profile": "openshell-repaired-v0.0.104-a187f64d56000b57",
+          "context": {
+            "capacity_tokens": 100000,
+            "strategy": "fresh"
+          },
+          "harness": "claude",
+          "id": "claude-structured-git",
+          "metrics": {
+            "commission_elapsed_time_contribution_ms": 1000,
+            "continuity": 0,
+            "cost_cents": 0,
+            "expected_verified_correctness": 9600,
+            "first_pass_acceptance": 9000,
+            "preference_adherence": 9000
+          },
+          "model": "claude-fixture-model",
+          "replacement_class": "structured-git",
+          "resource_limits": {
+            "max_concurrency_slots": 1,
+            "max_model_spend_cents": 0,
+            "max_paid_service_spend_cents": 0,
+            "max_storage_bytes": 5242880
+          },
+          "selected_skills": [],
+          "settings": {
+            "mode": "structured_git"
+          },
+          "skills": [
+            {
+              "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+              "name": "frontend"
+            }
+          ],
+          "tools": [
+            "git"
+          ]
+        },
+        "elapsed_time_ms": 905,
+        "handle": "Brienne",
+        "id": "535d4d61-b329-46f8-b599-877987525613",
+        "latest_meaningful_activity": "Result accepted",
+        "native_session_id": "claude-session-fixture",
+        "routing_rationale": {
+          "eligible": [
+            "claude-structured-git"
+          ],
+          "entry_harness": "codex",
+          "entry_harness_preference_applied": false,
+          "ineligible": [
+            {
+              "configuration_id": "codex-structured-git",
+              "failed_gates": [
+                "required_skills"
+              ]
+            }
+          ],
+          "ordering": [
+            "expected_verified_correctness",
+            "preference_adherence",
+            "first_pass_acceptance",
+            "commission_elapsed_time_contribution",
+            "cost",
+            "continuity"
+          ]
+        },
+        "started_at_ms": 1787945731012,
+        "status": "succeeded",
+        "usage": {
+          "cost_cents": 0,
+          "input_tokens": 10,
+          "output_tokens": 5
+        }
+      }
+    ]
+  },
+  "summary_markdown": "# Tyrion Commission Record\n\nChecksum: `sha256:8b5749792b3369bf653e9b37418179d35020f0c3f57dc05a61f882f1ff6ab602`\n\nCommission: `466a025a-a4b2-4f99-b7cc-88ac74968477`\n\nStatus: `verified_complete`\n\nAcceptance Criteria: `2/2` passed\n\nContainment scope: fixture-backed Worker evidence is not production containment attestation.\n",
+  "version": 1
+}

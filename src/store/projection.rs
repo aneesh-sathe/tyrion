@@ -1041,25 +1041,26 @@ pub(super) fn inspect_commission(
             "success_metric": "verified execution elapsed-time reduction",
         }
     });
+    let run_report = build_run_report(RunReportInput {
+        commission: &commission,
+        assignments: &assignments,
+        attempts: &attempts,
+        workers: &workers,
+        worker_commands: &worker_commands,
+        operation_requests: &operation_requests,
+        approval_gates: &approval_gates,
+        commission_amendments: &commission_amendments,
+        results: &results,
+        evidence: &evidence,
+        events: &events,
+        blockers: &blockers,
+        recovery_history: &recovery_history,
+        restart_recoveries: &restart_recoveries,
+        watchdog_findings: &watchdog_findings,
+        activity_journal: &activity_journal,
+    });
     if let Some(briefing) = briefing.as_mut() {
-        briefing["run_report"] = build_run_report(RunReportInput {
-            commission: &commission,
-            assignments: &assignments,
-            attempts: &attempts,
-            workers: &workers,
-            worker_commands: &worker_commands,
-            operation_requests: &operation_requests,
-            approval_gates: &approval_gates,
-            commission_amendments: &commission_amendments,
-            results: &results,
-            evidence: &evidence,
-            events: &events,
-            blockers: &blockers,
-            recovery_history: &recovery_history,
-            restart_recoveries: &restart_recoveries,
-            watchdog_findings: &watchdog_findings,
-            activity_journal: &activity_journal,
-        });
+        briefing["run_report"] = run_report.clone();
     }
     let occupied = attempts
         .iter()
@@ -1467,6 +1468,7 @@ pub(super) fn inspect_commission(
         "watchdog": watchdog,
         "attachments": attachments,
         "activity_journal": activity_journal,
+        "run_report": run_report,
         "verification": verification,
         "retention_materials": retention_materials,
     }))
@@ -1592,7 +1594,15 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
             .filter(|value| value[field] == expected)
             .count()
     };
-    let worker_controls = input.worker_commands.len();
+    let planned_worker_controls = input
+        .worker_commands
+        .iter()
+        .filter(|command| command["payload"]["planned"] == true)
+        .count();
+    let unplanned_worker_controls = input
+        .worker_commands
+        .len()
+        .saturating_sub(planned_worker_controls);
     let accepted_amendments = count(input.commission_amendments, "status", "accepted");
     let manual_clarifications = count(input.worker_commands, "kind", "steer");
     let attachment_takeovers = input
@@ -1659,11 +1669,22 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
         .filter(|finding| finding["signal"] == "invalid_authority");
     let explicit_security_blockers = input.blockers.iter().filter(|blocker| {
         let code = blocker["code"].as_str().unwrap_or_default();
-        code.contains("containment") || code.contains("security_invariant")
+        let requirement = blocker["requirement"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        code.contains("containment")
+            || code.contains("security_invariant")
+            || requirement.contains("containment failure")
     });
+    let abnormal_resource_findings = input
+        .watchdog_findings
+        .iter()
+        .filter(|finding| finding["signal"] == "abnormal_resource_use");
     let security_invariant_failures = containment_recovery_failures.count()
         + containment_effect_failures.count()
         + invalid_authority_findings.count()
+        + abnormal_resource_findings.count()
         + explicit_security_blockers.count();
     let principal_effect_reconciliations = input
         .operation_requests
@@ -1681,8 +1702,9 @@ fn build_run_report(input: RunReportInput<'_>) -> Value {
                 + count(input.approval_gates, "status", "revoked"),
         },
         "unplanned_principal_interventions": {
-            "total": worker_controls + accepted_amendments,
-            "worker_controls": worker_controls,
+            "total": unplanned_worker_controls + accepted_amendments,
+            "worker_controls": unplanned_worker_controls,
+            "planned_worker_controls": planned_worker_controls,
             "commission_amendments": accepted_amendments,
             "required_approval_gate_actions_excluded": true,
         },

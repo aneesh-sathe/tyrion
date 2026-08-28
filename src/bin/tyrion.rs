@@ -221,6 +221,8 @@ enum WorkerCommand {
         #[arg(long)]
         clarification: String,
         #[arg(long)]
+        planned: bool,
+        #[arg(long)]
         expected_revision: i64,
         #[arg(long)]
         idempotency_key: String,
@@ -230,6 +232,8 @@ enum WorkerCommand {
         worker_handle: String,
         #[arg(long)]
         reason: String,
+        #[arg(long)]
+        planned: bool,
         #[arg(long)]
         expected_revision: i64,
         #[arg(long)]
@@ -1014,6 +1018,7 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                         commission_id,
                         worker_handle,
                         clarification,
+                        planned,
                         expected_revision,
                         idempotency_key,
                     },
@@ -1022,6 +1027,7 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     commission_id: commission_id.clone(),
                     worker_handle: worker_handle.clone(),
                     clarification: clarification.clone(),
+                    planned: *planned,
                 },
                 Some(idempotency_key.clone()),
                 Some(*expected_revision),
@@ -1033,6 +1039,7 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                         commission_id,
                         worker_handle,
                         reason,
+                        planned,
                         expected_revision,
                         idempotency_key,
                     },
@@ -1041,6 +1048,7 @@ fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> 
                     commission_id: commission_id.clone(),
                     worker_handle: worker_handle.clone(),
                     reason: reason.clone(),
+                    planned: *planned,
                 },
                 Some(idempotency_key.clone()),
                 Some(*expected_revision),
