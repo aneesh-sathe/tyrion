@@ -1781,8 +1781,8 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
 
     let observer_token = issue_launch_token(
         &daemon,
-        "muse",
-        "muse-entry",
+        "generic",
+        "generic-entry",
         "0.1.0",
         "issue-observer-mode-token",
     );
@@ -1790,8 +1790,8 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
         &daemon,
         observer_token["launch_token"].as_str().unwrap(),
         &attachment_fixture(
-            "muse",
-            "muse-entry",
+            "generic",
+            "generic-entry",
             "0.1.0",
             "observer-mode-session",
             &["commission_inspection"],
@@ -1842,8 +1842,8 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
 
     let incompatible_token = issue_launch_token(
         &daemon,
-        "muse",
-        "muse-entry",
+        "generic",
+        "generic-entry",
         "0.1.0",
         "issue-no-inspection-token",
     );
@@ -1851,8 +1851,8 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
         &daemon,
         incompatible_token["launch_token"].as_str().unwrap(),
         &attachment_fixture(
-            "muse",
-            "muse-entry",
+            "generic",
+            "generic-entry",
             "0.1.0",
             "no-inspection-session",
             &["event_replay"],

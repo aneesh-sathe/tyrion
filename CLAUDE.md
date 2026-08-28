@@ -18,6 +18,7 @@
 - Daemon startup journals cleanup before marking stranded Attempts failed, expiring Leases, revoking reservations, and returning Assignments to `ready`. Pending sandbox deletion survives repeated crashes and blocks redispatch until confirmed.
 - Keep lifecycle transactions in `store.rs`, read projections in `store/projection.rs`, and schema invariants in `store/schema.rs`.
 - After completing each tracker ticket, commit and push the current branch to `origin` before handoff.
+- Muse Code integration is deferred as future support and is not part of the dogfood MVP.
 - Commission inspection and mutation require an opaque Attachment session credential. Public Attachment IDs identify projections but grant no authority. Proposal creation makes its capable creator active; later Attachments join as observers until an explicit revision-checked takeover.
 - Launch tokens expire within 300 seconds, are single-use, and bind the expected harness, adapter identity, and adapter version. The handshake also requires an exact protocol version and native session identity.
 - Entry capability negotiation covers proposal creation, acceptance, inspection, event replay, takeover, material notifications, persistent mode display, Worker steering, and Worker interruption. Every missing capability names its affected protocol operations, practical effect, concrete alternative, and the Pi recovery harness, then derives Full, Limited, or Observer mode.
