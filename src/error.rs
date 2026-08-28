@@ -55,6 +55,8 @@ pub enum TyrionError {
     StaleControlRevision { expected: i64, actual: i64 },
     #[error("attachment rejected: {0}")]
     AttachmentRejected(String),
+    #[error("attachment rejected: {message}")]
+    AttachmentRejectedWithDetails { message: String, details: Value },
     #[error("control denied: {0}")]
     ControlDenied(String),
     #[error("Worker Lease expired {operation}")]
@@ -106,7 +108,9 @@ impl TyrionError {
             Self::IdempotencyConflict => ErrorCode::IdempotencyConflict,
             Self::StaleRevision { .. } => ErrorCode::StaleRevision,
             Self::StaleControlRevision { .. } => ErrorCode::StaleControlRevision,
-            Self::AttachmentRejected(_) => ErrorCode::AttachmentRejected,
+            Self::AttachmentRejected(_) | Self::AttachmentRejectedWithDetails { .. } => {
+                ErrorCode::AttachmentRejected
+            }
             Self::ControlDenied(_) => ErrorCode::ControlDenied,
             Self::WorkerLeaseExpired { .. }
             | Self::WorkerInterrupted
@@ -129,6 +133,7 @@ impl TyrionError {
                 "expected_control_revision": expected,
                 "current_control_revision": actual,
             })),
+            Self::AttachmentRejectedWithDetails { details, .. } => Some(details.clone()),
             _ => None,
         }
     }

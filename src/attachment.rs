@@ -18,45 +18,94 @@ pub(crate) const WORKER_INTERRUPTION: &str = "worker_interruption";
 const CAPABILITIES: [Capability; 9] = [
     Capability {
         name: PROPOSAL_CREATION,
+        affected_actions: &["create_proposal"],
         missing_effect: "This Entry Session cannot create Commission Proposals.",
     },
     Capability {
         name: COMMISSION_ACCEPTANCE,
+        affected_actions: &[
+            "accept_commission",
+            "pause_commission",
+            "resume_commission",
+            "cancel_commission",
+            "propose_operation",
+            "execute_operation",
+            "propose_commission_amendment",
+            "amend_verification",
+            "record_verification_evidence",
+        ],
         missing_effect: "This Entry Session cannot accept Commission Proposals.",
     },
     Capability {
         name: COMMISSION_INSPECTION,
+        affected_actions: &[
+            "connect_attachment",
+            "inspect_commission",
+            "update_attachment_capabilities",
+            "create_profile_claim",
+            "revise_profile_claim",
+            "observe_profile_preference",
+            "confirm_profile_claim",
+            "suppress_profile_claim",
+            "forget_profile_claim",
+            "create_learning_boundary",
+            "import_memory",
+            "pin_memory_material",
+        ],
         missing_effect: "This Entry Session cannot inspect a Commission.",
     },
     Capability {
         name: EVENT_REPLAY,
+        affected_actions: &[
+            "connect_attachment_with_replay",
+            "resume_attachment",
+            "replay_events",
+        ],
         missing_effect: "This Entry Session cannot replay unseen durable Commission events.",
     },
     Capability {
         name: CONTROL_TAKEOVER,
+        affected_actions: &["take_control"],
         missing_effect: "This Entry Session cannot take active control of a Commission.",
     },
     Capability {
         name: MATERIAL_NOTIFICATIONS,
+        affected_actions: &["receive_material_notifications"],
         missing_effect: "This Entry Session must inspect for material Commission updates.",
     },
     Capability {
         name: PERSISTENT_MODE_DISPLAY,
+        affected_actions: &["display_attachment_mode_persistently"],
         missing_effect: "Every Commission summary must repeat the Attachment Mode warning.",
     },
     Capability {
         name: WORKER_STEERING,
+        affected_actions: &["steer_worker"],
         missing_effect: "This Entry Session cannot steer an active Worker.",
     },
     Capability {
         name: WORKER_INTERRUPTION,
+        affected_actions: &["interrupt_worker", "retry_worker"],
         missing_effect: "This Entry Session cannot interrupt an active Worker.",
     },
 ];
 
 struct Capability {
     name: &'static str,
+    affected_actions: &'static [&'static str],
     missing_effect: &'static str,
+}
+
+const FULL_CONTROL_HARNESS: &str = "pi";
+
+fn missing_capability(capability: &Capability) -> Value {
+    json!({
+        "capability": capability.name,
+        "affected_actions": capability.affected_actions,
+        "effect": capability.missing_effect,
+        "alternative": "Reconnect through a Full Pi Entry Session.",
+        "supported_harness": FULL_CONTROL_HARNESS,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -108,9 +157,14 @@ pub(crate) fn negotiate(advertised: &[String]) -> Result<NegotiatedCapabilities,
         .map(String::as_str)
         .collect::<HashSet<_>>();
     if !advertised.contains(COMMISSION_INSPECTION) {
-        return Err(TyrionError::AttachmentRejected(
-            "the adapter is incompatible because commission_inspection is required".into(),
-        ));
+        let inspection = CAPABILITIES
+            .iter()
+            .find(|capability| capability.name == COMMISSION_INSPECTION)
+            .expect("commission_inspection must remain a known capability");
+        return Err(TyrionError::AttachmentRejectedWithDetails {
+            message: "the adapter is incompatible because commission_inspection is required".into(),
+            details: json!({"missing_capabilities": [missing_capability(inspection)]}),
+        });
     }
 
     let effective = CAPABILITIES
@@ -121,13 +175,7 @@ pub(crate) fn negotiate(advertised: &[String]) -> Result<NegotiatedCapabilities,
     let missing = CAPABILITIES
         .iter()
         .filter(|capability| !advertised.contains(capability.name))
-        .map(|capability| {
-            json!({
-                "capability": capability.name,
-                "effect": capability.missing_effect,
-                "alternative": "Use an Entry Session that advertises this capability.",
-            })
-        })
+        .map(missing_capability)
         .collect::<Vec<_>>();
     let can_mutate = advertised.contains(PROPOSAL_CREATION)
         || advertised.contains(COMMISSION_ACCEPTANCE)

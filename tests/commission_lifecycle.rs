@@ -1709,7 +1709,7 @@ fn rejected_attachment_handshakes_never_fall_back_or_consume_a_valid_token() {
     assert_attachment_rejected(&expired, "launch token has expired");
 }
 
-fn assert_attachment_rejected(output: &Output, expected_message: &str) {
+fn assert_attachment_rejected(output: &Output, expected_message: &str) -> Value {
     assert_eq!(output.status.code(), Some(2));
     assert!(
         output.stdout.is_empty(),
@@ -1723,6 +1723,7 @@ fn assert_attachment_rejected(output: &Output, expected_message: &str) {
         actual_message.contains(expected_message),
         "expected attachment error containing {expected_message:?}, got {actual_message:?}"
     );
+    error
 }
 
 #[test]
@@ -1763,6 +1764,20 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
         .as_str()
         .unwrap()
         .contains("inspect"));
+    assert_eq!(
+        limited["attachment"]["missing_capabilities"][0]["affected_actions"],
+        json!(["receive_material_notifications"])
+    );
+    assert_eq!(
+        limited["attachment"]["missing_capabilities"][0]["supported_harness"],
+        "pi"
+    );
+    assert!(
+        limited["attachment"]["missing_capabilities"][0]["alternative"]
+            .as_str()
+            .unwrap()
+            .contains("Pi Entry Session")
+    );
 
     let observer_token = issue_launch_token(
         &daemon,
@@ -1779,26 +1794,51 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
             "muse-entry",
             "0.1.0",
             "observer-mode-session",
-            &[
-                "commission_inspection",
-                "event_replay",
-                "persistent_mode_display",
-            ],
+            &["commission_inspection"],
         ),
         "connect-observer-mode-session",
     ));
     assert_eq!(observer["attachment"]["mode"], "observer");
     assert_eq!(observer["attachment"]["mode_tag"], "Tyrion: Observer");
-    assert!(observer["attachment"]["missing_capabilities"]
+    let expected_actions = json!({
+        "proposal_creation": ["create_proposal"],
+        "commission_acceptance": [
+            "accept_commission",
+            "pause_commission",
+            "resume_commission",
+            "cancel_commission",
+            "propose_operation",
+            "execute_operation",
+            "propose_commission_amendment",
+            "amend_verification",
+            "record_verification_evidence"
+        ],
+        "event_replay": [
+            "connect_attachment_with_replay",
+            "resume_attachment",
+            "replay_events"
+        ],
+        "control_takeover": ["take_control"],
+        "material_notifications": ["receive_material_notifications"],
+        "persistent_mode_display": ["display_attachment_mode_persistently"],
+        "worker_steering": ["steer_worker"],
+        "worker_interruption": ["interrupt_worker", "retry_worker"]
+    });
+    let observer_missing = observer["attachment"]["missing_capabilities"]
         .as_array()
-        .unwrap()
-        .iter()
-        .all(|missing| missing["effect"]
+        .unwrap();
+    assert_eq!(observer_missing.len(), 8);
+    for missing in observer_missing {
+        let capability = missing["capability"].as_str().unwrap();
+        assert_eq!(missing["affected_actions"], expected_actions[capability]);
+        assert!(missing["effect"]
             .as_str()
-            .is_some_and(|effect| !effect.is_empty())
-            && missing["alternative"]
-                .as_str()
-                .is_some_and(|alternative| !alternative.is_empty())));
+            .is_some_and(|effect| !effect.is_empty()));
+        assert!(missing["alternative"]
+            .as_str()
+            .is_some_and(|alternative| alternative.contains("Pi Entry Session")));
+        assert_eq!(missing["supported_harness"], "pi");
+    }
 
     let incompatible_token = issue_launch_token(
         &daemon,
@@ -1819,7 +1859,31 @@ fn capability_negotiation_reports_limited_and_observer_effects() {
         ),
         "connect-no-inspection-session",
     );
-    assert_attachment_rejected(&incompatible, "commission_inspection is required");
+    let incompatible_error =
+        assert_attachment_rejected(&incompatible, "commission_inspection is required");
+    assert_eq!(
+        incompatible_error["details"]["missing_capabilities"],
+        json!([{
+            "capability": "commission_inspection",
+            "affected_actions": [
+                "connect_attachment",
+                "inspect_commission",
+                "update_attachment_capabilities",
+                "create_profile_claim",
+                "revise_profile_claim",
+                "observe_profile_preference",
+                "confirm_profile_claim",
+                "suppress_profile_claim",
+                "forget_profile_claim",
+                "create_learning_boundary",
+                "import_memory",
+                "pin_memory_material"
+            ],
+            "effect": "This Entry Session cannot inspect a Commission.",
+            "alternative": "Reconnect through a Full Pi Entry Session.",
+            "supported_harness": "pi"
+        }])
+    );
 }
 
 #[test]

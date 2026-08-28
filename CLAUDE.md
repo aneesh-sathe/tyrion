@@ -20,7 +20,7 @@
 - After completing each tracker ticket, commit and push the current branch to `origin` before handoff.
 - Commission inspection and mutation require an opaque Attachment session credential. Public Attachment IDs identify projections but grant no authority. Proposal creation makes its capable creator active; later Attachments join as observers until an explicit revision-checked takeover.
 - Launch tokens expire within 300 seconds, are single-use, and bind the expected harness, adapter identity, and adapter version. The handshake also requires an exact protocol version and native session identity.
-- Entry capability negotiation currently covers proposal creation, acceptance, inspection, event replay, takeover, material notifications, and persistent mode display. Every missing capability returns its practical effect and derives Full, Limited, or Observer mode.
+- Entry capability negotiation covers proposal creation, acceptance, inspection, event replay, takeover, material notifications, persistent mode display, Worker steering, and Worker interruption. Every missing capability names its affected protocol operations, practical effect, concrete alternative, and the Pi recovery harness, then derives Full, Limited, or Observer mode.
 - Attachment joins and control transfers are durable ordered events with structured payloads. Cursor replay returns only later events; observers receive the event ledger but never material notifications.
 - Resume reauthenticates the durable Attachment credential against the exact adapter, protocol, native session, and negotiated capabilities before replaying unseen events.
 - Control takeover advances a separate control revision without changing the Commission mandate revision or Authority Envelope.
