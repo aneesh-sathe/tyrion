@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,77 @@ use tempfile::TempDir;
 struct RunningDaemon {
     child: Child,
     socket_path: PathBuf,
+}
+
+struct RunningPi {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    request_sequence: u64,
+}
+
+impl RunningPi {
+    fn start(socket_path: &Path) -> Self {
+        let fake_pi = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_pi_host.mjs");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+            .args(["--socket", path_text(socket_path), "pi", "--pi-command"])
+            .arg(fake_pi)
+            .args(["--", "--mode", "rpc", "--no-session"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Pi Entry Session should launch");
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            input,
+            output,
+            request_sequence: 0,
+        }
+    }
+
+    fn request(&mut self, request_type: &str, message: Option<&str>) -> Value {
+        self.request_sequence += 1;
+        let id = format!("pi-control-{}", self.request_sequence);
+        let request = json!({
+            "id": id,
+            "type": request_type,
+            "message": message,
+        });
+        serde_json::to_writer(&mut self.input, &request).unwrap();
+        self.input.write_all(b"\n").unwrap();
+        self.input.flush().unwrap();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(self.output.read_line(&mut line).unwrap(), 0);
+            let response: Value = serde_json::from_str(&line).unwrap();
+            if response["type"] == "response" && response["id"] == id {
+                assert_eq!(response["success"], true, "Pi request failed: {response}");
+                return response;
+            }
+        }
+    }
+
+    fn prompt(&mut self, message: &str) {
+        self.request("prompt", Some(message));
+    }
+
+    fn messages(&mut self) -> Vec<Value> {
+        self.request("get_messages", None)["data"]["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+}
+
+impl Drop for RunningPi {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn skill_version(name: &str) -> Value {
@@ -822,6 +893,95 @@ fn codex_entry_routes_to_the_best_complete_claude_configuration() {
 }
 
 #[test]
+fn qualified_pi_routes_and_executes_with_the_shared_worker_contract() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let catalog = write_worker_catalog(temp.path());
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog, &[]);
+    let attachment_token = connect_full_entry(&daemon, "pi", "pi-qualified-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["worker_requirements"]["require_configurations"] = json!(["pi-rpc-qualified"]);
+    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(&daemon, &attachment_token, &proposal_path, "pi-qualified");
+    let route = &accepted["assignments"][0]["route"];
+    assert_eq!(route["status"], "selected");
+    assert_eq!(route["selected_configuration"]["id"], "pi-rpc-qualified");
+    assert_eq!(route["selected_configuration"]["harness"], "pi");
+    assert_eq!(route["rationale"]["entry_harness"], "pi");
+    let commission_id = accepted["commission"]["id"].as_str().unwrap();
+    let completed = wait_for_commission_status(
+        &daemon,
+        &attachment_token,
+        commission_id,
+        "verified_complete",
+    );
+    assert_eq!(
+        completed["workers"][0]["native_session_id"],
+        "pi-session-fixture"
+    );
+    assert_eq!(completed["workers"][0]["usage"]["input_tokens"], 11);
+    assert_eq!(
+        completed["workers"][0]["latest_meaningful_activity"],
+        "Result accepted"
+    );
+}
+
+#[test]
+fn incomplete_pi_worker_is_visibly_ineligible() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let mut catalog = worker_catalog();
+    let pi = catalog["configurations"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap();
+    pi["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("production_qualified");
+    pi["adapter"]["command"] = json!([]);
+    pi["adapter"]["sha256"] = json!("");
+    pi["capabilities"] = json!([]);
+    let catalog = write_worker_catalog_value(temp.path(), catalog);
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog, &[]);
+    let attachment_token = connect_full_entry(&daemon, "pi", "pi-incomplete-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["worker_requirements"]["require_configurations"] = json!(["pi-rpc-qualified"]);
+    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(&daemon, &attachment_token, &proposal_path, "pi-incomplete");
+    let route = &accepted["assignments"][0]["route"];
+    assert_eq!(route["status"], "attention_required");
+    let pi = route["rationale"]["ineligible"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["configuration_id"] == "pi-rpc-qualified")
+        .unwrap();
+    assert!(pi["failed_gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|gate| gate == "production_qualification"));
+}
+
+#[test]
 fn claude_entry_does_not_bias_routing_toward_claude() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
@@ -1571,6 +1731,67 @@ fn active_entry_session_inspects_steers_and_interrupts_by_worker_handle() {
 }
 
 #[test]
+fn pi_native_commands_render_steer_interrupt_and_retry_controls() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let catalog_path = write_worker_catalog(temp.path());
+    let daemon = RunningDaemon::start_with_arguments(
+        &data_dir,
+        &catalog_path,
+        &["--fault-hold-worker-for-control"],
+    );
+    let mut pi = RunningPi::start(&daemon.socket_path);
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(proposal_path).unwrap()).unwrap();
+    proposal["resource_ceilings"]["max_attempts"] = json!(2);
+    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+
+    pi.prompt(&format!(
+        "/tyrion-propose {}",
+        serde_json::to_string(&proposal).unwrap()
+    ));
+    pi.prompt("/tyrion-accept");
+    let running = wait_for_pi_worker(&mut pi, 1, "running");
+    let running_content = running["content"].as_str().unwrap();
+    assert!(running_content.contains("- Arya: running"));
+    assert!(running_content.contains("controls: inspect, steer, interrupt"));
+    assert!(running_content.contains("configuration claude-opus-review"));
+
+    pi.prompt("/tyrion-steer Arya Focus on the accepted greeting wording.");
+    let steered = latest_pi_projection(&mut pi);
+    assert_eq!(steered["worker_commands"][0]["kind"], "steer");
+    assert_eq!(steered["worker_commands"][0]["status"], "delivered");
+    assert!(steered["workers"][0]["latest_meaningful_activity"]
+        .as_str()
+        .unwrap()
+        .contains("accepted greeting wording"));
+
+    pi.prompt("/tyrion-interrupt Arya Principal requested a stop.");
+    let interrupted = wait_for_pi_worker(&mut pi, 1, "interrupted");
+    assert!(interrupted["content"]
+        .as_str()
+        .unwrap()
+        .contains("controls: inspect, retry"));
+    assert_eq!(
+        interrupted["details"]["commission"]["worker_commands"][1]["kind"],
+        "interrupt"
+    );
+
+    pi.prompt("/tyrion-retry Arya");
+    let retried = wait_for_pi_worker(&mut pi, 2, "running");
+    let second_handle = retried["details"]["commission"]["workers"][1]["handle"]
+        .as_str()
+        .unwrap();
+    assert_ne!(second_handle, "Arya");
+    assert!(retried["content"].as_str().unwrap().contains(second_handle));
+    assert_eq!(
+        retried["details"]["commission"]["attention_conditions"][0]["status"],
+        "resolved"
+    );
+}
+
+#[test]
 fn workers_without_live_adapter_controls_expose_only_inspection() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
@@ -1705,8 +1926,8 @@ fn failed_interrupt_delivery_does_not_interrupt_the_worker_locally() {
 }
 
 #[test]
-fn codex_and_claude_adapters_receive_structured_steering_and_interruption() {
-    for configuration_id in ["codex-deep", "claude-opus-review"] {
+fn structured_adapters_receive_steering_and_interruption() {
+    for configuration_id in ["codex-deep", "claude-opus-review", "pi-rpc-qualified"] {
         let temp = TempDir::new().expect("temporary directory should be created");
         let data_dir = temp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
@@ -1720,6 +1941,9 @@ fn codex_and_claude_adapters_receive_structured_steering_and_interruption() {
         proposal["goal"] = json!("hold for structured control");
         proposal["criteria"][0]["verifier"]["expected"] = json!("hold for structured control");
         proposal["worker_requirements"]["require_configurations"] = json!([configuration_id]);
+        if configuration_id == "pi-rpc-qualified" {
+            proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+        }
         fs::write(
             &proposal_path,
             serde_json::to_vec_pretty(&proposal).unwrap(),
@@ -1792,13 +2016,25 @@ fn codex_and_claude_adapters_receive_structured_steering_and_interruption() {
         assert!(interrupted["workers"][0]["native_session_id"]
             .as_str()
             .is_some_and(|session| !session.is_empty()));
-        assert_eq!(interrupted["workers"][0]["usage"]["input_tokens"], 2);
+        let expected_usage = if configuration_id == "pi-rpc-qualified" {
+            (19, 4)
+        } else {
+            (2, 0)
+        };
+        assert_eq!(
+            interrupted["workers"][0]["usage"]["input_tokens"],
+            expected_usage.0
+        );
+        assert_eq!(
+            interrupted["workers"][0]["usage"]["output_tokens"],
+            expected_usage.1
+        );
     }
 }
 
 #[test]
 fn failed_structured_terminals_retain_native_session_and_usage() {
-    for configuration_id in ["codex-deep", "claude-opus-review"] {
+    for configuration_id in ["codex-deep", "claude-opus-review", "pi-rpc-qualified"] {
         let temp = TempDir::new().expect("temporary directory should be created");
         let data_dir = temp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
@@ -1811,6 +2047,9 @@ fn failed_structured_terminals_retain_native_session_and_usage() {
             serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
         proposal["goal"] = json!("report structured failure");
         proposal["worker_requirements"]["require_configurations"] = json!([configuration_id]);
+        if configuration_id == "pi-rpc-qualified" {
+            proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+        }
         fs::write(
             &proposal_path,
             serde_json::to_vec_pretty(&proposal).unwrap(),
@@ -1827,8 +2066,19 @@ fn failed_structured_terminals_retain_native_session_and_usage() {
         assert!(failed["workers"][0]["native_session_id"]
             .as_str()
             .is_some_and(|session| !session.is_empty()));
-        assert_eq!(failed["workers"][0]["usage"]["input_tokens"], 6);
-        assert_eq!(failed["workers"][0]["usage"]["output_tokens"], 1);
+        let expected_usage = if configuration_id == "pi-rpc-qualified" {
+            (23, 7)
+        } else {
+            (6, 1)
+        };
+        assert_eq!(
+            failed["workers"][0]["usage"]["input_tokens"],
+            expected_usage.0
+        );
+        assert_eq!(
+            failed["workers"][0]["usage"]["output_tokens"],
+            expected_usage.1
+        );
     }
 }
 
@@ -1839,13 +2089,14 @@ fn restart_recovers_a_stranded_structured_worker_and_retries() {
     fs::create_dir(&data_dir).unwrap();
     let catalog_path = write_worker_catalog(temp.path());
     let mut first = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
-    let attachment_token = connect_full_entry(&first, "codex", "restart-control-session");
+    let attachment_token = connect_full_entry(&first, "pi", "restart-control-session");
     let proposal_path = write_deterministic_routing_proposal(temp.path());
     let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
     proposal["goal"] = json!("hold for structured control");
     proposal["criteria"][0]["verifier"]["expected"] = json!("hold for structured control");
     proposal["resource_ceilings"]["max_attempts"] = json!(2);
     proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+    proposal["worker_requirements"]["require_configurations"] = json!(["pi-rpc-qualified"]);
     fs::write(
         &proposal_path,
         serde_json::to_vec_pretty(&proposal).unwrap(),
@@ -1853,12 +2104,7 @@ fn restart_recovers_a_stranded_structured_worker_and_retries() {
     .unwrap();
     let accepted = create_and_accept(&first, &attachment_token, &proposal_path, "crash-recovery");
     let commission_id = accepted["commission"]["id"].as_str().unwrap();
-    wait_for_live_adapter_telemetry(
-        &first,
-        &attachment_token,
-        commission_id,
-        "claude-opus-review",
-    );
+    wait_for_live_adapter_telemetry(&first, &attachment_token, commission_id, "pi-rpc-qualified");
     first.child.kill().unwrap();
     first.child.wait().unwrap();
 
@@ -1947,6 +2193,42 @@ fn wait_for_path(path: &Path) {
             path.display()
         );
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn latest_pi_message(pi: &mut RunningPi) -> Value {
+    pi.messages()
+        .into_iter()
+        .rev()
+        .find(|message| message["customType"] == "tyrion-commission")
+        .expect("Pi should render a Commission projection")
+}
+
+fn latest_pi_projection(pi: &mut RunningPi) -> Value {
+    latest_pi_message(pi)["details"]["commission"].clone()
+}
+
+fn wait_for_pi_worker(pi: &mut RunningPi, expected_count: usize, expected_status: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        pi.prompt("/tyrion-status");
+        let message = latest_pi_message(pi);
+        if message["details"]["commission"]["workers"]
+            .as_array()
+            .is_some_and(|workers| {
+                workers.len() == expected_count
+                    && workers
+                        .last()
+                        .is_some_and(|worker| worker["status"] == expected_status)
+            })
+        {
+            return message;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Pi Worker did not reach {expected_status}: {message}"
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -2215,17 +2497,20 @@ fn write_worker_catalog_value(root: &Path, catalog: Value) -> PathBuf {
     let mut catalog = catalog;
     for configuration in catalog["configurations"].as_array_mut().unwrap() {
         let kind = configuration["adapter"]["kind"].as_str().unwrap();
-        if matches!(kind, "codex_app_server" | "claude_agent_sdk") {
+        let qualified_pi =
+            kind != "pi_rpc" || configuration["settings"]["production_qualified"] == true;
+        if qualified_pi && matches!(kind, "codex_app_server" | "claude_agent_sdk" | "pi_rpc") {
             let adapter = Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/fake_structured_adapter.sh"
             ));
             configuration["adapter"]["command"] = json!([
                 adapter,
-                if kind == "codex_app_server" {
-                    "codex"
-                } else {
-                    "claude"
+                match kind {
+                    "codex_app_server" => "codex",
+                    "claude_agent_sdk" => "claude",
+                    "pi_rpc" => "pi",
+                    _ => unreachable!(),
                 }
             ]);
             configuration["adapter"]["sha256"] = json!(sha256_file(adapter));
@@ -2331,6 +2616,37 @@ fn worker_catalog() -> Value {
                     "cost_cents": 30,
                     "continuity": 9000
                 }
+            },
+            {
+                "id": "pi-rpc-qualified",
+                "harness": "pi",
+                "adapter": {"kind": "pi_rpc", "version": "1.0.0"},
+                "model": "openai/fixture-pi",
+                "settings": {"production_qualified": true},
+                "tools": ["git"],
+                "skills": [skill_version("code-review")],
+                "context": {"strategy": "fresh_with_retrieval", "capacity_tokens": 200000},
+                "resource_limits": {
+                    "max_concurrency_slots": 1,
+                    "max_storage_bytes": 2097152,
+                    "max_model_spend_cents": 0,
+                    "max_paid_service_spend_cents": 0
+                },
+                "capabilities": ["structured_lifecycle", "semantic_interrupt", "terminal_state", "usage", "skills", "result_submission", "contained"],
+                "authority_actions": ["deterministic.echo", "codex.git_change"],
+                "authority_scope_types": ["repository", "path", "action"],
+                "assignment_constraints": ["coding"],
+                "containment_profile": "openshell-repaired-v0.0.104",
+                "replacement_class": "deep-coding",
+                "available": true,
+                "metrics": {
+                    "expected_verified_correctness": 9300,
+                    "preference_adherence": 9000,
+                    "first_pass_acceptance": 8900,
+                    "commission_elapsed_time_contribution_ms": 1300,
+                    "cost_cents": 0,
+                    "continuity": 4000
+                }
             }
         ]
     })
@@ -2408,6 +2724,12 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path, claude: &P
         include_bytes!("../runtime/openshell/hard-landlock-claude-policy.yaml"),
     )
     .unwrap();
+    let pi_policy = root.join("hard-pi-policy.yaml");
+    fs::write(
+        &pi_policy,
+        include_bytes!("../runtime/openshell/hard-landlock-pi-policy.yaml"),
+    )
+    .unwrap();
     let gateway = root.join("gateway.toml");
     fs::write(
         &gateway,
@@ -2455,6 +2777,16 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path, claude: &P
                 "policy_path": claude_policy,
                 "policy_sha256": sha256_file(&claude_policy),
                 "openshell_provider": "fixture-claude",
+                "binary": claude,
+                "version": "2.1.204 (Claude Code)",
+                "sha256": sha256_file(claude)
+            },
+            "pi": {
+                "policy_path": pi_policy,
+                "policy_sha256": sha256_file(&pi_policy),
+                "openshell_provider": "fixture-pi",
+                "model_provider": "openai",
+                "model": "openai/fixture-pi",
                 "binary": claude,
                 "version": "2.1.204 (Claude Code)",
                 "sha256": sha256_file(claude)

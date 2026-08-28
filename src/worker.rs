@@ -220,6 +220,34 @@ impl WorkerControl {
                 }
                 _ => {}
             },
+            routing::WorkerAdapterKind::PiRpc => match event["type"].as_str() {
+                Some("agent_start") => meaningful_activity = Some("Pi agent started"),
+                Some("tyrion.pi.usage") => {
+                    if let (Some(input), Some(output)) = (
+                        event["input_tokens"].as_u64(),
+                        event["output_tokens"].as_u64(),
+                    ) {
+                        telemetry.input_tokens = input;
+                        telemetry.output_tokens = output;
+                        telemetry.usage_reported = true;
+                    }
+                }
+                Some("message_end") if event["message"]["role"] == "assistant" => {
+                    meaningful_activity = Some("Pi produced a structured Result");
+                    if let (Some(input), Some(output)) = (
+                        event["message"]["usage"]["input"].as_u64(),
+                        event["message"]["usage"]["output"].as_u64(),
+                    ) {
+                        telemetry.input_tokens = telemetry.input_tokens.saturating_add(input);
+                        telemetry.output_tokens = telemetry.output_tokens.saturating_add(output);
+                        telemetry.usage_reported = true;
+                    }
+                }
+                Some("extension_error") => {
+                    meaningful_activity = Some("Pi adapter reported an error")
+                }
+                _ => {}
+            },
             _ => {}
         }
         if let Some(activity) = meaningful_activity {
@@ -861,7 +889,8 @@ impl WorkerRuntime {
             match (configuration.adapter.kind, &assignment.execution) {
                 (
                     routing::WorkerAdapterKind::CodexAppServer
-                    | routing::WorkerAdapterKind::ClaudeAgentSdk,
+                    | routing::WorkerAdapterKind::ClaudeAgentSdk
+                    | routing::WorkerAdapterKind::PiRpc,
                     ExecutionSpec::Deterministic,
                 ) => {
                     let runtime = self.contained_codex.as_ref().ok_or_else(|| {
@@ -898,7 +927,8 @@ impl WorkerRuntime {
                 }
                 (
                     routing::WorkerAdapterKind::CodexAppServer
-                    | routing::WorkerAdapterKind::ClaudeAgentSdk,
+                    | routing::WorkerAdapterKind::ClaudeAgentSdk
+                    | routing::WorkerAdapterKind::PiRpc,
                     ExecutionSpec::CodexGit {
                         repository,
                         base_revision,

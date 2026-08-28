@@ -48,6 +48,7 @@ pub struct DaemonOptions {
     pub leave_effect_started_after_rename: bool,
     pub leave_one_shot_effect_started_before_cleanup: bool,
     pub hold_effect_before_commit_milliseconds: u64,
+    pub hold_incremental_replay_milliseconds: u64,
     pub watchdog_stall_milliseconds: u64,
     pub memory_now_epoch_seconds: Option<i64>,
 }
@@ -71,6 +72,7 @@ impl Default for DaemonOptions {
             leave_effect_started_after_rename: false,
             leave_one_shot_effect_started_before_cleanup: false,
             hold_effect_before_commit_milliseconds: 0,
+            hold_incremental_replay_milliseconds: 0,
             watchdog_stall_milliseconds: 30_000,
             memory_now_epoch_seconds: None,
         }
@@ -658,17 +660,27 @@ fn dispatch(
         Command::ResumeAttachment { handshake, replay } => Ok(DispatchOutcome::without_follow_up(
             store.resume_attachment(request, handshake, replay)?,
         )),
+        Command::UpdateAttachmentCapabilities {
+            commission_id,
+            capabilities,
+        } => Ok(DispatchOutcome::without_follow_up(
+            store.update_attachment_capabilities(request, commission_id, capabilities)?,
+        )),
         Command::TakeControl { commission_id } => Ok(DispatchOutcome::without_follow_up(
             store.take_control(request, commission_id)?,
         )),
         Command::ReplayEvents {
             commission_id,
             after_sequence,
-        } => Ok(DispatchOutcome::without_follow_up(store.replay_events(
-            request,
-            commission_id,
-            *after_sequence,
-        )?)),
+        } => {
+            let replay = store.replay_events(request, commission_id, *after_sequence)?;
+            if *after_sequence > 0 && options.hold_incremental_replay_milliseconds > 0 {
+                thread::sleep(std::time::Duration::from_millis(
+                    options.hold_incremental_replay_milliseconds,
+                ));
+            }
+            Ok(DispatchOutcome::without_follow_up(replay))
+        }
         Command::InspectApprovalGate { approval_gate_id } => {
             Ok(DispatchOutcome::without_follow_up(
                 store.inspect_approval_gate(request, approval_gate_id, principal_token_hash)?,

@@ -5007,7 +5007,9 @@ impl Store {
         }
         let idempotency_key = mutation_key(request)?;
         let request_hash = request_hash(request)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
             return Ok(prior);
         }
@@ -5070,7 +5072,9 @@ impl Store {
         let negotiated = attachment::negotiate(&handshake.capabilities)?;
         let idempotency_key = mutation_key(request)?;
         let request_hash = request_hash(request)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(cursor) = replay_cursor {
             ensure_commission_exists(&transaction, &cursor.commission_id)?;
         }
@@ -5302,6 +5306,128 @@ impl Store {
             "resumed": true,
             "replay": replay,
         }))
+    }
+
+    pub fn update_attachment_capabilities(
+        &mut self,
+        request: &Request,
+        commission_id: &str,
+        capabilities: &[String],
+    ) -> Result<Value, TyrionError> {
+        let idempotency_key = mutation_key(request)?;
+        let request_hash = request_hash(request)?;
+        let expected_revision = request.expected_revision.ok_or_else(|| {
+            TyrionError::InvalidRequest(
+                "Attachment capability changes require an expected Commission revision".into(),
+            )
+        })?;
+        let negotiated = attachment::negotiate(capabilities)?;
+        if negotiated.effective.len() != capabilities.len() {
+            return Err(TyrionError::AttachmentRejected(
+                "Attachment capability changes must contain only unique supported capabilities"
+                    .into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        if let Some(prior) = prior_result(&transaction, idempotency_key, &request_hash)? {
+            return Ok(prior);
+        }
+        let attachment_id = authenticated_attachment_id(&transaction, request)?;
+        ensure_commission_attachment(
+            &transaction,
+            &attachment_id,
+            commission_id,
+            attachment::COMMISSION_INSPECTION,
+        )?;
+        let (current_revision, current_mode, current_capabilities_json, role) = transaction
+            .query_row(
+                "SELECT commissions.revision, attachments.mode,
+                        attachments.capabilities_json, commission_attachments.role
+                 FROM commission_attachments
+                 JOIN commissions ON commissions.id = commission_attachments.commission_id
+                 JOIN attachments ON attachments.id = commission_attachments.attachment_id
+                 WHERE commission_attachments.commission_id = ?1
+                   AND commission_attachments.attachment_id = ?2",
+                params![commission_id, attachment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+        if current_revision != expected_revision {
+            return Err(TyrionError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        let current_capabilities = serde_json::from_str::<Vec<String>>(&current_capabilities_json)?;
+        if negotiated.effective.iter().any(|capability| {
+            !current_capabilities
+                .iter()
+                .any(|current| current == capability)
+        }) {
+            return Err(TyrionError::AttachmentRejected(
+                "Attachment capabilities may be downgraded but never expanded".into(),
+            ));
+        }
+        let linked_commissions = transaction
+            .prepare(
+                "SELECT commissions.id, commissions.revision
+                 FROM commission_attachments
+                 JOIN commissions ON commissions.id = commission_attachments.commission_id
+                 WHERE commission_attachments.attachment_id = ?1
+                 ORDER BY commissions.id",
+            )?
+            .query_map([&attachment_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.execute(
+            "UPDATE attachments
+             SET mode = ?2, capabilities_json = ?3, missing_capabilities_json = ?4
+             WHERE id = ?1",
+            params![
+                attachment_id,
+                negotiated.mode.as_str(),
+                serde_json::to_string(&negotiated.effective)?,
+                serde_json::to_string(&negotiated.missing)?,
+            ],
+        )?;
+        let event_payload = serde_json::json!({
+            "attachment_id": attachment_id,
+            "previous_mode": current_mode,
+            "mode": negotiated.mode.as_str(),
+            "capabilities": negotiated.effective,
+            "missing_capabilities": negotiated.missing,
+        });
+        for (linked_commission_id, linked_revision) in linked_commissions {
+            record_event_with_payload(
+                &transaction,
+                &linked_commission_id,
+                EventKind::AttachmentCapabilitiesChanged,
+                linked_revision,
+                &event_payload,
+            )?;
+        }
+        let commission = project_commission(&transaction, commission_id)?;
+        let result = serde_json::json!({
+            "attachment": {
+                "id": attachment_id,
+                "mode": negotiated.mode.as_str(),
+                "mode_tag": negotiated.mode.tag(),
+                "role": role,
+                "capabilities": negotiated.effective,
+                "missing_capabilities": negotiated.missing,
+            },
+            "commission": commission,
+        });
+        save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn inspect_commission(
@@ -14214,7 +14340,7 @@ fn worker_configuration_supports_control(
 ) -> bool {
     let structured_adapter = matches!(
         configuration["adapter"]["kind"].as_str(),
-        Some("codex_app_server" | "claude_agent_sdk")
+        Some("codex_app_server" | "claude_agent_sdk" | "pi_rpc")
     );
     if !structured_adapter {
         return false;

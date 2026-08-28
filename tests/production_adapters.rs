@@ -294,7 +294,7 @@ class ClaudeSDKClient:
     );
     let required_skills = vec![SkillVersion {
         name: "code-review".to_owned(),
-        content_digest: skill_digest,
+        content_digest: skill_digest.clone(),
     }];
     let report = validate_production_trace(
         StructuredAdapterKind::ClaudeAgentSdk,
@@ -490,6 +490,266 @@ class ClaudeSDKClient:
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported context strategy"));
 }
 
+#[test]
+fn production_pi_adapter_uses_rpc_lifecycle_and_native_skills() {
+    let temp = TempDir::new().unwrap();
+    let skill_root = temp.path().join("pi-native-skill");
+    fs::create_dir(&skill_root).unwrap();
+    let skill_path = skill_root.join("SKILL.md");
+    fs::write(&skill_path, "# Code review\n").unwrap();
+    let skill_digest = skill_content_digest(&skill_root);
+    let wrong_skill_root = temp.path().join("pi-wrong-native-skill");
+    fs::create_dir(&wrong_skill_root).unwrap();
+    let wrong_skill_path = wrong_skill_root.join("SKILL.md");
+    fs::write(&wrong_skill_path, "# Code review\n").unwrap();
+    let fake_pi = write_executable(
+        &temp.path().join("pi"),
+        r#"#!/usr/bin/env python3
+import json, os, sys
+model = sys.argv[sys.argv.index("--model") + 1]
+configured_skill = os.path.realpath(os.environ["TYRION_SKILL_PATH"])
+git_skill = os.path.realpath(os.getcwd() + "/.pi/skills/code-review/SKILL.md")
+if model in {"pi-fixture", "pi-wrong-skill-path"}:
+    tail = ["--tools", "read,bash", "--skill", configured_skill]
+elif model == "pi-git":
+    tail = ["--no-tools", "--skill", git_skill]
+else:
+    tail = ["--no-tools"]
+expected = ["--mode", "rpc", "--no-session", "--no-extensions", "--no-prompt-templates", "--no-context-files", "--no-skills", "--model", model, *tail]
+if sys.argv[1:] != expected:
+    raise RuntimeError(f"unexpected Pi arguments: {sys.argv[1:]}")
+queued_steer = False
+for line in sys.stdin:
+    request = json.loads(line)
+    kind = request["type"]
+    if kind == "get_state":
+        data = {"model": {"id": model, "provider": "fixture"}, "sessionId": "pi-production-session"}
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True, "data": data}), flush=True)
+    elif kind == "get_commands":
+        if model == "pi-wrong-skill-path":
+            path = os.environ["TYRION_WRONG_SKILL_PATH"]
+        elif model == "pi-git":
+            path = git_skill
+        else:
+            path = configured_skill
+        commands = [{"name": "skill:code-review", "source": "skill", "path": path}] if model in {"pi-fixture", "pi-wrong-skill-path", "pi-git"} else []
+        data = {"commands": commands}
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True, "data": data}), flush=True)
+    elif kind == "prompt":
+        if model in {"pi-fixture", "pi-git"}:
+            assert request["message"].startswith("/skill:code-review ")
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True}), flush=True)
+        print(json.dumps({"type": "agent_start"}), flush=True)
+        if model == "pi-git":
+            with open(os.getcwd() + "/pi-uncommitted.txt", "w") as output:
+                output.write("saved by Pi\n")
+            result = json.dumps({"summary": "implemented Pi Git change", "known_effects": []}, separators=(",", ":"))
+            print(json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": result}], "usage": {"input": 17, "output": 7, "cost": {"total": 0}}}}), flush=True)
+            print(json.dumps({"type": "agent_settled"}), flush=True)
+    elif kind == "steer":
+        assert "Finish the accepted assignment" in request["message"]
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True}), flush=True)
+        if model == "pi-fixture":
+            result = json.dumps({"summary": "implemented by Pi", "known_effects": []}, separators=(",", ":"))
+            print(json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": result}], "usage": {"input": 13, "output": 5, "cost": {"total": 0}}}}), flush=True)
+            print(json.dumps({"type": "agent_settled"}), flush=True)
+        else:
+            queued_steer = True
+    elif kind == "clear_queue":
+        cleared = ["queued steer"] if queued_steer else []
+        queued_steer = False
+        data = {"steering": cleared, "followUp": []}
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True, "data": data}), flush=True)
+    elif kind == "abort":
+        assert not queued_steer, "abort would continue queued steering"
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True}), flush=True)
+        print(json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [], "usage": {"input": 2, "output": 0, "cost": {"total": 0}}}}), flush=True)
+        print(json.dumps({"type": "agent_settled"}), flush=True)
+    elif kind == "get_session_stats":
+        usage = {
+            "pi-fixture": (31, 11),
+            "pi-git": (17, 7),
+            "pi-interrupt": (2, 0),
+        }.get(model, (0, 0))
+        data = {"sessionId": "pi-production-session", "tokens": {"input": usage[0], "output": usage[1], "cacheRead": 0, "cacheWrite": 0, "total": sum(usage)}, "cost": 0}
+        print(json.dumps({"id": request["id"], "type": "response", "command": kind, "success": True, "data": data}), flush=True)
+"#,
+    );
+    let mut pi_launch = launch("pi_rpc", "pi-fixture");
+    pi_launch["worker_configuration"]["settings"] = json!({
+        "production_qualified": true,
+        "native_skill_paths": {"code-review": skill_path}
+    });
+    pi_launch["worker_configuration"]["tools"] = json!(["read", "bash"]);
+    pi_launch["worker_configuration"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest
+    }]);
+    pi_launch["skill_defaults"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest,
+        "requirement": "required",
+        "provenance": "principal",
+        "delegation": "native_unchanged"
+    }]);
+    let trace = run_adapter(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/pi_rpc_adapter.py"),
+        pi_launch,
+        &[
+            ("TYRION_PI_BINARY", fake_pi.as_os_str()),
+            ("TYRION_SKILL_PATH", skill_path.as_os_str()),
+            ("TYRION_WORKSPACE_ROOT", temp.path().as_os_str()),
+        ],
+        &[json!({
+            "type": "tyrion.worker.steer",
+            "command_id": "pi-steer",
+            "mandate_revision": 1,
+            "clarification": "Finish the accepted assignment."
+        })],
+        false,
+    );
+    let required_skills = vec![SkillVersion {
+        name: "code-review".to_owned(),
+        content_digest: skill_digest.clone(),
+    }];
+    let report = validate_production_trace(StructuredAdapterKind::PiRpc, trace, &required_skills);
+    assert_eq!(report.native_session_id, "pi-production-session");
+    assert_eq!(report.result_summary, "implemented by Pi");
+    assert_eq!(report.input_tokens, 31);
+    assert_eq!(report.output_tokens, 11);
+
+    let mut wrong_path_launch = launch("pi_rpc", "pi-wrong-skill-path");
+    wrong_path_launch["worker_configuration"]["settings"] = json!({
+        "production_qualified": true,
+        "native_skill_paths": {"code-review": skill_path}
+    });
+    wrong_path_launch["worker_configuration"]["tools"] = json!(["read", "bash"]);
+    wrong_path_launch["worker_configuration"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest
+    }]);
+    wrong_path_launch["skill_defaults"] = json!([{
+        "name": "code-review",
+        "content_digest": skill_digest,
+        "requirement": "required",
+        "provenance": "principal",
+        "delegation": "native_unchanged"
+    }]);
+    let output = run_adapter_output(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/pi_rpc_adapter.py"),
+        wrong_path_launch,
+        &[
+            ("TYRION_PI_BINARY", fake_pi.as_os_str()),
+            ("TYRION_SKILL_PATH", skill_path.as_os_str()),
+            ("TYRION_WRONG_SKILL_PATH", wrong_skill_path.as_os_str()),
+            ("TYRION_WORKSPACE_ROOT", temp.path().as_os_str()),
+        ],
+        &[],
+        false,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("required_skill_failure"));
+
+    let mut interrupt_launch = launch("pi_rpc", "pi-interrupt");
+    interrupt_launch["worker_configuration"]["settings"] = json!({"production_qualified": true});
+    let trace = run_adapter(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/pi_rpc_adapter.py"),
+        interrupt_launch,
+        &[
+            ("TYRION_PI_BINARY", fake_pi.as_os_str()),
+            ("TYRION_SKILL_PATH", skill_path.as_os_str()),
+            ("TYRION_WORKSPACE_ROOT", temp.path().as_os_str()),
+        ],
+        &[
+            json!({
+                "type": "tyrion.worker.steer",
+                "command_id": "pi-steer-before-interrupt",
+                "mandate_revision": 1,
+                "clarification": "Finish the accepted assignment."
+            }),
+            json!({
+                "type": "tyrion.worker.interrupt",
+                "command_id": "pi-interrupt",
+                "mandate_revision": 1,
+                "reason": "Stop the accepted Assignment."
+            }),
+        ],
+        false,
+    );
+    let report = validate_production_trace(StructuredAdapterKind::PiRpc, trace, &[]);
+    assert_eq!(report.terminal_state, "interrupted");
+
+    let git_fixture = git_bundle_fixture(temp.path(), "pi");
+    let git_repository = temp.path().join("pi-base-repository");
+    let git_skill_root = git_repository.join(".pi/skills/code-review");
+    fs::create_dir_all(&git_skill_root).unwrap();
+    fs::write(git_skill_root.join("SKILL.md"), "# Contained code review\n").unwrap();
+    let git_skill_digest = skill_content_digest(&git_skill_root);
+    git(&git_repository, &["add", ".pi/skills/code-review/SKILL.md"]);
+    git(
+        &git_repository,
+        &["commit", "--amend", "-qm", "test: add skill"],
+    );
+    git(&git_repository, &["branch", "-f", "tyrion-base", "HEAD"]);
+    fs::remove_file(&git_fixture.base_bundle).unwrap();
+    git(
+        &git_repository,
+        &[
+            "bundle",
+            "create",
+            git_fixture.base_bundle.to_str().unwrap(),
+            "refs/heads/tyrion-base",
+        ],
+    );
+    let mut git_launch = launch("pi_rpc", "pi-git");
+    git_launch["worker_configuration"]["settings"] = json!({
+        "production_qualified": true,
+        "native_skill_paths": {"code-review": ".pi/skills/code-review/SKILL.md"}
+    });
+    git_launch["worker_configuration"]["skills"] = json!([{
+        "name": "code-review",
+        "content_digest": git_skill_digest
+    }]);
+    git_launch["skill_defaults"] = json!([{
+        "name": "code-review",
+        "content_digest": git_skill_digest,
+        "requirement": "required",
+        "provenance": "principal",
+        "delegation": "native_unchanged"
+    }]);
+    let trace = run_adapter(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/pi_rpc_adapter.py"),
+        git_launch,
+        &[
+            ("TYRION_PI_BINARY", fake_pi.as_os_str()),
+            ("TYRION_SKILL_PATH", skill_path.as_os_str()),
+            ("TYRION_BASE_BUNDLE", git_fixture.base_bundle.as_os_str()),
+            (
+                "TYRION_CANDIDATE_BUNDLE",
+                git_fixture.candidate_bundle.as_os_str(),
+            ),
+            (
+                "TYRION_WORKSPACE_ROOT",
+                git_fixture.workspace_root.as_os_str(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    let required_git_skills = [SkillVersion {
+        name: "code-review".to_owned(),
+        content_digest: git_skill_digest,
+    }];
+    let report =
+        validate_production_trace(StructuredAdapterKind::PiRpc, trace, &required_git_skills);
+    assert_eq!(report.result_summary, "implemented Pi Git change");
+    assert_candidate_contains(
+        &git_fixture.candidate_bundle,
+        "pi-uncommitted.txt",
+        "saved by Pi\n",
+    );
+}
+
 fn launch(kind: &str, model: &str) -> Value {
     json!({
         "type": "tyrion.assignment.launch",
@@ -520,7 +780,7 @@ fn launch(kind: &str, model: &str) -> Value {
         },
         "resource_limits": {
             "max_storage_bytes": 1048576,
-            "max_model_spend_cents": if kind == "codex_app_server" { 0 } else { 100 },
+            "max_model_spend_cents": if matches!(kind, "codex_app_server" | "pi_rpc") { 0 } else { 100 },
             "max_paid_service_spend_cents": 0
         }
     })
@@ -576,9 +836,12 @@ fn run_adapter_output(
     input.write_all(b"\n").unwrap();
     for control in controls {
         thread::sleep(Duration::from_millis(100));
-        serde_json::to_writer(&mut input, control).unwrap();
-        input.write_all(b"\n").unwrap();
-        input.flush().unwrap();
+        if serde_json::to_writer(&mut input, control).is_err()
+            || input.write_all(b"\n").is_err()
+            || input.flush().is_err()
+        {
+            break;
+        }
     }
     if keep_input_open {
         thread::spawn(move || {

@@ -44,6 +44,16 @@
     "version": "replace-with-the-pinned-claude-version",
     "sha256": "replace-with-the-pinned-claude-sha256"
   },
+  "pi": {
+    "policy_path": "/absolute/path/to/tyrion/runtime/openshell/hard-landlock-pi-policy.yaml",
+    "policy_sha256": "c7bbd0d358df5d7943e38d32ea2442b2f4cba8e34cdd39db98982e5502f62982",
+    "openshell_provider": "tyrion-pi",
+    "model_provider": "openai",
+    "model": "openai/replace-with-the-pinned-model-id",
+    "binary": "/absolute/path/to/linux-aarch64/pi",
+    "version": "replace-with-the-pinned-pi-version",
+    "sha256": "replace-with-the-pinned-pi-sha256"
+  },
   "lease_ttl_seconds": 900,
   "vcpus": 2,
   "memory_mib": 2048,

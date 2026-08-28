@@ -735,7 +735,7 @@ CREATE TABLE IF NOT EXISTS events (
         'useful_concurrency_observed',
         'evidence_recorded',
         'commission_verified_complete', 'assignment_blocked',
-        'attachment_joined', 'active_attachment_changed',
+        'attachment_joined', 'active_attachment_changed', 'attachment_capabilities_changed',
         'worker_steered', 'worker_interrupted', 'worker_activity',
         'commission_paused', 'commission_resumed', 'commission_cancelled',
         'recovery_decided', 'attempt_contained', 'restart_reconciled',
@@ -920,6 +920,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             || !schema.contains("credential_grant_issued")
             || !schema.contains("credential_grant_consumed")
             || !schema.contains("credential_exposure_authorized")
+            || !schema.contains("attachment_capabilities_changed")
     });
     if needs_event_upgrade {
         let payload_projection = if events_schema
@@ -944,7 +945,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
                     'useful_concurrency_observed',
                     'evidence_recorded',
                     'commission_verified_complete', 'assignment_blocked',
-                    'attachment_joined', 'active_attachment_changed',
+                    'attachment_joined', 'active_attachment_changed', 'attachment_capabilities_changed',
                     'worker_steered', 'worker_interrupted', 'worker_activity',
                     'commission_paused', 'commission_resumed', 'commission_cancelled',
                     'recovery_decided', 'attempt_contained', 'restart_reconciled',
@@ -1153,7 +1154,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
         SELECT id, '{}', updated_at FROM profile_claims;
         "#,
     )?;
-    connection.pragma_update(None, "user_version", 16)?;
+    connection.pragma_update(None, "user_version", 17)?;
     Ok(())
 }
 
@@ -1266,7 +1267,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 16
+    Ok(user_version < 17
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1393,6 +1394,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
                 || !schema.contains("credential_grant_issued")
                 || !schema.contains("credential_grant_consumed")
                 || !schema.contains("credential_exposure_authorized")
+                || !schema.contains("attachment_capabilities_changed")
         }))
 }
 
@@ -1400,7 +1402,7 @@ pub(super) fn migration_backup_path(database_path: &Path) -> Result<PathBuf, Tyr
     let file_name = database_path
         .file_name()
         .ok_or_else(|| TyrionError::InvalidRequest("database path must have a file name".into()))?;
-    let backup_name = format!("{}.pre-migration-v16", file_name.to_string_lossy());
+    let backup_name = format!("{}.pre-migration-v17", file_name.to_string_lossy());
     Ok(database_path.with_file_name(backup_name))
 }
 
@@ -1427,7 +1429,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 16
+    if user_version != 17
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1546,6 +1548,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         || !events_schema.contains("credential_grant_issued")
         || !events_schema.contains("credential_grant_consumed")
         || !events_schema.contains("credential_exposure_authorized")
+        || !events_schema.contains("attachment_capabilities_changed")
     {
         return Err(TyrionError::InvalidRequest(
             "events schema migration verification failed".into(),

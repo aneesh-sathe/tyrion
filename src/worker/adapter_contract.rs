@@ -7,6 +7,7 @@ use crate::TyrionError;
 pub enum StructuredAdapterKind {
     CodexAppServer,
     ClaudeAgentSdk,
+    PiRpc,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -204,6 +205,7 @@ pub fn validate_trace(
     let mut lifecycle = match kind {
         StructuredAdapterKind::CodexAppServer => codex_lifecycle(&vendor_events)?,
         StructuredAdapterKind::ClaudeAgentSdk => claude_lifecycle(&vendor_events)?,
+        StructuredAdapterKind::PiRpc => pi_lifecycle(&vendor_events)?,
     };
     validate_lifecycle_order(kind, &vendor_events)?;
     if let Some(summary) = result_summary {
@@ -353,10 +355,12 @@ fn validate_lifecycle_order(
     let is_start = |event: &&Value| match kind {
         StructuredAdapterKind::CodexAppServer => event["method"] == "turn/started",
         StructuredAdapterKind::ClaudeAgentSdk => event["type"] == "session.status_running",
+        StructuredAdapterKind::PiRpc => event["type"] == "agent_start",
     };
     let is_usage = |event: &&Value| match kind {
         StructuredAdapterKind::CodexAppServer => event["method"] == "thread/tokenUsage/updated",
         StructuredAdapterKind::ClaudeAgentSdk => event["type"] == "span.model_request_end",
+        StructuredAdapterKind::PiRpc => event["type"] == "tyrion.pi.usage",
     };
     let is_terminal = |event: &&Value| match kind {
         StructuredAdapterKind::CodexAppServer => {
@@ -365,6 +369,7 @@ fn validate_lifecycle_order(
         StructuredAdapterKind::ClaudeAgentSdk => {
             event["type"] == "session.status_idle" || event["type"] == "session.error"
         }
+        StructuredAdapterKind::PiRpc => event["type"] == "agent_settled",
     };
     let starts = events
         .iter()
@@ -544,6 +549,58 @@ fn claude_lifecycle(events: &[&Value]) -> Result<Lifecycle, TyrionError> {
     Ok(lifecycle)
 }
 
+fn pi_lifecycle(events: &[&Value]) -> Result<Lifecycle, TyrionError> {
+    let mut lifecycle = Lifecycle::default();
+    for event in events {
+        match event["type"].as_str() {
+            Some("agent_start") => {
+                lifecycle.started = true;
+                lifecycle.latest_activity = "Pi agent started".into();
+            }
+            Some("message_end") if event["message"]["role"] == "assistant" => {
+                if event["message"]["content"]
+                    .as_array()
+                    .and_then(|content| content.iter().find_map(|item| item["text"].as_str()))
+                    .is_some()
+                {
+                    lifecycle.latest_activity = "Pi produced a structured Result".into();
+                }
+            }
+            Some("tyrion.pi.usage") => {
+                if lifecycle.usage_reported {
+                    return Err(TyrionError::InvalidRequest(
+                        "Pi adapter emitted more than one authoritative usage report".into(),
+                    ));
+                }
+                lifecycle.input_tokens = unsigned(event, "input_tokens")?;
+                lifecycle.output_tokens = unsigned(event, "output_tokens")?;
+                if unsigned(event, "cost")? != 0 {
+                    return Err(TyrionError::InvalidRequest(
+                        "Pi adapter reported model spend under a zero-spend configuration".into(),
+                    ));
+                }
+                lifecycle.usage_reported = true;
+            }
+            Some("tyrion.pi.interrupt") => lifecycle.interrupted = true,
+            Some("extension_error") => {
+                lifecycle.terminal_state = "failed".into();
+                lifecycle.latest_activity = "Pi adapter reported an error".into();
+            }
+            Some("agent_settled") => {
+                if lifecycle.terminal_state != "failed" {
+                    lifecycle.terminal_state = if lifecycle.interrupted {
+                        "interrupted".into()
+                    } else {
+                        "completed".into()
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(lifecycle)
+}
+
 fn required_string(value: &Value, field: &str) -> Result<String, TyrionError> {
     value[field]
         .as_str()
@@ -699,6 +756,46 @@ mod tests {
         assert_eq!(
             report.latest_meaningful_activity,
             "Claude produced a structured Result"
+        );
+    }
+
+    #[test]
+    fn pi_rpc_passes_the_shared_worker_adapter_contract() {
+        let report = validate_trace(
+            StructuredAdapterKind::PiRpc,
+            &[
+                ready("pi-session-1"),
+                invoked(),
+                json!({"type":"agent_start"}),
+                json!({
+                    "type":"message_end",
+                    "message": {
+                        "role":"assistant",
+                        "content":[{"type":"text", "text":"implemented Pi adapter"}],
+                        "usage": {
+                            "input":90,
+                            "output":35,
+                            "cost":{"total":0.0}
+                        }
+                    }
+                }),
+                json!({"type":"tyrion.pi.usage", "input_tokens":120, "output_tokens":44, "cost":0}),
+                json!({"type":"agent_settled"}),
+                result("implemented Pi adapter"),
+            ],
+            expectation(),
+        )
+        .unwrap();
+        assert!(report.lifecycle_started);
+        assert_eq!(report.terminal_state, "completed");
+        assert_eq!(report.native_session_id, "pi-session-1");
+        assert_eq!(report.input_tokens, 120);
+        assert_eq!(report.output_tokens, 44);
+        assert_eq!(report.native_skills, ["code-review"]);
+        assert_eq!(report.result_summary, "implemented Pi adapter");
+        assert_eq!(
+            report.latest_meaningful_activity,
+            "Pi produced a structured Result"
         );
     }
 

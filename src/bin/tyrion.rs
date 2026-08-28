@@ -1,8 +1,13 @@
-use std::fs;
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 use tyrion::protocol::{
     AdapterIdentity, AttachmentHandshake, Command, CommissionAmendment, CommissionProposal,
     CommissionReplayCursor, CredentialGrantRequest, LearningObservationKind,
@@ -25,6 +30,19 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
+    /// Launch an explicitly attached Pi Entry Session.
+    Pi {
+        #[arg(long, default_value = "pi")]
+        pi_command: PathBuf,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        #[arg(long)]
+        commission_id: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        last_event_sequence: i64,
+        #[arg(last = true)]
+        pi_arguments: Vec<String>,
+    },
     Proposal {
         #[command(subcommand)]
         command: ProposalCommand,
@@ -387,6 +405,27 @@ enum PrincipalCommand {
 
 fn main() {
     let arguments = Arguments::parse();
+    if let TopLevelCommand::Pi {
+        pi_command,
+        capabilities,
+        commission_id,
+        last_event_sequence,
+        pi_arguments,
+    } = &arguments.command
+    {
+        if let Err(error) = launch_pi(
+            &arguments.socket,
+            pi_command,
+            capabilities,
+            commission_id.as_deref(),
+            *last_event_sequence,
+            pi_arguments,
+        ) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let request = match build_request(&arguments) {
         Ok(request) => request,
         Err(error) => {
@@ -417,6 +456,249 @@ fn main() {
     }
 }
 
+const PI_ADAPTER_IDENTITY: &str = "tyrion-pi-entry";
+const PI_ADAPTER_VERSION: &str = "1.0.0";
+const PI_EXTENSION: &str = include_str!("../../adapters/pi_entry_extension.mjs");
+const FULL_ENTRY_CAPABILITIES: [&str; 9] = [
+    "proposal_creation",
+    "commission_acceptance",
+    "commission_inspection",
+    "event_replay",
+    "control_takeover",
+    "material_notifications",
+    "persistent_mode_display",
+    "worker_steering",
+    "worker_interruption",
+];
+
+fn launch_pi(
+    socket: &std::path::Path,
+    pi_command: &std::path::Path,
+    capabilities: &[String],
+    commission_id: Option<&str>,
+    last_event_sequence: i64,
+    pi_arguments: &[String],
+) -> Result<(), tyrion::TyrionError> {
+    if last_event_sequence < 0 {
+        return Err(tyrion::TyrionError::InvalidRequest(
+            "last durable event cursor must not be negative".into(),
+        ));
+    }
+    if pi_arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "--extension" | "-e") || argument.starts_with("--extension=")
+    }) {
+        return Err(tyrion::TyrionError::InvalidRequest(
+            "Pi Entry launch forbids additional extension arguments".into(),
+        ));
+    }
+    let capabilities = if capabilities.is_empty() {
+        FULL_ENTRY_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        capabilities.to_vec()
+    };
+    let issue_request = Request {
+        protocol_version: PROTOCOL_VERSION,
+        attachment_token: None,
+        principal_token: None,
+        idempotency_key: Some(format!("pi-launch-{}", uuid::Uuid::new_v4())),
+        expected_revision: None,
+        expected_control_revision: None,
+        command: Command::IssueAttachmentToken {
+            expected_adapter: AdapterIdentity {
+                harness: "pi".into(),
+                adapter_identity: PI_ADAPTER_IDENTITY.into(),
+                adapter_version: PI_ADAPTER_VERSION.into(),
+            },
+            ttl_seconds: 60,
+        },
+    };
+    let response = tyrion::send_request(socket, &issue_request)?;
+    if !response.ok {
+        return Err(tyrion::TyrionError::AttachmentRejected(
+            response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "launch token request failed".into()),
+        ));
+    }
+    let launch_token = response
+        .data
+        .as_ref()
+        .and_then(|data| data["launch_token"].as_str())
+        .ok_or_else(|| {
+            tyrion::TyrionError::AttachmentRejected("launch token response was incomplete".into())
+        })?;
+    let extension_path = materialize_pi_extension(socket)?;
+    let extension_path = extension_path.to_str().ok_or_else(|| {
+        tyrion::TyrionError::InvalidRequest("Pi Entry extension path must be UTF-8".into())
+    })?;
+    let mut command = ProcessCommand::new(pi_command);
+    command
+        .args(["--no-extensions", "--extension", extension_path])
+        .args(pi_arguments)
+        .env("TYRION_PI_SOCKET", socket)
+        .env("TYRION_PI_LAUNCH_TOKEN", launch_token)
+        .env(
+            "TYRION_PI_CAPABILITIES",
+            serde_json::to_string(&capabilities)?,
+        )
+        .env(
+            "TYRION_PI_LAST_EVENT_SEQUENCE",
+            last_event_sequence.to_string(),
+        );
+    if let Some(commission_id) = commission_id {
+        command.env("TYRION_PI_COMMISSION_ID", commission_id);
+    } else {
+        command.env_remove("TYRION_PI_COMMISSION_ID");
+    }
+    let status = command.status()?;
+    if !status.success() {
+        return Err(tyrion::TyrionError::AttachmentRejected(format!(
+            "Pi Entry Session exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn materialize_pi_extension(socket: &std::path::Path) -> Result<PathBuf, tyrion::TyrionError> {
+    let parent = socket.parent().ok_or_else(|| {
+        tyrion::TyrionError::InvalidRequest("Tyrion socket requires a parent directory".into())
+    })?;
+    validate_pi_cache_parent(parent)?;
+    let directory = parent.join("entry-adapters");
+    match fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let directory_metadata = fs::symlink_metadata(&directory)?;
+    let current_user = unsafe { libc::geteuid() };
+    if !directory_metadata.is_dir()
+        || directory_metadata.file_type().is_symlink()
+        || directory_metadata.uid() != current_user
+    {
+        return Err(tyrion::TyrionError::AttachmentRejected(
+            "Pi Entry adapter cache must be a user-owned regular directory".into(),
+        ));
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let directory_handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&directory)?;
+    let secured_metadata = directory_handle.metadata()?;
+    if !secured_metadata.is_dir()
+        || secured_metadata.uid() != current_user
+        || secured_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(tyrion::TyrionError::AttachmentRejected(
+            "Pi Entry adapter cache permissions are not private".into(),
+        ));
+    }
+    let digest = format!("{:x}", Sha256::digest(PI_EXTENSION.as_bytes()));
+    let file_name = format!("pi-entry-{digest}.mjs");
+    let native_name = CString::new(file_name.as_bytes()).map_err(|_| {
+        tyrion::TyrionError::InvalidRequest("Pi Entry extension name is invalid".into())
+    })?;
+    let create_flags =
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let created = unsafe {
+        libc::openat(
+            directory_handle.as_raw_fd(),
+            native_name.as_ptr(),
+            create_flags,
+            0o600,
+        )
+    };
+    let (mut file, created_new) = if created >= 0 {
+        (unsafe { File::from_raw_fd(created) }, true)
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+        let existing = unsafe {
+            libc::openat(
+                directory_handle.as_raw_fd(),
+                native_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if existing < 0 {
+            return Err(tyrion::TyrionError::AttachmentRejected(
+                "cached Pi Entry extension is not a regular file".into(),
+            ));
+        }
+        (unsafe { File::from_raw_fd(existing) }, false)
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != current_user {
+        return Err(tyrion::TyrionError::AttachmentRejected(
+            "cached Pi Entry extension must be a user-owned regular file".into(),
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if created_new {
+        use std::io::Write;
+        file.write_all(PI_EXTENSION.as_bytes())?;
+        file.sync_all()?;
+        directory_handle.sync_all()?;
+    } else {
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        let actual = format!("{:x}", Sha256::digest(contents));
+        if actual != digest {
+            return Err(tyrion::TyrionError::AttachmentRejected(
+                "cached Pi Entry extension failed its pinned digest".into(),
+            ));
+        }
+    }
+    Ok(directory.join(file_name))
+}
+
+fn validate_pi_cache_parent(parent: &std::path::Path) -> Result<(), tyrion::TyrionError> {
+    let current_user = unsafe { libc::geteuid() };
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != current_user
+    {
+        return Err(tyrion::TyrionError::AttachmentRejected(
+            "Tyrion socket parent must be a user-owned regular directory".into(),
+        ));
+    }
+    let absolute_parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(parent)
+    };
+    validate_pi_cache_ancestor_chain(&absolute_parent)?;
+    validate_pi_cache_ancestor_chain(&fs::canonicalize(parent)?)?;
+    Ok(())
+}
+
+fn validate_pi_cache_ancestor_chain(
+    directory: &std::path::Path,
+) -> Result<(), tyrion::TyrionError> {
+    for ancestor in directory.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(tyrion::TyrionError::AttachmentRejected(
+                "Pi Entry adapter cache requires a socket parent chain that other users cannot modify"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn attachment_handshake(
     harness: &str,
     adapter_identity: &str,
@@ -440,6 +722,11 @@ fn attachment_handshake(
 fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> {
     let (command, idempotency_key, expected_revision, expected_control_revision) =
         match &arguments.command {
+            TopLevelCommand::Pi { .. } => {
+                return Err(tyrion::TyrionError::InvalidRequest(
+                    "Pi launch must be handled before protocol request construction".into(),
+                ));
+            }
             TopLevelCommand::Proposal {
                 command:
                     ProposalCommand::Create {

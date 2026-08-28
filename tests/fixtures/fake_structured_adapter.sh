@@ -30,7 +30,11 @@ printf '%s\n' "$launch" | TYRION_FIXTURE_KIND="$kind" python3 -c '
 import json, os, sys
 launch = json.load(sys.stdin)
 kind = os.environ["TYRION_FIXTURE_KIND"]
-session = "codex-thread-fixture" if kind == "codex" else "claude-session-fixture"
+session = {
+    "codex": "codex-thread-fixture",
+    "claude": "claude-session-fixture",
+    "pi": "pi-session-fixture",
+}[kind]
 inventory = launch["worker_configuration"].get("skills", [])
 names = sorted(skill["name"] if isinstance(skill, dict) else skill for skill in inventory)
 preparations = [
@@ -67,6 +71,8 @@ esac
 if [ "$kind" = codex ]; then
   printf '%s\n' \
     '{"method":"turn/started","params":{"turn":{"status":"inProgress"}}}'
+elif [ "$kind" = pi ]; then
+  printf '%s\n' '{"type":"agent_start"}'
 else
   printf '%s\n' \
     '{"type":"session.status_running"}'
@@ -107,10 +113,16 @@ case "$launch" in
       printf '%s\n' \
         '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":6,"outputTokens":1}}}}' \
         '{"method":"error","params":{"message":"fixture failure"}}'
-    else
+    elif [ "$kind" = claude ]; then
       printf '%s\n' \
         '{"type":"span.model_request_end","usage":{"input_tokens":6,"output_tokens":1}}' \
         '{"type":"session.error","message":"fixture failure"}'
+    else
+      printf '%s\n' \
+        '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":6,"output":1,"cost":{"total":0}}}}' \
+        '{"type":"tyrion.pi.usage","input_tokens":23,"output_tokens":7,"cost":0}' \
+        '{"type":"extension_error","error":"fixture failure"}' \
+        '{"type":"agent_settled"}'
     fi
     exit 0
     ;;
@@ -125,11 +137,17 @@ case "$launch" in
       printf '%s\n' \
         '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":2,"outputTokens":0}}}}' \
         '{"method":"turn/completed","params":{"turn":{"status":"interrupted"}}}'
-    else
+    elif [ "$kind" = claude ]; then
       printf '%s\n' \
         '{"type":"span.model_request_end","usage":{"input_tokens":2,"output_tokens":0}}' \
         '{"type":"user.interrupt"}' \
         '{"type":"session.status_idle"}'
+    else
+      printf '%s\n' \
+        '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":2,"output":0,"cost":{"total":0}}}}' \
+        '{"type":"tyrion.pi.interrupt"}' \
+        '{"type":"tyrion.pi.usage","input_tokens":19,"output_tokens":4,"cost":0}' \
+        '{"type":"agent_settled"}'
     fi
     exit 0
     ;;
@@ -139,11 +157,16 @@ if [ "$kind" = codex ]; then
     '{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"fixture completed"}}}' \
     '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":12,"outputTokens":4}}}}' \
     '{"method":"turn/completed","params":{"turn":{"status":"completed"}}}'
-else
+elif [ "$kind" = claude ]; then
   printf '%s\n' \
     '{"type":"agent.message","content":[{"type":"text","text":"fixture completed"}]}' \
     '{"type":"span.model_request_end","usage":{"input_tokens":10,"output_tokens":5}}' \
     '{"type":"session.status_idle"}'
+else
+  printf '%s\n' \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"fixture completed"}],"usage":{"input":11,"output":6,"cost":{"total":0}}}}' \
+    '{"type":"tyrion.pi.usage","input_tokens":11,"output_tokens":6,"cost":0}' \
+    '{"type":"agent_settled"}'
 fi
 printf '{"type":"tyrion.result","commission_id":"%s","assignment_id":"%s","attempt_id":"%s","mandate_revision":%s,"plan_revision":%s,"summary":"return a routed greeting","known_effects":[],"cost_cents":0}\n' \
   "$TYRION_COMMISSION_ID" "$TYRION_ASSIGNMENT_ID" "$TYRION_ATTEMPT_ID" \

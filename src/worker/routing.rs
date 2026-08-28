@@ -35,6 +35,9 @@ pub(super) struct ContainedCodexDescriptor {
     pub max_storage_bytes: u64,
     pub containment_profile: String,
     pub supports_claude: bool,
+    pub supports_pi: bool,
+    pub pi_model_provider: Option<String>,
+    pub pi_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +87,7 @@ pub(super) struct WorkerAdapter {
 pub(super) enum WorkerAdapterKind {
     CodexAppServer,
     ClaudeAgentSdk,
+    PiRpc,
     DeterministicLocal,
     ContainedCodex,
 }
@@ -186,9 +190,16 @@ impl WorkerCatalog {
         descriptor: &ContainedCodexDescriptor,
     ) -> Result<(), TyrionError> {
         for configuration in &mut self.configurations {
+            if configuration.adapter.kind == WorkerAdapterKind::PiRpc
+                && !pi_is_production_qualified(configuration)
+            {
+                continue;
+            }
             if !matches!(
                 configuration.adapter.kind,
-                WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ClaudeAgentSdk
+                WorkerAdapterKind::CodexAppServer
+                    | WorkerAdapterKind::ClaudeAgentSdk
+                    | WorkerAdapterKind::PiRpc
             ) {
                 continue;
             }
@@ -200,6 +211,31 @@ impl WorkerCatalog {
                     "available Worker Configuration {} requires a pinned Claude OpenShell profile",
                     configuration.id
                 )));
+            }
+            if configuration.available
+                && configuration.adapter.kind == WorkerAdapterKind::PiRpc
+                && !descriptor.supports_pi
+            {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "available Worker Configuration {} requires a pinned Pi OpenShell profile",
+                    configuration.id
+                )));
+            }
+            if configuration.available && configuration.adapter.kind == WorkerAdapterKind::PiRpc {
+                let configured_model = pi_base_model(&configuration.model);
+                if descriptor.pi_model.as_deref() != Some(configured_model)
+                    || descriptor
+                        .pi_model_provider
+                        .as_deref()
+                        .is_none_or(|provider| {
+                            !configured_model.starts_with(&format!("{provider}/"))
+                        })
+                {
+                    return Err(TyrionError::InvalidRequest(format!(
+                        "available Worker Configuration {} model {} does not match the pinned Pi provider/model runtime",
+                        configuration.id, configuration.model
+                    )));
+                }
             }
             if configuration.containment_profile != "openshell-repaired-v0.0.104"
                 && configuration.containment_profile != descriptor.containment_profile
@@ -296,10 +332,12 @@ impl WorkerCatalog {
 
     pub(super) fn requires_structured_runtime(&self) -> bool {
         self.configurations.iter().any(|configuration| {
-            configuration.available
+            configuration_is_available(configuration)
                 && matches!(
                     configuration.adapter.kind,
-                    WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ClaudeAgentSdk
+                    WorkerAdapterKind::CodexAppServer
+                        | WorkerAdapterKind::ClaudeAgentSdk
+                        | WorkerAdapterKind::PiRpc
                 )
         })
     }
@@ -312,10 +350,12 @@ impl WorkerCatalog {
         fs::create_dir_all(&adapter_dir)?;
         fs::set_permissions(&adapter_dir, fs::Permissions::from_mode(0o700))?;
         for configuration in &mut self.configurations {
-            if !configuration.available
+            if !configuration_is_available(configuration)
                 || !matches!(
                     configuration.adapter.kind,
-                    WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ClaudeAgentSdk
+                    WorkerAdapterKind::CodexAppServer
+                        | WorkerAdapterKind::ClaudeAgentSdk
+                        | WorkerAdapterKind::PiRpc
                 )
             {
                 continue;
@@ -367,6 +407,7 @@ impl WorkerCatalog {
             let expected_harness = match configuration.adapter.kind {
                 WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ContainedCodex => "codex",
                 WorkerAdapterKind::ClaudeAgentSdk => "claude",
+                WorkerAdapterKind::PiRpc => "pi",
                 WorkerAdapterKind::DeterministicLocal => "tyrion",
             };
             if configuration.harness != expected_harness {
@@ -464,6 +505,7 @@ impl WorkerCatalog {
                 }
                 WorkerAdapterKind::CodexAppServer
                 | WorkerAdapterKind::ClaudeAgentSdk
+                | WorkerAdapterKind::PiRpc
                 | WorkerAdapterKind::ContainedCodex => matches!(
                     configuration.context.strategy.as_str(),
                     "fresh" | "fresh_with_retrieval"
@@ -489,8 +531,12 @@ impl WorkerCatalog {
             }
             if matches!(
                 configuration.adapter.kind,
-                WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ClaudeAgentSdk
-            ) {
+                WorkerAdapterKind::CodexAppServer
+                    | WorkerAdapterKind::ClaudeAgentSdk
+                    | WorkerAdapterKind::PiRpc
+            ) && (configuration.adapter.kind != WorkerAdapterKind::PiRpc
+                || pi_is_production_qualified(configuration))
+            {
                 if !configuration
                     .authority_scope_types
                     .iter()
@@ -584,9 +630,16 @@ fn configuration_is_available(configuration: &WorkerConfiguration) -> bool {
     if !configuration.available {
         return false;
     }
+    if configuration.adapter.kind == WorkerAdapterKind::PiRpc
+        && !pi_is_production_qualified(configuration)
+    {
+        return false;
+    }
     if !matches!(
         configuration.adapter.kind,
-        WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ClaudeAgentSdk
+        WorkerAdapterKind::CodexAppServer
+            | WorkerAdapterKind::ClaudeAgentSdk
+            | WorkerAdapterKind::PiRpc
     ) {
         return true;
     }
@@ -599,12 +652,35 @@ fn configuration_is_available(configuration: &WorkerConfiguration) -> bool {
     })
 }
 
+fn pi_is_production_qualified(configuration: &WorkerConfiguration) -> bool {
+    configuration.settings.get("production_qualified") == Some(&serde_json::Value::Bool(true))
+}
+
+fn pi_base_model(model: &str) -> &str {
+    let Some((base, thinking)) = model.rsplit_once(':') else {
+        return model;
+    };
+    if matches!(
+        thinking,
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    ) {
+        base
+    } else {
+        model
+    }
+}
+
 fn failed_gates(
     configuration: &WorkerConfiguration,
     request: &RouteRequest<'_>,
 ) -> Vec<&'static str> {
     let requirements = request.requirements;
     let mut failures = Vec::new();
+    if configuration.adapter.kind == WorkerAdapterKind::PiRpc
+        && !pi_is_production_qualified(configuration)
+    {
+        failures.push("production_qualification");
+    }
     if !requirements.require_configurations.is_empty()
         && !requirements
             .require_configurations
@@ -642,6 +718,27 @@ fn failed_gates(
         })
     {
         failures.push("required_skills");
+    }
+    if configuration.adapter.kind == WorkerAdapterKind::PiRpc
+        && pi_is_production_qualified(configuration)
+    {
+        let mut selected_names = HashSet::new();
+        selected_names.extend(requirements.skills.iter().map(|skill| skill.name.as_str()));
+        selected_names.extend(
+            requirements
+                .selected_skills
+                .iter()
+                .map(|skill| skill.name.as_str()),
+        );
+        selected_names.extend(
+            configuration
+                .selected_skills
+                .iter()
+                .map(|skill| skill.name.as_str()),
+        );
+        if selected_names.len() > 1 {
+            failures.push("pi_single_native_skill");
+        }
     }
     if configuration.context.capacity_tokens < requirements.min_context_tokens {
         failures.push("context_capacity");
@@ -859,5 +956,88 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported context strategy"));
+    }
+
+    #[test]
+    fn incomplete_pi_catalog_entry_needs_no_structured_runtime() {
+        let mut configuration = deterministic_configuration();
+        configuration.id = "pi-incomplete".into();
+        configuration.harness = "pi".into();
+        configuration.adapter.kind = WorkerAdapterKind::PiRpc;
+        configuration.context.strategy = "fresh".into();
+        configuration.capabilities.clear();
+        let catalog = WorkerCatalog {
+            configurations: vec![configuration],
+        };
+
+        catalog.validate().unwrap();
+        assert!(!catalog.requires_structured_runtime());
+    }
+
+    #[test]
+    fn qualified_pi_requires_the_pinned_runtime_provider_and_model() {
+        let mut configuration = deterministic_configuration();
+        configuration.id = "pi-model-mismatch".into();
+        configuration.harness = "pi".into();
+        configuration.adapter.kind = WorkerAdapterKind::PiRpc;
+        configuration.model = "openai/unpinned-model".into();
+        configuration
+            .settings
+            .insert("production_qualified".into(), serde_json::Value::Bool(true));
+        let mut catalog = WorkerCatalog {
+            configurations: vec![configuration],
+        };
+        let descriptor = ContainedCodexDescriptor {
+            id: "contained".into(),
+            version: "1".into(),
+            model: "codex".into(),
+            settings: BTreeMap::new(),
+            max_storage_bytes: u64::MAX,
+            containment_profile: "openshell-repaired-v0.0.104".into(),
+            supports_claude: false,
+            supports_pi: true,
+            pi_model_provider: Some("openai".into()),
+            pi_model: Some("openai/pinned-model".into()),
+        };
+
+        assert!(catalog
+            .bind_structured_containment(&descriptor)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned Pi provider/model runtime"));
+    }
+
+    #[test]
+    fn qualified_pi_rejects_multi_skill_assignments_before_dispatch() {
+        let digest = |digit: char| SkillVersion {
+            name: format!("skill-{digit}"),
+            content_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+        };
+        let mut configuration = deterministic_configuration();
+        configuration.harness = "pi".into();
+        configuration.adapter.kind = WorkerAdapterKind::PiRpc;
+        configuration
+            .settings
+            .insert("production_qualified".into(), serde_json::Value::Bool(true));
+        configuration.skills = vec![digest('1'), digest('2')];
+        let requirements = WorkerRequirements {
+            skills: configuration.skills.clone(),
+            ..WorkerRequirements::default()
+        };
+        let resources = AssignmentResources {
+            concurrency_slots: 1,
+            max_storage_bytes: 1,
+            max_model_spend_cents: 0,
+            max_paid_service_spend_cents: 0,
+        };
+        let request = RouteRequest {
+            requirements: &requirements,
+            resources: &resources,
+            required_authority_action: super::super::DETERMINISTIC_ACTION,
+            required_authority_scope_types: &["action"],
+            entry_harness: "pi",
+        };
+
+        assert!(failed_gates(&configuration, &request).contains(&"pi_single_native_skill"));
     }
 }

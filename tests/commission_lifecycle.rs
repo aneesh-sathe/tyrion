@@ -963,6 +963,12 @@ fn restart_resumes_a_durably_ready_assignment() {
 
     daemon.stop();
     let restarted = RunningDaemon::start(temp.path());
+    wait_for_event(
+        &restarted,
+        &attachment_id,
+        &commission_id,
+        "commission_verified_complete",
+    );
     let recovered = run_cli(
         &restarted.socket_path,
         &[

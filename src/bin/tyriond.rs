@@ -41,6 +41,8 @@ struct Arguments {
     fault_leave_one_shot_effect_started_before_cleanup: bool,
     #[arg(long, default_value_t = 0, hide = true)]
     fault_hold_effect_before_commit_milliseconds: u64,
+    #[arg(long, default_value_t = 0, hide = true)]
+    fault_hold_incremental_replay_milliseconds: u64,
     #[arg(long, default_value_t = 30_000, hide = true)]
     watchdog_stall_milliseconds: u64,
     #[arg(long, hide = true)]
@@ -69,6 +71,7 @@ fn main() {
             .fault_leave_one_shot_effect_started_before_cleanup,
         hold_effect_before_commit_milliseconds: arguments
             .fault_hold_effect_before_commit_milliseconds,
+        hold_incremental_replay_milliseconds: arguments.fault_hold_incremental_replay_milliseconds,
         watchdog_stall_milliseconds: arguments.watchdog_stall_milliseconds,
         memory_now_epoch_seconds: arguments.fault_memory_now_epoch,
     };

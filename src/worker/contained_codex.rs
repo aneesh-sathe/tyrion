@@ -28,6 +28,7 @@ const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha2
 const POLICY_SHA256: &str = "76715da36c5e5f8603cd4732690707bca8b7f11ee153ae36521028db75bc4453";
 const CLAUDE_POLICY_SHA256: &str =
     "89ec4d87f6a6b4bd8c581ec878ff82cb2e2acf96a5a581e94e3f0b10d84feccf";
+const PI_POLICY_SHA256: &str = "c7bbd0d358df5d7943e38d32ea2442b2f4cba8e34cdd39db98982e5502f62982";
 const CODEX_VERSION: &str = "codex-cli 0.147.0";
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +55,8 @@ struct RuntimeConfig {
     openshell_provider: String,
     #[serde(default)]
     claude: Option<ClaudeRuntimeConfig>,
+    #[serde(default)]
+    pi: Option<PiRuntimeConfig>,
     lease_ttl_seconds: u64,
     vcpus: u32,
     memory_mib: u64,
@@ -67,6 +70,19 @@ struct ClaudeRuntimeConfig {
     policy_path: PathBuf,
     policy_sha256: String,
     openshell_provider: String,
+    binary: PathBuf,
+    version: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PiRuntimeConfig {
+    policy_path: PathBuf,
+    policy_sha256: String,
+    openshell_provider: String,
+    model_provider: String,
+    model: String,
     binary: PathBuf,
     version: String,
     sha256: String,
@@ -178,6 +194,7 @@ impl StructuredAdapterSandbox<'_> {
                 super::routing::WorkerAdapterKind::ClaudeAgentSdk => {
                     "TYRION_CLAUDE_BINARY=/sandbox/claude"
                 }
+                super::routing::WorkerAdapterKind::PiRpc => "TYRION_PI_BINARY=/sandbox/pi",
                 _ => unreachable!("structured sandbox command uses a structured adapter"),
             })
             .args(git_attempt.into_iter().flat_map(|attempt| {
@@ -300,6 +317,9 @@ impl ContainedCodexRuntime {
                 .saturating_mul(1024),
             containment_profile: format!("openshell-repaired-v0.0.104-{}", &self.fingerprint[..16]),
             supports_claude: self.config.claude.is_some(),
+            supports_pi: self.config.pi.is_some(),
+            pi_model_provider: self.config.pi.as_ref().map(|pi| pi.model_provider.clone()),
+            pi_model: self.config.pi.as_ref().map(|pi| pi.model.clone()),
         }
     }
 
@@ -403,6 +423,21 @@ impl ContainedCodexRuntime {
                     remote_binary: "/sandbox/claude",
                     binary_environment: "Claude",
                     version: &claude.version,
+                })
+            }
+            super::routing::WorkerAdapterKind::PiRpc => {
+                let pi = self.config.pi.as_ref().ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "Pi Worker execution requires a pinned Pi OpenShell profile".into(),
+                    )
+                })?;
+                Ok(StructuredRuntimeProfile {
+                    policy_path: &pi.policy_path,
+                    provider: &pi.openshell_provider,
+                    binary: &pi.binary,
+                    remote_binary: "/sandbox/pi",
+                    binary_environment: "Pi",
+                    version: &pi.version,
                 })
             }
             _ => Err(TyrionError::InvalidRequest(
@@ -1110,7 +1145,7 @@ impl<'a> Sandbox<'a> {
         let host_repository_parent = shell_quote(path_text(host_repository_parent)?);
         let host_state = shell_quote(path_text(data_dir)?);
         let probe = format!(
-            "set -eu; printf tyrion-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; memory_kib=$(awk '/MemTotal/ {{print $2}}' /proc/meminfo); test \"$memory_kib\" -ge 1900000; test \"$memory_kib\" -le 2097152; storage_kib=$(df -Pk /sandbox | awk 'NR==2 {{print $2}}'); test \"$storage_kib\" -le 4194304; test ! -e {host_repository}; test ! -e {host_repository_parent}; test ! -e {host_state}; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test ! -e /home/sandbox/.codex; test ! -e /home/sandbox/.claude; test -z \"${{OPENAI_API_KEY:-}}${{ANTHROPIC_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; test ! -r /opt/openshell/auth/sandbox.jwt; test ! -r /opt/openshell/tls/tls.key; if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; printf allowed >/sandbox/tyrion-probe; command -v curl >/dev/null; if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; sleep 600 >/dev/null 2>&1 & descendant=$!; kill -0 \"$descendant\"; printf descendant-live"
+            "set -eu; printf tyrion-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; memory_kib=$(awk '/MemTotal/ {{print $2}}' /proc/meminfo); test \"$memory_kib\" -ge 1900000; test \"$memory_kib\" -le 2097152; storage_kib=$(df -Pk /sandbox | awk 'NR==2 {{print $2}}'); test \"$storage_kib\" -le 4194304; test ! -e {host_repository}; test ! -e {host_repository_parent}; test ! -e {host_state}; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test ! -e /home/sandbox/.codex; test ! -e /home/sandbox/.claude; test ! -e /home/sandbox/.pi; test -z \"${{OPENAI_API_KEY:-}}${{ANTHROPIC_API_KEY:-}}${{GEMINI_API_KEY:-}}${{XAI_API_KEY:-}}${{GROQ_API_KEY:-}}${{OPENROUTER_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; test ! -r /opt/openshell/auth/sandbox.jwt; test ! -r /opt/openshell/tls/tls.key; if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; printf allowed >/sandbox/tyrion-probe; command -v curl >/dev/null; if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; sleep 600 >/dev/null 2>&1 & descendant=$!; kill -0 \"$descendant\"; printf descendant-live"
         );
         self.exec_checked(&["sh", "-c", &probe], None, deadline)?;
         let logs = self
@@ -1296,6 +1331,21 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
         }
         verify_hash(&claude.policy_path, &claude.policy_sha256)?;
         verify_hash(&claude.binary, &claude.sha256)?;
+    }
+    if let Some(pi) = &config.pi {
+        if pi.policy_sha256 != PI_POLICY_SHA256
+            || pi.openshell_provider.trim().is_empty()
+            || pi.model_provider != "openai"
+            || !pi.model.starts_with("openai/")
+            || pi.model.len() == "openai/".len()
+            || pi.version.trim().is_empty()
+        {
+            return Err(TyrionError::InvalidRequest(
+                "Pi runtime does not match the pinned OpenShell profile".into(),
+            ));
+        }
+        verify_hash(&pi.policy_path, &pi.policy_sha256)?;
+        verify_hash(&pi.binary, &pi.sha256)?;
     }
     for artifact in &config.runtime_artifacts {
         verify_hash(&artifact.path, &artifact.sha256)?;

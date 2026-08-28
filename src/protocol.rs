@@ -633,6 +633,10 @@ pub enum Command {
         handshake: Box<AttachmentHandshake>,
         replay: CommissionReplayCursor,
     },
+    UpdateAttachmentCapabilities {
+        commission_id: String,
+        capabilities: Vec<String>,
+    },
     TakeControl {
         commission_id: String,
     },

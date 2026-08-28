@@ -2143,11 +2143,19 @@ fn wait_for_failed_attempt(
                 commission_id,
             ],
         );
-        if inspected["attempts"].as_array().is_some_and(|attempts| {
+        let attempt_failed = inspected["attempts"].as_array().is_some_and(|attempts| {
             attempts
                 .first()
                 .is_some_and(|attempt| attempt["status"] == "failed")
-        }) {
+        });
+        let failure_projected = inspected["assignments"]
+            .as_array()
+            .and_then(|assignments| assignments.first())
+            .is_some_and(|assignment| assignment["status"] != "running")
+            && inspected["blockers"]
+                .as_array()
+                .is_some_and(|blockers| !blockers.is_empty());
+        if attempt_failed && failure_projected {
             return inspected;
         }
         assert!(
