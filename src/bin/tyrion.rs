@@ -15,12 +15,13 @@ use tyrion::protocol::{
     VerificationAmendment, VerificationEvidenceSubmission, WorkerControlPlanningProvenance,
     PROTOCOL_VERSION,
 };
+use tyrion::{launch_native_entry, NativeHarness};
 
 #[derive(Debug, Parser)]
 #[command(about = "Review and control Tyrion Commissions")]
 struct Arguments {
-    #[arg(long)]
-    socket: PathBuf,
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
     #[arg(long, global = true)]
     attachment_token: Option<String>,
     #[arg(long, global = true)]
@@ -31,6 +32,21 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
+    /// Launch Claude Code as a Tyrion Entry Session.
+    Claude {
+        #[arg(last = true)]
+        claude_arguments: Vec<String>,
+    },
+    /// Launch Codex as a Tyrion Entry Session.
+    Codex {
+        #[arg(last = true)]
+        codex_arguments: Vec<String>,
+    },
+    #[command(hide = true)]
+    EntryMcp {
+        #[arg(long)]
+        harness: String,
+    },
     /// Launch an explicitly attached Pi Entry Session.
     Pi {
         #[arg(long, default_value = "pi")]
@@ -413,6 +429,49 @@ enum PrincipalCommand {
 
 fn main() {
     let arguments = Arguments::parse();
+    if let TopLevelCommand::Claude { claude_arguments } = &arguments.command {
+        if let Err(error) = launch_native_entry(
+            NativeHarness::Claude,
+            arguments.socket.as_deref(),
+            claude_arguments,
+        ) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let TopLevelCommand::Codex { codex_arguments } = &arguments.command {
+        if let Err(error) = launch_native_entry(
+            NativeHarness::Codex,
+            arguments.socket.as_deref(),
+            codex_arguments,
+        ) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let TopLevelCommand::EntryMcp { harness } = &arguments.command {
+        let socket = match required_socket(&arguments) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        };
+        let harness = match harness.parse() {
+            Ok(harness) => harness,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(error) = tyrion::run_entry_mcp(socket, harness) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let TopLevelCommand::Pi {
         pi_command,
         capabilities,
@@ -422,7 +481,13 @@ fn main() {
     } = &arguments.command
     {
         if let Err(error) = launch_pi(
-            &arguments.socket,
+            match required_socket(&arguments) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
+            },
             pi_command,
             capabilities,
             commission_id.as_deref(),
@@ -441,7 +506,14 @@ fn main() {
             std::process::exit(2);
         }
     };
-    match tyrion::send_request(&arguments.socket, &request) {
+    let socket = match required_socket(&arguments) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    match tyrion::send_request(socket, &request) {
         Ok(response) if response.ok => {
             println!(
                 "{}",
@@ -462,6 +534,15 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn required_socket(arguments: &Arguments) -> Result<&std::path::Path, tyrion::TyrionError> {
+    arguments.socket.as_deref().ok_or_else(|| {
+        tyrion::TyrionError::InvalidRequest(
+            "this command requires --socket; tyrion claude and tyrion codex manage it automatically"
+                .into(),
+        )
+    })
 }
 
 const PI_ADAPTER_IDENTITY: &str = "tyrion-pi-entry";
@@ -730,6 +811,21 @@ fn attachment_handshake(
 fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> {
     let (command, idempotency_key, expected_revision, expected_control_revision) =
         match &arguments.command {
+            TopLevelCommand::Claude { .. } => {
+                return Err(tyrion::TyrionError::InvalidRequest(
+                    "Claude launch must be handled before protocol request construction".into(),
+                ));
+            }
+            TopLevelCommand::Codex { .. } => {
+                return Err(tyrion::TyrionError::InvalidRequest(
+                    "Codex launch must be handled before protocol request construction".into(),
+                ));
+            }
+            TopLevelCommand::EntryMcp { .. } => {
+                return Err(tyrion::TyrionError::InvalidRequest(
+                    "Entry MCP must be handled before protocol request construction".into(),
+                ));
+            }
             TopLevelCommand::Pi { .. } => {
                 return Err(tyrion::TyrionError::InvalidRequest(
                     "Pi launch must be handled before protocol request construction".into(),

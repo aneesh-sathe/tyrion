@@ -2,6 +2,10 @@
 
 - Domain language follows the issue tracker: Principal, Commission Proposal, Commission, Acceptance Criterion, Authority Envelope, Assignment, Attempt, Result, Evidence, Control Plane, and Verified Completion.
 - The public seam is the `tyrion` CLI over the versioned Unix-socket protocol to `tyriond`. End-to-end tests must observe only that seam and must use real SQLite state and daemon restarts.
+- `tyrion claude` and `tyrion codex` launch the installed native TUI from the current Git root, start a session-owned local daemon when needed, and inject the Tyrion stdio MCP bridge without changing persistent harness configuration. The bridge creates and accepts sequential small Commissions and exposes status, but the host TUI remains an Entry Session rather than an uncontained Worker.
+- A non-blocking private lock permits one auto-managed native Entry Session at a time because that launcher owns the daemon lifetime. Explicitly managed sockets may serve concurrent Entry Sessions.
+- The native Entry MVP rejects plans, external effects, paid-service spend, non-deterministic verification, more than one Attempt or Worker, over 15 minutes, over 100 MiB, over $1 model spend, and actions other than `deterministic.echo` or `codex.git_change`.
+- The native Entry MCP replays an identical in-session start request, rejects a different task while the current Commission is non-terminal, and exposes cancellation so abandoned blocked work does not wedge sequential use.
 - `tyriond` is the only authoritative writer. It holds an exclusive lock per data directory, protects the directory and socket with user-only permissions, and uses `state.sqlite3` in WAL mode.
 - Proposal creation grants no execution authority. Acceptance requires `deterministic.echo` in the Authority Envelope plus an exact expected revision and idempotency key.
 - Acceptance and Assignment readiness commit before the Worker dispatches. The acceptance response exposes that ready state; the daemon closes the response path before attempting dispatch, and a disconnected Entry Session does not revoke accepted work.

@@ -2379,7 +2379,9 @@ fn wait_for_commission_status(
     commission_id: &str,
     expected_status: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Reroute scenarios may run two structured adapter processes serially. Under
+    // a full parallel test run their combined fixture time can exceed 10 seconds.
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,

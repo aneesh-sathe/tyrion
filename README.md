@@ -37,6 +37,34 @@ Tyrion does not recreate a model loop. Codex, Claude, and Pi keep their native t
 
 These names appear in the CLI output and protocol. They are worth learning because Tyrion uses them precisely.
 
+## Start a native Entry Session
+
+For the normal interactive path, build Tyrion and launch the Agent Harness already installed on `PATH`:
+
+```sh
+cargo build
+target/debug/tyrion claude
+# or
+target/debug/tyrion codex
+```
+
+Run the command anywhere inside the Git repository you want to work on. Tyrion finds the repository root, creates a private local state directory, starts `tyriond` when needed, injects a session-only Tyrion MCP server and instructions, and then hands the terminal to the harness's native TUI. It does not edit Claude, Codex, or repository configuration files. If this launch started the daemon, exiting the TUI stops that daemon but retains the durable SQLite state.
+
+The MVP permits one auto-managed native TUI at a time so one session cannot accidentally terminate another session's daemon. One TUI can run many sequential Commissions. Multiple simultaneous Entry Sessions require an explicitly managed daemon and `--socket`.
+
+Talk to Claude or Codex normally. For each substantial task, the harness constructs and accepts one bounded Commission through Tyrion. The same TUI session can host multiple sequential Commissions. Exact retries reuse the first Commission, overlapping tasks are rejected, and abandoned blocked work can be cancelled before starting again. The built-in path does not ask the user for proposal JSON, socket paths, launch tokens, or attachment credentials.
+
+Pass native harness arguments after `--`:
+
+```sh
+target/debug/tyrion claude -- --model opus
+target/debug/tyrion codex -- --model gpt-5.5
+```
+
+The first MVP path is deliberately small. It permits one Assignment and Attempt, one Worker, at most 15 minutes, 100 MiB of storage, and $1 of model spend. It rejects paid services, external effects, non-deterministic verification, and actions other than `deterministic.echo` or `codex.git_change`.
+
+The native TUI is an Entry Session, not an uncontained Worker. The deterministic Worker works without setup. A real `codex_git` Commission still needs an eligible contained Worker runtime as described below. Until Tyrion can provision that runtime itself, the one-command launcher proves the user-facing control path but does not by itself satisfy the production dogfood claim.
+
 ## Run the deterministic walkthrough
 
 This is the right first run. It exercises the real CLI, Unix socket, daemon, SQLite state, attachment handshake, ordered events, dispatch, Evidence, and Verified Completion. The built-in deterministic Worker only echoes the accepted Goal, so it needs no external runtime or credential.
