@@ -171,14 +171,24 @@ fn ensure_local_daemon(explicit_socket: Option<&Path>) -> Result<LocalDaemon, Ty
     }
 
     let daemon_binary = std::env::current_exe()?.with_file_name("tyriond");
-    let mut child = Command::new(&daemon_binary)
+    let mut command = Command::new(&daemon_binary);
+    command
         .arg("--data-dir")
         .arg(&data_dir)
         .arg("--socket")
-        .arg(&socket)
+        .arg(&socket);
+    let prototype_config = prototype_codex_worker_config(&data_dir)?;
+    if let Some(config) = &prototype_config {
+        command.arg("--codex-worker-config").arg(config);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if prototype_config.is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .map_err(|error| {
             TyrionError::InvalidRequest(format!(
@@ -209,6 +219,37 @@ fn ensure_local_daemon(explicit_socket: Option<&Path>) -> Result<LocalDaemon, Ty
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+// PROTOTYPE ONLY: prove that the native launcher can inject an ephemeral,
+// Tyrion-owned Worker runtime without asking the user for a JSON file.
+fn prototype_codex_worker_config(data_dir: &Path) -> Result<Option<PathBuf>, TyrionError> {
+    if std::env::var_os("TYRION_PROTOTYPE_ZERO_CONFIG_CODEX").as_deref() != Some("1".as_ref()) {
+        return Ok(None);
+    }
+    let configured = std::env::var_os("TYRION_PROTOTYPE_CODEX_WORKER_CONFIG").ok_or_else(|| {
+        TyrionError::InvalidRequest(
+            "zero-config Codex prototype requires its private Worker runtime".into(),
+        )
+    })?;
+    let configured = PathBuf::from(configured);
+    let metadata = fs::symlink_metadata(&configured)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(TyrionError::InvalidRequest(
+            "prototype Worker runtime must be a user-owned regular file".into(),
+        ));
+    }
+    let configured = fs::canonicalize(configured)?;
+    let data_dir = fs::canonicalize(data_dir)?;
+    if !configured.starts_with(&data_dir) {
+        return Err(TyrionError::InvalidRequest(
+            "prototype Worker runtime must remain inside the private Tyrion data directory".into(),
+        ));
+    }
+    Ok(Some(configured))
 }
 
 fn open_native_session_lock(data_dir: &Path) -> Result<File, TyrionError> {
