@@ -41,7 +41,7 @@ case "$operation" in
                 --network) network=$2; shift 2 ;;
                 --add-host) aliases+=("$2"); shift 2 ;;
                 --detach) detach=1; shift ;;
-                --read-only|--cap-drop|--security-opt|--user|--mount|--workdir|--env|--pids-limit|--memory|--memory-swap|--cpus|--cpuset-cpus)
+                --read-only|--cap-drop|--security-opt|--user|--tmpfs|--workdir|--env|--pids-limit|--memory|--memory-swap|--cpus|--cpuset-cpus)
                     seen+=("$1")
                     [[ $1 == --read-only ]] || shift
                     shift
@@ -51,7 +51,7 @@ case "$operation" in
         done
         [[ -n $name ]]
         # Every sandbox must be created with the whole hardened profile.
-        for required in --read-only --cap-drop --security-opt --user --mount --pids-limit --memory --cpus; do
+        for required in --read-only --cap-drop --security-opt --user --tmpfs --pids-limit --memory --cpus; do
             if [[ " ${seen[*]-} " != *" $required "* ]]; then
                 printf 'fake docker: missing hardening flag %s\n' "$required" >&2
                 exit 64
@@ -147,6 +147,7 @@ case "$operation" in
                 'SSH_AUTH_SOCK'
                 '/etc/tyrion-probe'
                 '/sandbox/tyrion-probe'
+                'tyrion-exec-probe'
                 '/proc/self/mountinfo'
                 'https://example.com'
                 'descendant-live'

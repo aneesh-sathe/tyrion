@@ -84,6 +84,10 @@ struct LiveWorkerTelemetry {
     raw_adapter_event_bytes: usize,
     raw_adapter_event_limit: usize,
     raw_adapter_events_truncated: bool,
+    /// Whatever the adapter wrote to standard error, captured as it arrives so
+    /// a Watchdog containment still explains itself. An adapter that hangs
+    /// before its first event is otherwise silent.
+    raw_adapter_stderr: String,
 }
 
 impl WorkerControl {
@@ -150,6 +154,30 @@ impl WorkerControl {
 
     pub(super) fn was_interrupted(&self) -> bool {
         self.interrupted.load(Ordering::SeqCst)
+    }
+
+    /// Record adapter diagnostics incrementally. The reader thread is joined
+    /// only after the process exits, so anything buffered there is lost when
+    /// the Watchdog terminates an Attempt instead.
+    pub(in crate::worker) fn observe_adapter_stderr(&self, chunk: &str) {
+        const STDERR_LIMIT: usize = 65_536;
+        let Ok(mut telemetry) = self.telemetry.lock() else {
+            return;
+        };
+        let remaining = STDERR_LIMIT.saturating_sub(telemetry.raw_adapter_stderr.len());
+        if remaining == 0 {
+            return;
+        }
+        let chunk = if chunk.len() <= remaining {
+            chunk
+        } else {
+            let mut end = remaining;
+            while end > 0 && !chunk.is_char_boundary(end) {
+                end -= 1;
+            }
+            &chunk[..end]
+        };
+        telemetry.raw_adapter_stderr.push_str(chunk);
     }
 
     pub(in crate::worker) fn observe_adapter_event(
@@ -781,6 +809,7 @@ impl WorkerRuntime {
             "skill_versions": telemetry.skill_versions,
             "raw_adapter_events": telemetry.raw_adapter_events,
             "raw_adapter_events_truncated": telemetry.raw_adapter_events_truncated,
+            "raw_adapter_stderr": telemetry.raw_adapter_stderr,
         }))
     }
 

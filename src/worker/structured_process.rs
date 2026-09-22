@@ -145,12 +145,25 @@ pub(super) fn execute(
         }
         Ok(events)
     });
+    // Stream diagnostics into the control record rather than holding them in
+    // this thread: a Watchdog containment never joins it.
+    let stderr_control = Arc::clone(control);
     let error_reader = thread::spawn(move || {
         let mut output = String::new();
-        stderr
-            .take(65_536)
-            .read_to_string(&mut output)
-            .map(|_| output)
+        let mut reader = BufReader::new(stderr.take(65_536));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    stderr_control.observe_adapter_stderr(&line);
+                    output.push_str(&line);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(output)
     });
 
     let mut interrupted_at = None;

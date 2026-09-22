@@ -203,10 +203,14 @@ async def run():
     if unknown:
         raise RuntimeError(f"unsupported Claude settings: {', '.join(unknown)}")
     repository, temporary_root = prepare_workspace()
-    input_queue = asyncio.Queue()
     control_lines = asyncio.Queue()
     interrupted = False
     configured_tools = sorted(set(native_tools(configuration.get("tools", []))) | {"Skill"})
+    # Tyrion always requests a structured Result, and Claude exposes the
+    # StructuredOutput tool in response. It is induced by this adapter rather
+    # than granted by the Commission, so it is expected in the reported
+    # inventory without being granted in allowed_tools.
+    expected_tools = sorted(set(configured_tools) | {"StructuredOutput"})
     selected_skills = launch.get("skill_defaults", [])
     configured_skills = sorted(skill["name"] for skill in selected_skills)
     configured_versions = {
@@ -239,16 +243,6 @@ async def run():
             )
         selected_skill_paths[name] = path
 
-    async def inputs():
-        yield {
-            "type": "user",
-            "message": {"role": "user", "content": prompt(launch)},
-        }
-        while True:
-            item = await input_queue.get()
-            if item is None:
-                return
-            yield item
 
     options = ClaudeAgentOptions(
         model=configuration["model"],
@@ -290,15 +284,7 @@ async def run():
             line = await control_lines.get()
             control = json.loads(line)
             if control.get("type") == "tyrion.worker.steer":
-                await input_queue.put(
-                    {
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": clarification_text(control),
-                        },
-                    }
-                )
+                await client.query(clarification_text(control))
             elif control.get("type") == "tyrion.worker.interrupt":
                 interrupted = True
                 emit({"type": "user.interrupt"})
@@ -307,7 +293,11 @@ async def run():
     control_task = None
     try:
         await client.connect()
-        await client.query(inputs())
+        # The SDK waits for an async iterable to finish before writing, so an
+        # open-ended input generator never delivers its first message: Claude
+        # blocks reading stdin while this adapter blocks reading its output.
+        # Each turn is its own query, which keeps steering without deadlocking.
+        await client.query(prompt(launch))
         control_task = asyncio.create_task(controls())
         ready = False
         usage_reported = False
@@ -334,7 +324,7 @@ async def run():
                         "Claude did not load required Skill " + missing_skills[0],
                     )
                 effective_tools = native_init_list(message.data, "tools")
-                if effective_tools != configured_tools:
+                if effective_tools != expected_tools:
                     raise RuntimeError(
                         "Claude native tool inventory does not match the selected configuration"
                     )
@@ -471,7 +461,6 @@ async def run():
         if terminal is None:
             raise RuntimeError("Claude Agent SDK emitted no terminal ResultMessage")
     finally:
-        await input_queue.put(None)
         if control_task:
             control_task.cancel()
         await client.disconnect()

@@ -263,7 +263,9 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     // descendant, each terminated with its container.
     assert_eq!(log.matches("descendant-terminated").count(), 4);
     // Every sandbox carries the whole hardened profile, and each ceiling is
-    // set by the Docker daemon from outside the container.
+    // set by the Docker daemon from outside the container. The fixture logs
+    // shell-quoted arguments, so compare against an unescaped copy.
+    let log_plain = log.replace('\\', "");
     for hardening in [
         "--read-only",
         "--pids-limit 256",
@@ -273,11 +275,11 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
         "--security-opt no-new-privileges",
         "--security-opt seccomp=builtin",
         "--user 65534:65534",
-        "tmpfs-size=4294967296",
+        "/sandbox:rw,exec,nosuid,nodev,size=4096m,mode=1777",
         "--network none",
     ] {
         assert!(
-            log.contains(hardening),
+            log_plain.contains(hardening),
             "sandbox created without {hardening}"
         );
     }
