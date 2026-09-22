@@ -220,7 +220,8 @@ class SystemMessage:
             "session_id": "claude-production-session",
             "model": options.model,
             "permissionMode": options.permission_mode,
-            "tools": options.tools,
+            # real Claude adds StructuredOutput when an output_format is requested
+            "tools": sorted(set(options.tools) | {"StructuredOutput"}),
             "skills": ["code-review", "frontend"],
             "slash_commands": ["code-review", "frontend"],
         }
@@ -237,7 +238,7 @@ class ResultMessage:
 class ClaudeSDKClient:
     def __init__(self, options): self.options = options
     async def connect(self): pass
-    async def query(self, prompt): self.prompt = await prompt.__anext__()
+    async def query(self, prompt): self.prompt = prompt
     async def receive_response(self):
         assert self.options.tools == ["Skill"]
         assert self.options.allowed_tools == ["Skill"]
@@ -246,7 +247,7 @@ class ClaudeSDKClient:
         assert self.options.max_budget_usd == 1.0
         assert self.options.cli_path == "/fixture/claude"
         if self.options.model in {"claude-fixture", "claude-skill-refusal"}:
-            assert "native Skill tool: code-review" in self.prompt["message"]["content"]
+            assert "native Skill tool: code-review" in self.prompt
         if self.options.model == "claude-git-fixture":
             with open(self.options.cwd + "/claude-uncommitted.txt", "w") as output:
                 output.write("saved by Claude\n")

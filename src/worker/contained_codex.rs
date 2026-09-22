@@ -1149,12 +1149,13 @@ impl<'a> Sandbox<'a> {
         let cpus = config.vcpus.to_string();
         let cpuset = format!("0-{}", config.vcpus.saturating_sub(1));
         let pids = config.max_processes.to_string();
+        // Docker defaults a tmpfs to noexec, but /sandbox is the only writable
+        // mount and holds every artifact Tyrion streams in, including the
+        // harness binary. `nosuid` and `nodev` stay; the image already ships
+        // interpreters, so noexec here bought no containment.
         let tmpfs = format!(
-            "type=tmpfs,destination={SANDBOX_ROOT},tmpfs-size={},tmpfs-mode=1777",
-            config
-                .writable_storage_mib
-                .saturating_mul(1024)
-                .saturating_mul(1024)
+            "{SANDBOX_ROOT}:rw,exec,nosuid,nodev,size={}m,mode=1777",
+            config.writable_storage_mib
         );
         let home = format!("HOME={SANDBOX_ROOT}");
         let tmpdir = format!("TMPDIR={SANDBOX_ROOT}/tmp");
@@ -1202,7 +1203,7 @@ impl<'a> Sandbox<'a> {
             "seccomp=builtin",
             "--user",
             "65534:65534",
-            "--mount",
+            "--tmpfs",
             &tmpfs,
             "--workdir",
             SANDBOX_ROOT,
@@ -1349,6 +1350,9 @@ impl<'a> Sandbox<'a> {
              if printf 512 >/sys/fs/cgroup/pids.max 2>/dev/null; then exit 90; fi; \
              if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; \
              printf allowed >{SANDBOX_ROOT}/tyrion-probe; \
+             printf '#!/bin/sh\\necho executable' >{SANDBOX_ROOT}/tyrion-exec-probe; \
+             chmod 700 {SANDBOX_ROOT}/tyrion-exec-probe; \
+             test \"$({SANDBOX_ROOT}/tyrion-exec-probe)\" = executable; \
              test \"$(awk '/^CapEff:/ {{print $2}}' /proc/self/status)\" = 0000000000000000; \
              test \"$(awk '/^NoNewPrivs:/ {{print $2}}' /proc/self/status)\" = 1; \
              test \"$(awk '/^Seccomp:/ {{print $2}}' /proc/self/status)\" != 0; \
@@ -1725,9 +1729,14 @@ impl ContainedCodexRuntime {
     }
 }
 
+/// Removal is idempotent from Tyrion's side: a container that is absent, or
+/// that another sweep is already tearing down, is as good as removed. Only an
+/// unexplained failure is worth surfacing.
 fn reports_missing(stderr: &[u8]) -> bool {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    stderr.contains("no such container") || stderr.contains("not found")
+    stderr.contains("no such container")
+        || stderr.contains("not found")
+        || stderr.contains("already in progress")
 }
 
 fn text_lines(bytes: &[u8]) -> Vec<String> {
@@ -1774,9 +1783,9 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
             "an explicit Docker daemon address is required; Tyrion never resolves an ambient context".into(),
         ));
     }
-    if !is_digest_pinned(&config.worker_image) {
+    if !is_content_addressed(&config.worker_image) {
         return Err(TyrionError::InvalidRequest(
-            "the Worker image must be pinned by an exact sha256 registry digest".into(),
+            "the Worker image must be content addressed: a registry digest reference or a bare sha256 image id".into(),
         ));
     }
     if !is_image_id(&config.worker_image_id) {
@@ -1881,7 +1890,14 @@ fn validate_worker_image(config: &RuntimeConfig, data_dir: &Path) -> Result<(), 
     Ok(())
 }
 
-fn is_digest_pinned(reference: &str) -> bool {
+/// A reference Tyrion will accept: a registry digest reference, or the bare
+/// image id of a locally built image. Both name exact content; a tag does not.
+/// A personal runtime builds its own Worker image and never pushes it, so
+/// requiring a registry would rule that out without improving the pin.
+fn is_content_addressed(reference: &str) -> bool {
+    if is_image_id(reference) {
+        return true;
+    }
     match reference.split_once("@sha256:") {
         Some((repository, digest)) => !repository.is_empty() && is_hex64(digest),
         None => false,
@@ -2502,7 +2518,8 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_script, is_digest_pinned, is_image_id, result_schema, symlink_escapes_repository,
+        attempt_script, is_content_addressed, is_image_id, result_schema,
+        symlink_escapes_repository,
     };
 
     #[test]
@@ -2540,14 +2557,18 @@ mod tests {
     }
 
     #[test]
-    fn only_a_digest_pinned_worker_image_is_accepted() {
+    fn only_a_content_addressed_worker_image_is_accepted() {
         let digest = "a".repeat(64);
-        assert!(is_digest_pinned(&format!(
+        assert!(is_content_addressed(&format!(
             "registry.example/worker@sha256:{digest}"
         )));
-        assert!(!is_digest_pinned("registry.example/worker:latest"));
-        assert!(!is_digest_pinned("registry.example/worker@sha256:short"));
-        assert!(!is_digest_pinned(&format!("@sha256:{digest}")));
+        // A locally built image has no registry digest, only an id.
+        assert!(is_content_addressed(&format!("sha256:{digest}")));
+        assert!(!is_content_addressed("registry.example/worker:latest"));
+        assert!(!is_content_addressed(
+            "registry.example/worker@sha256:short"
+        ));
+        assert!(!is_content_addressed(&format!("@sha256:{digest}")));
         assert!(is_image_id(&format!("sha256:{digest}")));
         assert!(!is_image_id(&digest));
         assert!(!is_image_id(&format!("sha256:{}", "A".repeat(64))));

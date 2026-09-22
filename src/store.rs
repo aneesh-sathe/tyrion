@@ -7543,6 +7543,12 @@ impl Store {
                                 .is_some_and(|telemetry| {
                                     telemetry["raw_adapter_events_truncated"] == true
                                 }),
+                            "adapter_stderr": terminal_telemetry
+                                .as_ref()
+                                .and_then(|telemetry| telemetry
+                                    .get("raw_adapter_stderr")
+                                    .cloned())
+                                .unwrap_or_else(|| serde_json::json!("")),
                             "terminal_error": error.to_string(),
                         }))?,
                     ],

@@ -43,7 +43,10 @@ struct Arguments {
     fault_hold_effect_before_commit_milliseconds: u64,
     #[arg(long, default_value_t = 0, hide = true)]
     fault_hold_incremental_replay_milliseconds: u64,
-    #[arg(long, default_value_t = 30_000, hide = true)]
+    /// How long a Worker may go without meaningful activity before the
+    /// Watchdog contains it. A real model routinely thinks for minutes, so
+    /// this is a production setting rather than a test knob.
+    #[arg(long, default_value_t = 600_000)]
     watchdog_stall_milliseconds: u64,
     #[arg(long, hide = true)]
     fault_memory_now_epoch: Option<i64>,
