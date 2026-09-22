@@ -2056,6 +2056,7 @@ fn validate_candidate_bundle(
             "Codex Result contains no changed paths".into(),
         ));
     }
+    validate_no_escaping_symlink(&quarantine, &candidate_revision)?;
     for changed_path in &changed_paths {
         validate_relative_path(changed_path)?;
         if !authorized_paths.iter().any(|allowed| {
@@ -2252,6 +2253,85 @@ fn validate_relative_path(path: &str) -> Result<(), TyrionError> {
     Ok(())
 }
 
+/// A Worker may be authorized to write a path while having no authority to
+/// read what a symlink at that path would point at. Integration must never
+/// materialize a link that leaves the repository, because a Principal who
+/// later merges the artifact would resolve it against their own machine.
+fn validate_no_escaping_symlink(
+    repository: &Path,
+    candidate_revision: &str,
+) -> Result<(), TyrionError> {
+    let listing = git_bytes(
+        repository,
+        &[os("ls-tree"), os("-r"), os("-z"), os(candidate_revision)],
+    )?;
+    for entry in listing.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let entry = String::from_utf8(entry.to_vec()).map_err(|_| {
+            TyrionError::InvalidRequest("Result contains a non-UTF-8 tree entry".into())
+        })?;
+        // "<mode> <type> <object>\t<path>"
+        let Some((metadata, path)) = entry.split_once('\t') else {
+            return Err(TyrionError::InvalidRequest(
+                "Result contains an unparseable tree entry".into(),
+            ));
+        };
+        let fields = metadata.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(TyrionError::InvalidRequest(
+                "Result contains an unparseable tree entry".into(),
+            ));
+        }
+        if fields[0] != "120000" {
+            continue;
+        }
+        let target = git_bytes(repository, &[os("cat-file"), os("blob"), os(fields[2])])?;
+        let target = String::from_utf8(target).map_err(|_| {
+            TyrionError::InvalidRequest("Result contains a non-UTF-8 symlink target".into())
+        })?;
+        if symlink_escapes_repository(path, &target) {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Codex Result symlink {path} points outside the repository at {target}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a symlink target against the directory holding it, purely
+/// lexically, and report whether it leaves the repository root.
+fn symlink_escapes_repository(path: &str, target: &str) -> bool {
+    let target = target.trim_end_matches('\n');
+    if target.is_empty() || Path::new(target).is_absolute() {
+        return true;
+    }
+    let mut resolved: Vec<&str> = Path::new(path)
+        .parent()
+        .map(|parent| {
+            parent
+                .to_str()
+                .unwrap_or_default()
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if resolved.pop().is_none() {
+                    return true;
+                }
+            }
+            segment => resolved.push(segment),
+        }
+    }
+    false
+}
+
 fn verify_hash(path: &Path, expected: &str) -> Result<(), TyrionError> {
     let actual = sha256_file(path)?;
     if actual != expected {
@@ -2416,7 +2496,9 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt_script, is_digest_pinned, is_image_id, result_schema};
+    use super::{
+        attempt_script, is_digest_pinned, is_image_id, result_schema, symlink_escapes_repository,
+    };
 
     #[test]
     fn a_worker_without_declared_credentials_receives_none() {
@@ -2464,6 +2546,31 @@ mod tests {
         assert!(is_image_id(&format!("sha256:{digest}")));
         assert!(!is_image_id(&digest));
         assert!(!is_image_id(&format!("sha256:{}", "A".repeat(64))));
+    }
+
+    #[test]
+    fn only_symlinks_that_stay_inside_the_repository_are_accepted() {
+        // Inside the repository: legitimate and allowed.
+        assert!(!symlink_escapes_repository("src/link", "module.rs"));
+        assert!(!symlink_escapes_repository("src/a/link", "../b/module.rs"));
+        assert!(!symlink_escapes_repository("src/link", "./module.rs"));
+        assert!(!symlink_escapes_repository("a/b/c/link", "../../../top.rs"));
+
+        // Leaving the repository, by any route.
+        assert!(symlink_escapes_repository(
+            "issue-4.txt",
+            "/Users/someone/.ssh/id_rsa"
+        ));
+        assert!(symlink_escapes_repository("issue-4.txt", ".."));
+        assert!(symlink_escapes_repository("src/link", "../../etc/passwd"));
+        assert!(symlink_escapes_repository(
+            "a/b/c/link",
+            "../../../../etc/passwd"
+        ));
+        assert!(symlink_escapes_repository("link", "../anything"));
+        assert!(symlink_escapes_repository("link", ""));
+        // A trailing newline must not disguise an absolute target.
+        assert!(symlink_escapes_repository("link", "/etc/passwd\n"));
     }
 
     #[test]

@@ -62,6 +62,46 @@ Probe scripts: `.scratch/docker-qual-20260921/probe.sh`, `probe2.sh`,
 `curl` without `--fail` exits 0 on HTTP 403, so every egress probe recorded the
 HTTP status rather than the exit code.
 
+## Adversarial probe: can a Worker reach the Principal's directories?
+
+`.scratch/docker-qual-20260921/escape.sh` runs a container with the exact
+production profile and attacks the boundary. Every attempt was blocked:
+
+| Attack | Result |
+| --- | --- |
+| Read the Principal home directory, this repository, or `/Users` | Blocked, path does not exist |
+| Read the VM's host mount markers, directly or via `/proc/1/root` | Blocked |
+| Write `/etc`, `/usr/bin`, `/`, `/dev`, `/proc/sys` | Blocked, read-only |
+| Raise its own cgroup limits | Blocked, read-only cgroupfs |
+| `su` to root, `mount`, `unshare`, `modprobe` | Blocked, no capabilities |
+| Reach the Docker or containerd socket | Blocked, absent |
+| See host processes, read host block devices | Blocked |
+| Follow a symlink from its scratch area to the host home directory | Blocked |
+| Write its own `/sandbox` scratch area | Allowed, as intended |
+
+Running as uid 65534 with `CapEff=0000000000000000`. One probe resolved
+`../../../../etc/passwd` and read a Linux-format passwd file: that is the
+container's own disposable `/etc`, reached inside its mount namespace, not the
+host's.
+
+Two properties are enforced above the container as well, each with an
+end-to-end test:
+
+- **The Principal checkout is an input, never a workspace.**
+  `a_completed_commission_leaves_the_principal_checkout_byte_identical`
+  fingerprints every path, mode, and content digest before and after a
+  completed Commission and requires them to be identical, with `HEAD` still on
+  the base revision. The accepted artifact exists only inside Tyrion's own
+  integration repository.
+- **A Result cannot smuggle a link out of the repository.**
+  `a_symlink_aimed_at_the_host_is_rejected_before_verification` has a Worker
+  commit `issue-4.txt` as a symlink to a host SSH key. Path-scope checking
+  alone does not catch this, because the path itself is authorized; an earlier
+  revision of this work caught it only because a criterion happened to read
+  that file, which would not generalize. `validate_no_escaping_symlink` now
+  rejects any tree entry of mode `120000` whose target is absolute or resolves
+  above the repository root, before verification and before Integration.
+
 ## The resource contract changed, and needs a Principal decision
 
 The OpenShell profile was 2 vCPU, 2048 MiB memory, and a 4096 MiB overlay disk:

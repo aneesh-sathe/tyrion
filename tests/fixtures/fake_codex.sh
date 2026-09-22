@@ -83,6 +83,11 @@ fi
 if [ -e "$fake_state/unauthorized-change" ]; then
     printf '%s\n' 'outside authority' >"$repo/outside.txt"
 fi
+if [ -e "$fake_state/symlink-escape" ]; then
+    # A symlink is a path the Worker is allowed to write, pointing at a host
+    # file it is not allowed to read. Committing one must not smuggle it out.
+    ln -sf /Users/aneeshsathe/.ssh/id_rsa "$repo/issue-4.txt"
+fi
 if [ -e "$fake_state/reverted-unauthorized-change" ]; then
     git -C "$repo" config user.name 'Adversarial Fixture'
     git -C "$repo" config user.email 'fixture@tyrion.invalid'
