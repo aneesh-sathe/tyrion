@@ -10,6 +10,12 @@ Start `tyriond` with `--credential-runtime credential-runtime.json`. The runtime
 - an absolute, SHA-256-pinned `curl` binary and a closed map of destination aliases to exact HTTPS origins;
 - for exceptional exposure only, the repaired OpenShell 0.0.104 source revision and patch, pinned runtime artifacts, base image, gateway and kernel configurations, hard policy, adapter, and fixed 2-vCPU, 2-GiB, 4-GiB, 256-process profile.
 
+> This one-shot Effect Sandbox is the last OpenShell consumer. Worker
+> containment moved to Docker on 2026-09-21; see
+> [the qualification](prototypes/docker-containment-qualification.md). Migrating
+> this path uses the same create/transfer/execute/delete seam and is the
+> remaining work before `runtime/openshell/` can be deleted.
+
 The daemon validates every pin at startup. It validates the broker binaries again immediately before use. One-shot execution additionally revalidates the full Effect Sandbox profile, including Landlock, seccomp, PID cgroup, network destination, allowed binaries, source repair, and adapter version.
 
 Provision a short-lived credential under the configured Keychain service and an opaque account name. The account name becomes `credential_reference`; the secret value never enters a Tyrion request or database. The configured Keychain should be dedicated to the credential broker and protected for the daemon identity.

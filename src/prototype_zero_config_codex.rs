@@ -17,7 +17,7 @@ pub enum Phase {
 pub struct RuntimeFacts {
     pub tyrion_owned_bundle: bool,
     pub boundary_attested: bool,
-    pub openshell_version: Option<String>,
+    pub docker_version: Option<String>,
     pub guest_codex_version: Option<String>,
     pub ambient_codex_version: Option<String>,
 }
@@ -46,10 +46,10 @@ pub fn select_runtime(facts: RuntimeFacts) -> RuntimeDecision {
     if !facts.tyrion_owned_bundle {
         reasons.push("pinned Tyrion-owned runtime bundle missing".into());
     }
-    match facts.openshell_version.as_deref() {
-        Some("openshell 0.0.104") => {}
-        Some(version) => reasons.push(format!("expected OpenShell 0.0.104, found {version}")),
-        None => reasons.push("OpenShell missing".into()),
+    match facts.docker_version.as_deref() {
+        Some(version) if version.starts_with("Docker version ") => {}
+        Some(version) => reasons.push(format!("expected a Docker CLI, found {version}")),
+        None => reasons.push("Docker missing".into()),
     }
     match facts.guest_codex_version.as_deref() {
         Some("codex-cli 0.147.0") => {}

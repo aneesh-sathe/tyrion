@@ -1,0 +1,6 @@
+[env]
+# Each end-to-end test starts a real daemon and several sandboxes, and some of
+# them assert wall-clock concurrency. Saturating every core makes those
+# assertions measure machine load rather than Tyrion, so bound the suite's
+# parallelism instead of weakening what it checks.
+RUST_TEST_THREADS = { value = "4", force = false }

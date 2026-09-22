@@ -21,55 +21,118 @@ use crate::error::IntegrationFailureKind;
 use crate::protocol::Verifier;
 use crate::TyrionError;
 
-const SOURCE_REVISION: &str = "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354";
-const SOURCE_PATCH_SHA256: &str =
-    "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402";
-const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e";
-const POLICY_SHA256: &str = "76715da36c5e5f8603cd4732690707bca8b7f11ee153ae36521028db75bc4453";
-const CLAUDE_POLICY_SHA256: &str =
-    "89ec4d87f6a6b4bd8c581ec878ff82cb2e2acf96a5a581e94e3f0b10d84feccf";
-const PI_POLICY_SHA256: &str = "c7bbd0d358df5d7943e38d32ea2442b2f4cba8e34cdd39db98982e5502f62982";
+/// The Worker containment boundary is one disposable Docker container per
+/// Attempt, verification run, and comparison. Every ceiling is set by the
+/// Docker daemon from outside the container and is not raisable by guest
+/// root, no host path is ever bind-mounted in, and the only writable mount is
+/// the sized `/sandbox` tmpfs.
+pub(super) const CONTAINMENT_PROFILE: &str = "docker-hardened-v1";
 const CODEX_VERSION: &str = "codex-cli 0.147.0";
+/// The single writable mount inside every sandbox.
+const SANDBOX_ROOT: &str = "/sandbox";
+/// Every container and network Tyrion creates carries its Attempt, so
+/// cleanup never depends on reconstructing a name.
+const ATTEMPT_LABEL: &str = "tyrion.attempt";
+/// Deterministic `PATH` for the Docker CLI, which never inherits the
+/// Principal environment.
+const DOCKER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// A destination-pinned TCP relay. It forwards bytes to exactly one
+/// `host:port` and never terminates TLS, so a Worker's provider credential
+/// stays end-to-end encrypted and cannot be sent anywhere else.
+const RELAY_SOURCE: &str = r#"
+import socket, sys, threading
+host, port = sys.argv[1], int(sys.argv[2])
+def pipe(source, sink):
+    try:
+        while True:
+            block = source.recv(65536)
+            if not block:
+                break
+            sink.sendall(block)
+    except OSError:
+        pass
+    finally:
+        try:
+            sink.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("0.0.0.0", port))
+listener.listen(64)
+sys.stderr.write("tyrion-relay-ready\n")
+sys.stderr.flush()
+while True:
+    client, _ = listener.accept()
+    try:
+        upstream = socket.create_connection((host, port), 15)
+    except OSError:
+        client.close()
+        continue
+    threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+    threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+"#;
+
+/// The vetted Docker runtime Tyrion contains Workers with. Tyrion never pulls
+/// an image and never resolves an ambient Docker context: the operator
+/// provisions the digest-pinned Worker image, and every field below is
+/// checked before the daemon accepts the configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeConfig {
-    openshell_binary: PathBuf,
-    openshell_sha256: String,
-    openshell_version: String,
-    openshell_config_home: PathBuf,
-    policy_path: PathBuf,
-    policy_sha256: String,
-    gateway_config_path: PathBuf,
-    gateway_config_sha256: String,
-    kernel_config_path: PathBuf,
-    kernel_config_sha256: String,
-    runtime_artifacts: Vec<PinnedArtifact>,
-    source_revision: String,
-    source_patch_path: PathBuf,
-    source_patch_sha256: String,
-    base_image: String,
+    docker_binary: PathBuf,
+    docker_sha256: String,
+    docker_version: String,
+    docker_host: String,
+    /// The Worker image, pinned by registry digest.
+    worker_image: String,
+    /// The locally resolved image identity that `worker_image` must launch.
+    worker_image_id: String,
     codex_binary: PathBuf,
     codex_version: String,
     codex_sha256: String,
     model: String,
-    openshell_provider: String,
+    /// Absent means every sandbox runs with no network at all.
+    #[serde(default)]
+    egress: Option<EgressConfig>,
+    /// Environment variable names the Principal started `tyriond` with that
+    /// may reach a Worker. Empty by default: credential availability on the
+    /// host never implies permission to use it.
+    #[serde(default)]
+    worker_credentials: Vec<String>,
     #[serde(default)]
     claude: Option<ClaudeRuntimeConfig>,
     #[serde(default)]
     pi: Option<PiRuntimeConfig>,
     lease_ttl_seconds: u64,
     vcpus: u32,
+    /// Bounds process memory and the writable tmpfs together, because tmpfs
+    /// pages are charged to the container memory cgroup.
     memory_mib: u64,
-    overlay_disk_mib: u64,
+    writable_storage_mib: u64,
     max_processes: u32,
+}
+
+/// The complete set of destinations a Worker may reach. Each one is brokered
+/// by its own relay on a per-Attempt internal network; everything else is
+/// unreachable because the network has no route off the bridge.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EgressConfig {
+    destinations: Vec<EgressDestination>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct EgressDestination {
+    host: String,
+    port: u16,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClaudeRuntimeConfig {
-    policy_path: PathBuf,
-    policy_sha256: String,
-    openshell_provider: String,
     binary: PathBuf,
     version: String,
     sha256: String,
@@ -78,19 +141,10 @@ struct ClaudeRuntimeConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PiRuntimeConfig {
-    policy_path: PathBuf,
-    policy_sha256: String,
-    openshell_provider: String,
     model_provider: String,
     model: String,
     binary: PathBuf,
     version: String,
-    sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PinnedArtifact {
-    path: PathBuf,
     sha256: String,
 }
 
@@ -131,8 +185,6 @@ pub(super) struct StructuredAdapterSandbox<'a> {
 }
 
 struct StructuredRuntimeProfile<'a> {
-    policy_path: &'a Path,
-    provider: &'a str,
     binary: &'a Path,
     remote_binary: &'static str,
     binary_environment: &'static str,
@@ -161,20 +213,17 @@ impl StructuredAdapterSandbox<'_> {
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             TyrionError::InvalidRequest("structured adapter sandbox is no longer active".into())
         })?;
-        let mut command = Command::new(&sandbox.runtime.config.openshell_binary);
+        let credentials = sandbox.runtime.credential_arguments();
+        let mut arguments = vec!["exec", "--interactive", "--workdir", SANDBOX_ROOT];
+        arguments.extend(credentials.iter().map(String::as_str));
+        arguments.extend([
+            sandbox.name.as_str(),
+            "env",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+        ]);
+        let mut command = sandbox.runtime.docker_command(&arguments);
+        sandbox.runtime.apply_credentials(&mut command);
         command
-            .args([
-                "sandbox",
-                "exec",
-                "-n",
-                &sandbox.name,
-                "--workdir",
-                "/sandbox",
-                "--no-tty",
-                "--",
-                "env",
-                "PATH=/usr/local/bin:/usr/bin:/bin",
-            ])
             .arg(format!("TYRION_COMMISSION_ID={}", assignment.commission_id))
             .arg(format!("TYRION_ASSIGNMENT_ID={}", assignment.assignment_id))
             .arg(format!("TYRION_ATTEMPT_ID={}", assignment.attempt_id))
@@ -187,6 +236,8 @@ impl StructuredAdapterSandbox<'_> {
                 "TYRION_CONFIGURATION_FINGERPRINT={configuration_fingerprint}"
             ))
             .arg("TYRION_WORKSPACE_ROOT=/sandbox")
+            .arg("HOME=/sandbox")
+            .arg("TMPDIR=/sandbox/tmp")
             .arg(match configuration.adapter.kind {
                 super::routing::WorkerAdapterKind::CodexAppServer => {
                     "TYRION_CODEX_BINARY=/sandbox/codex"
@@ -206,11 +257,6 @@ impl StructuredAdapterSandbox<'_> {
             }))
             .arg("/sandbox/worker-adapter")
             .args(configuration.adapter.command.iter().skip(1))
-            .env_clear()
-            .env(
-                "XDG_CONFIG_HOME",
-                &sandbox.runtime.config.openshell_config_home,
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -266,6 +312,10 @@ impl ContainedCodexRuntime {
         let encoded = fs::read(config_path)?;
         let config: RuntimeConfig = serde_json::from_slice(&encoded)?;
         validate_config(&config)?;
+        let docker_config = data_dir.join("docker");
+        create_private_dir(&docker_config)?;
+        fs::write(docker_config.join("config.json"), b"{}")?;
+        validate_worker_image(&config, data_dir)?;
         let fingerprint = format!("{:x}", Sha256::digest(&encoded));
         Ok(Self {
             config,
@@ -277,16 +327,16 @@ impl ContainedCodexRuntime {
     pub(super) fn routing_descriptor(&self) -> super::routing::ContainedCodexDescriptor {
         let mut settings = std::collections::BTreeMap::new();
         settings.insert(
-            "openshell_version".into(),
-            serde_json::json!(self.config.openshell_version),
+            "docker_version".into(),
+            serde_json::json!(self.config.docker_version),
         );
         settings.insert(
-            "source_revision".into(),
-            serde_json::json!(self.config.source_revision),
+            "worker_image".into(),
+            serde_json::json!(self.config.worker_image),
         );
         settings.insert(
-            "base_image".into(),
-            serde_json::json!(self.config.base_image),
+            "worker_image_id".into(),
+            serde_json::json!(self.config.worker_image_id),
         );
         settings.insert("vcpus".into(), serde_json::json!(self.config.vcpus));
         settings.insert(
@@ -294,12 +344,25 @@ impl ContainedCodexRuntime {
             serde_json::json!(self.config.memory_mib),
         );
         settings.insert(
-            "overlay_disk_mib".into(),
-            serde_json::json!(self.config.overlay_disk_mib),
+            "writable_storage_mib".into(),
+            serde_json::json!(self.config.writable_storage_mib),
         );
         settings.insert(
             "max_processes".into(),
             serde_json::json!(self.config.max_processes),
+        );
+        settings.insert(
+            "brokered_egress".into(),
+            serde_json::json!(self
+                .config
+                .egress
+                .as_ref()
+                .map(|egress| egress
+                    .destinations
+                    .iter()
+                    .map(|destination| format!("{}:{}", destination.host, destination.port))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()),
         );
         settings.insert(
             "runtime_configuration_sha256".into(),
@@ -312,10 +375,10 @@ impl ContainedCodexRuntime {
             settings,
             max_storage_bytes: self
                 .config
-                .overlay_disk_mib
+                .writable_storage_mib
                 .saturating_mul(1024)
                 .saturating_mul(1024),
-            containment_profile: format!("openshell-repaired-v0.0.104-{}", &self.fingerprint[..16]),
+            containment_profile: format!("{CONTAINMENT_PROFILE}-{}", &self.fingerprint[..16]),
             supports_claude: self.config.claude.is_some(),
             supports_pi: self.config.pi.is_some(),
             pi_model_provider: self.config.pi.as_ref().map(|pi| pi.model_provider.clone()),
@@ -345,8 +408,8 @@ impl ContainedCodexRuntime {
         let sandbox = Sandbox::create(
             self,
             &sandbox_name,
-            profile.policy_path,
-            profile.provider,
+            &assignment.attempt_id,
+            NetworkPolicy::Brokered,
             assignment.lease_expires_at,
         )?;
         let host_scope = match &assignment.execution {
@@ -403,8 +466,6 @@ impl ContainedCodexRuntime {
     ) -> Result<StructuredRuntimeProfile<'_>, TyrionError> {
         match kind {
             super::routing::WorkerAdapterKind::CodexAppServer => Ok(StructuredRuntimeProfile {
-                policy_path: &self.config.policy_path,
-                provider: &self.config.openshell_provider,
                 binary: &self.config.codex_binary,
                 remote_binary: "/sandbox/codex",
                 binary_environment: "Codex",
@@ -413,12 +474,10 @@ impl ContainedCodexRuntime {
             super::routing::WorkerAdapterKind::ClaudeAgentSdk => {
                 let claude = self.config.claude.as_ref().ok_or_else(|| {
                     TyrionError::InvalidRequest(
-                        "Claude Worker execution requires a pinned Claude OpenShell profile".into(),
+                        "Claude Worker execution requires a pinned Claude runtime profile".into(),
                     )
                 })?;
                 Ok(StructuredRuntimeProfile {
-                    policy_path: &claude.policy_path,
-                    provider: &claude.openshell_provider,
                     binary: &claude.binary,
                     remote_binary: "/sandbox/claude",
                     binary_environment: "Claude",
@@ -428,12 +487,10 @@ impl ContainedCodexRuntime {
             super::routing::WorkerAdapterKind::PiRpc => {
                 let pi = self.config.pi.as_ref().ok_or_else(|| {
                     TyrionError::InvalidRequest(
-                        "Pi Worker execution requires a pinned Pi OpenShell profile".into(),
+                        "Pi Worker execution requires a pinned Pi runtime profile".into(),
                     )
                 })?;
                 Ok(StructuredRuntimeProfile {
-                    policy_path: &pi.policy_path,
-                    provider: &pi.openshell_provider,
                     binary: &pi.binary,
                     remote_binary: "/sandbox/pi",
                     binary_environment: "Pi",
@@ -446,26 +503,21 @@ impl ContainedCodexRuntime {
         }
     }
 
+    /// Remove every container and network this Attempt ever created. The
+    /// Attempt label is the authority, so a sandbox whose name is not
+    /// reachable from the durable record is still cleaned up.
     pub(super) fn cleanup_stranded_attempt(&self, attempt_id: &str) -> Result<(), TyrionError> {
-        let mut sandboxes = vec![
-            sandbox_name("adapter", attempt_id),
-            sandbox_name("attempt", attempt_id),
-        ];
-        for scope in ["candidate", "integrated"] {
-            for verification_index in 1..=2 {
-                sandboxes.push(sandbox_name(
-                    scope,
-                    &format!("{attempt_id}-verification-{verification_index}"),
-                ));
-            }
+        let deadline = unix_timestamp()?.saturating_add(120);
+        let filter = format!("label={ATTEMPT_LABEL}={attempt_id}");
+        let containers =
+            self.docker_checked(&["ps", "--all", "--quiet", "--filter", &filter], deadline)?;
+        for container in text_lines(&containers.stdout) {
+            self.delete_container(&container)?;
         }
-        for name in sandboxes {
-            let output = Command::new(&self.config.openshell_binary)
-                .args(["sandbox", "delete", name.as_str()])
-                .env_clear()
-                .env("XDG_CONFIG_HOME", &self.config.openshell_config_home)
-                .output()?;
-            require_success("stranded OpenShell sandbox cleanup", output)?;
+        let networks =
+            self.docker_checked(&["network", "ls", "--quiet", "--filter", &filter], deadline)?;
+        for network in text_lines(&networks.stdout) {
+            self.docker_checked(&["network", "rm", &network], deadline)?;
         }
         Ok(())
     }
@@ -614,8 +666,8 @@ impl ContainedCodexRuntime {
         let sandbox = Sandbox::create(
             self,
             &sandbox_name,
-            &self.config.policy_path,
-            &self.config.openshell_provider,
+            &assignment.attempt_id,
+            NetworkPolicy::Brokered,
             assignment.lease_expires_at,
         )?;
         sandbox.preflight(&repository, &self.data_dir, assignment.lease_expires_at)?;
@@ -672,6 +724,7 @@ impl ContainedCodexRuntime {
                 base_revision,
                 &self.config.model,
                 assignment.declared_write_scopes.is_empty(),
+                &self.config.worker_credentials,
             ),
         )?;
         fs::set_permissions(&attempt_script_path, fs::Permissions::from_mode(0o700))?;
@@ -680,9 +733,8 @@ impl ContainedCodexRuntime {
             "/sandbox/run-attempt.sh",
             assignment.lease_expires_at,
         )?;
-        sandbox.exec_checked(
+        sandbox.exec_credentialed(
             &["sh", "/sandbox/run-attempt.sh"],
-            None,
             assignment.lease_expires_at,
         )?;
 
@@ -995,8 +1047,8 @@ impl ContainedCodexRuntime {
             let sandbox = Sandbox::create(
                 self,
                 &sandbox_name,
-                &self.config.policy_path,
-                &self.config.openshell_provider,
+                &assignment.attempt_id,
+                NetworkPolicy::Denied,
                 assignment.lease_expires_at,
             )?;
             sandbox.preflight(
@@ -1045,65 +1097,175 @@ impl ContainedCodexRuntime {
     }
 }
 
+/// A single disposable Docker container. Creation, transfer, execution, and
+/// deletion are the whole containment seam; everything above it is
+/// runtime-independent.
 struct Sandbox<'a> {
     runtime: &'a ContainedCodexRuntime,
     name: String,
+    network: Option<AttemptNetwork<'a>>,
     deleted: bool,
+}
+
+/// Whether a sandbox may reach anything at all. Verification runs are always
+/// denied; Worker Attempts reach only the configured brokered destinations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkPolicy {
+    Denied,
+    Brokered,
 }
 
 impl<'a> Sandbox<'a> {
     fn create(
         runtime: &'a ContainedCodexRuntime,
         name: &str,
-        policy_path: &Path,
-        provider: &str,
+        attempt_id: &str,
+        policy: NetworkPolicy,
         deadline: i64,
     ) -> Result<Self, TyrionError> {
-        let mut arguments = vec![
-            "sandbox",
-            "create",
-            "--name",
-            name,
-            "--from",
-            &runtime.config.base_image,
-            "--policy",
-            path_text(policy_path)?,
-        ];
-        arguments.extend(["--provider", provider]);
-        arguments.extend([
-            "--no-auto-providers",
-            "--cpu",
-            "2",
-            "--memory",
-            "2Gi",
-            "--no-tty",
-            "--",
-            "true",
-        ]);
-        if let Err(error) = runtime.openshell_checked(&arguments, deadline) {
-            let _ = runtime.delete_sandbox(name);
-            return Err(error);
-        }
-        Ok(Self {
+        let network = match (policy, runtime.config.egress.as_ref()) {
+            (NetworkPolicy::Brokered, Some(egress)) => Some(AttemptNetwork::create(
+                runtime, name, attempt_id, egress, deadline,
+            )?),
+            _ => None,
+        };
+        let mut sandbox = Self {
             runtime,
             name: name.to_owned(),
+            network,
             deleted: false,
-        })
+        };
+        if let Err(error) = sandbox.start(attempt_id, deadline) {
+            sandbox.discard();
+            return Err(error);
+        }
+        Ok(sandbox)
     }
 
+    fn start(&mut self, attempt_id: &str, deadline: i64) -> Result<(), TyrionError> {
+        let config = &self.runtime.config;
+        let label = format!("{ATTEMPT_LABEL}={attempt_id}");
+        let memory = format!("{}m", config.memory_mib);
+        let cpus = config.vcpus.to_string();
+        let cpuset = format!("0-{}", config.vcpus.saturating_sub(1));
+        let pids = config.max_processes.to_string();
+        let tmpfs = format!(
+            "type=tmpfs,destination={SANDBOX_ROOT},tmpfs-size={},tmpfs-mode=1777",
+            config
+                .writable_storage_mib
+                .saturating_mul(1024)
+                .saturating_mul(1024)
+        );
+        let home = format!("HOME={SANDBOX_ROOT}");
+        let tmpdir = format!("TMPDIR={SANDBOX_ROOT}/tmp");
+        let xdg = format!("XDG_CONFIG_HOME={SANDBOX_ROOT}/.config");
+        let workspace = format!("TYRION_WORKSPACE_ROOT={SANDBOX_ROOT}");
+        // The container outlives no Worker Lease: it exits on its own when the
+        // lease does, which bounds its lifetime even if Tyrion itself is lost.
+        let lifetime = deadline
+            .saturating_sub(unix_timestamp()?)
+            .clamp(1, 86_400)
+            .to_string();
+        let network = match &self.network {
+            Some(network) => network.internal.clone(),
+            None => "none".to_owned(),
+        };
+        let mut arguments = vec![
+            "run",
+            "--detach",
+            "--name",
+            &self.name,
+            "--label",
+            &label,
+            "--network",
+            &network,
+            "--read-only",
+            "--pids-limit",
+            &pids,
+            "--memory",
+            &memory,
+            "--memory-swap",
+            &memory,
+            "--cpus",
+            &cpus,
+            "--cpuset-cpus",
+            &cpuset,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            // Docker Desktop leaves seccomp unconfined unless it is asked for.
+            "--security-opt",
+            "seccomp=builtin",
+            "--user",
+            "65534:65534",
+            "--mount",
+            &tmpfs,
+            "--workdir",
+            SANDBOX_ROOT,
+            "--env",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "--env",
+            &home,
+            "--env",
+            &tmpdir,
+            "--env",
+            &xdg,
+            "--env",
+            &workspace,
+        ];
+        let aliases = self
+            .network
+            .as_ref()
+            .map(AttemptNetwork::host_aliases)
+            .unwrap_or_default();
+        for alias in &aliases {
+            arguments.extend(["--add-host", alias]);
+        }
+        arguments.extend([config.worker_image.as_str(), "sleep", &lifetime]);
+        self.runtime.docker_checked(&arguments, deadline)?;
+        // The image that actually launched, not the one that was requested.
+        let launched = self
+            .runtime
+            .docker_checked(&["inspect", "--format", "{{.Image}}", &self.name], deadline)?;
+        let launched = String::from_utf8_lossy(&launched.stdout).trim().to_owned();
+        if launched != config.worker_image_id {
+            return Err(TyrionError::SecurityInvariantViolation(format!(
+                "sandbox launched image {launched}, not the pinned Worker image {}",
+                config.worker_image_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stream a host file in. `docker cp` is deliberately unused: on Docker
+    /// Desktop it reports success while writing underneath a tmpfs mount
+    /// instead of into it.
     fn upload(&self, local: &Path, remote: &str, deadline: i64) -> Result<(), TyrionError> {
-        self.runtime.openshell_checked(
-            &["sandbox", "upload", &self.name, path_text(local)?, remote],
-            deadline,
-        )?;
+        let source = File::open(local)?;
+        let quoted = shell_quote(remote);
+        let script = format!("set -eu; mkdir -p \"$(dirname {quoted})\"; cat > {quoted}");
+        let mut command = self.runtime.docker_command(&[
+            "exec",
+            "--interactive",
+            &self.name,
+            "sh",
+            "-c",
+            &script,
+        ]);
+        command.stdin(Stdio::from(source));
+        require_success("Docker sandbox upload", run_until(command, deadline)?)?;
         Ok(())
     }
 
     fn download(&self, remote: &str, local: &Path, deadline: i64) -> Result<(), TyrionError> {
-        self.runtime.openshell_checked(
-            &["sandbox", "download", &self.name, remote, path_text(local)?],
-            deadline,
-        )?;
+        let destination = File::create(local)?;
+        let script = format!("set -eu; cat {}", shell_quote(remote));
+        let mut command = self
+            .runtime
+            .docker_command(&["exec", &self.name, "sh", "-c", &script]);
+        command.stdout(Stdio::from(destination));
+        require_success("Docker sandbox download", run_until(command, deadline)?)?;
         Ok(())
     }
 
@@ -1114,7 +1276,7 @@ impl<'a> Sandbox<'a> {
         deadline: i64,
     ) -> Result<Output, TyrionError> {
         let output = self.exec(argv, workdir, deadline)?;
-        require_success("OpenShell sandbox command", output)
+        require_success("Docker sandbox command", output)
     }
 
     fn exec(
@@ -1123,45 +1285,96 @@ impl<'a> Sandbox<'a> {
         workdir: Option<&str>,
         deadline: i64,
     ) -> Result<Output, TyrionError> {
-        let mut arguments = vec!["sandbox", "exec", "-n", &self.name];
+        let mut arguments = vec!["exec"];
         if let Some(workdir) = workdir {
             arguments.extend(["--workdir", workdir]);
         }
-        arguments.extend(["--no-tty", "--"]);
+        arguments.push(&self.name);
         arguments.extend(argv.iter().copied());
-        self.runtime.openshell(&arguments, deadline)
+        self.runtime.docker(&arguments, deadline)
     }
 
+    /// The one execution that may carry a provider credential. It is scoped to
+    /// this single command, never to the container.
+    fn exec_credentialed(&self, argv: &[&str], deadline: i64) -> Result<Output, TyrionError> {
+        ensure_lease_active(deadline)?;
+        let credentials = self.runtime.credential_arguments();
+        let mut arguments = vec!["exec"];
+        arguments.extend(credentials.iter().map(String::as_str));
+        arguments.push(&self.name);
+        arguments.extend(argv.iter().copied());
+        let mut command = self.runtime.docker_command(&arguments);
+        self.runtime.apply_credentials(&mut command);
+        require_success(
+            "Docker credentialed sandbox command",
+            run_until(command, deadline)?,
+        )
+    }
+
+    /// Prove the boundary from inside it before any Worker code runs. Each
+    /// ceiling is read from the container's own cgroup, which the Docker
+    /// daemon set from outside and mounts read-only.
     fn preflight(
         &self,
         repository: &Path,
         data_dir: &Path,
         deadline: i64,
     ) -> Result<(), TyrionError> {
+        let config = &self.runtime.config;
         let host_repository = shell_quote(path_text(repository)?);
         let host_repository_parent = repository.parent().ok_or_else(|| {
             TyrionError::InvalidRequest("repository must have a parent directory".into())
         })?;
         let host_repository_parent = shell_quote(path_text(host_repository_parent)?);
         let host_state = shell_quote(path_text(data_dir)?);
+        let pids = config.max_processes;
+        let cpu_quota = u64::from(config.vcpus).saturating_mul(100_000);
+        let vcpus = config.vcpus;
+        let memory_bytes = config.memory_mib.saturating_mul(1024).saturating_mul(1024);
+        let storage_kib = config.writable_storage_mib.saturating_mul(1024);
         let probe = format!(
-            "set -eu; printf tyrion-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; memory_kib=$(awk '/MemTotal/ {{print $2}}' /proc/meminfo); test \"$memory_kib\" -ge 1900000; test \"$memory_kib\" -le 2097152; storage_kib=$(df -Pk /sandbox | awk 'NR==2 {{print $2}}'); test \"$storage_kib\" -le 4194304; test ! -e {host_repository}; test ! -e {host_repository_parent}; test ! -e {host_state}; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test ! -e /home/sandbox/.codex; test ! -e /home/sandbox/.claude; test ! -e /home/sandbox/.pi; test -z \"${{OPENAI_API_KEY:-}}${{ANTHROPIC_API_KEY:-}}${{GEMINI_API_KEY:-}}${{XAI_API_KEY:-}}${{GROQ_API_KEY:-}}${{OPENROUTER_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; test ! -r /opt/openshell/auth/sandbox.jwt; test ! -r /opt/openshell/tls/tls.key; if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; printf allowed >/sandbox/tyrion-probe; command -v curl >/dev/null; if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; sleep 600 >/dev/null 2>&1 & descendant=$!; kill -0 \"$descendant\"; printf descendant-live"
+            "set -eu; \
+             printf tyrion-containment-probe; \
+             test \"$(cat /sys/fs/cgroup/pids.max)\" = {pids}; \
+             test \"$(cat /sys/fs/cgroup/memory.max)\" = {memory_bytes}; \
+             test \"$(cat /sys/fs/cgroup/memory.swap.max)\" = 0; \
+             test \"$(cat /sys/fs/cgroup/cpu.max)\" = '{cpu_quota} 100000'; \
+             test \"$(nproc)\" = {vcpus}; \
+             test \"$(df -Pk {SANDBOX_ROOT} | awk 'NR==2 {{print $2}}')\" -le {storage_kib}; \
+             if printf 512 >/sys/fs/cgroup/pids.max 2>/dev/null; then exit 90; fi; \
+             if printf denied >/etc/tyrion-probe 2>/dev/null; then exit 91; fi; \
+             printf allowed >{SANDBOX_ROOT}/tyrion-probe; \
+             test \"$(awk '/^CapEff:/ {{print $2}}' /proc/self/status)\" = 0000000000000000; \
+             test \"$(awk '/^NoNewPrivs:/ {{print $2}}' /proc/self/status)\" = 1; \
+             test \"$(awk '/^Seccomp:/ {{print $2}}' /proc/self/status)\" != 0; \
+             test \"$(id -u)\" != 0; \
+             test ! -e {host_repository}; \
+             test ! -e {host_repository_parent}; \
+             test ! -e {host_state}; \
+             test ! -e /var/run/docker.sock; \
+             test ! -e /run/containerd/containerd.sock; \
+             test ! -e \"$HOME/.ssh\"; \
+             test ! -e \"$HOME/.aws\"; \
+             test ! -e \"$HOME/.config/gh\"; \
+             test ! -e \"$HOME/.codex\"; \
+             test ! -e \"$HOME/.claude\"; \
+             test ! -e \"$HOME/.pi\"; \
+             test -z \"${{OPENAI_API_KEY:-}}${{ANTHROPIC_API_KEY:-}}${{GEMINI_API_KEY:-}}${{XAI_API_KEY:-}}${{GROQ_API_KEY:-}}${{OPENROUTER_API_KEY:-}}${{AWS_ACCESS_KEY_ID:-}}${{GH_TOKEN:-}}${{GITHUB_TOKEN:-}}${{SSH_AUTH_SOCK:-}}\"; \
+             if awk '$5 != \"/\" && $5 !~ /^\\/(proc|sys|dev|sandbox)/ && $5 !~ /^\\/etc\\/(hosts|hostname|resolv.conf)$/ {{ print }}' /proc/self/mountinfo | grep -q .; then exit 93; fi; \
+             if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 92; fi; \
+             sleep 600 >/dev/null 2>&1 & descendant=$!; \
+             kill -0 \"$descendant\"; \
+             printf descendant-live"
         );
-        self.exec_checked(&["sh", "-c", &probe], None, deadline)
+        let output = self
+            .exec(&["sh", "-c", &probe], None, deadline)
             .map_err(|error| TyrionError::SecurityInvariantViolation(error.to_string()))?;
-        let logs = self
-            .runtime
-            .openshell(&["logs", &self.name, "-n", "300"], deadline)
-            .map_err(|error| TyrionError::SecurityInvariantViolation(error.to_string()))?;
-        let logs = require_success("OpenShell logs", logs)
-            .map_err(|error| TyrionError::SecurityInvariantViolation(error.to_string()))?;
-        let logs = String::from_utf8_lossy(&logs.stdout);
-        if !logs.contains("Landlock ruleset built")
-            || logs.contains("runtime cgroup pids.max is unavailable")
-        {
-            return Err(TyrionError::SecurityInvariantViolation(
-                "OpenShell did not attest the hard Landlock and process boundary".into(),
-            ));
+        if !output.status.success() {
+            return Err(TyrionError::SecurityInvariantViolation(format!(
+                "Docker containment preflight failed with status {}: {}",
+                output.status.code().unwrap_or(-1),
+                truncate(&String::from_utf8_lossy(&output.stderr), 4096)
+            )));
         }
         Ok(())
     }
@@ -1207,7 +1420,8 @@ impl<'a> Sandbox<'a> {
             });
         }
         let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = self.exec(&borrowed, Some("/sandbox/repository"), deadline)?;
+        let workdir = format!("{SANDBOX_ROOT}/repository");
+        let output = self.exec(&borrowed, Some(&workdir), deadline)?;
         let observed = format!(
             "exit={}; stdout={}; stderr={}",
             output.status.code().unwrap_or(-1),
@@ -1240,66 +1454,304 @@ impl<'a> Sandbox<'a> {
     }
 
     fn delete(mut self) -> Result<(), TyrionError> {
-        self.runtime.delete_sandbox(&self.name)?;
+        self.runtime.delete_container(&self.name)?;
+        if let Some(network) = self.network.take() {
+            network.delete()?;
+        }
         self.deleted = true;
         Ok(())
+    }
+
+    /// Best-effort teardown for a sandbox that failed before it was usable.
+    fn discard(&mut self) {
+        if self.deleted {
+            return;
+        }
+        let _ = self.runtime.delete_container(&self.name);
+        if let Some(network) = self.network.take() {
+            let _ = network.delete();
+        }
+        self.deleted = true;
     }
 }
 
 impl Drop for Sandbox<'_> {
     fn drop(&mut self) {
-        if !self.deleted {
-            let _ = self.runtime.delete_sandbox(&self.name);
-        }
+        self.discard();
     }
 }
 
-impl ContainedCodexRuntime {
-    fn openshell(&self, arguments: &[&str], deadline: i64) -> Result<Output, TyrionError> {
-        ensure_lease_active(deadline)?;
-        let mut command = Command::new(&self.config.openshell_binary);
-        command
-            .args(arguments)
-            .env_clear()
-            .env("XDG_CONFIG_HOME", &self.config.openshell_config_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        run_until(command, deadline)
+/// A per-Attempt internal bridge plus one destination-pinned relay for each
+/// authorized destination. The bridge has no route off itself, so the relays
+/// are the only way out and each reaches exactly one `host:port`.
+struct AttemptNetwork<'a> {
+    runtime: &'a ContainedCodexRuntime,
+    internal: String,
+    egress: String,
+    relays: Vec<String>,
+    aliases: Vec<String>,
+}
+
+impl<'a> AttemptNetwork<'a> {
+    fn create(
+        runtime: &'a ContainedCodexRuntime,
+        name: &str,
+        attempt_id: &str,
+        egress: &EgressConfig,
+        deadline: i64,
+    ) -> Result<Self, TyrionError> {
+        let label = format!("{ATTEMPT_LABEL}={attempt_id}");
+        let mut network = Self {
+            runtime,
+            internal: format!("{name}-net"),
+            egress: format!("{name}-out"),
+            relays: Vec::new(),
+            aliases: Vec::new(),
+        };
+        if let Err(error) = network.build(&label, egress, deadline) {
+            let _ = network.remove();
+            return Err(error);
+        }
+        Ok(network)
     }
 
-    fn openshell_checked(&self, arguments: &[&str], deadline: i64) -> Result<Output, TyrionError> {
-        let output = self.openshell(arguments, deadline)?;
-        require_success("OpenShell", output)
+    fn build(
+        &mut self,
+        label: &str,
+        egress: &EgressConfig,
+        deadline: i64,
+    ) -> Result<(), TyrionError> {
+        self.runtime.docker_checked(
+            &[
+                "network",
+                "create",
+                "--internal",
+                "--label",
+                label,
+                &self.internal,
+            ],
+            deadline,
+        )?;
+        self.runtime.docker_checked(
+            &["network", "create", "--label", label, &self.egress],
+            deadline,
+        )?;
+        for (index, destination) in egress.destinations.iter().enumerate() {
+            let relay = format!("{}-r{index}", self.internal);
+            let port = destination.port.to_string();
+            // The relay starts on the egress bridge so it can reach the
+            // destination, and is only then joined to the Worker's bridge.
+            self.runtime.docker_checked(
+                &[
+                    "run",
+                    "--detach",
+                    "--name",
+                    &relay,
+                    "--label",
+                    label,
+                    "--network",
+                    &self.egress,
+                    "--read-only",
+                    "--pids-limit",
+                    "64",
+                    "--memory",
+                    "128m",
+                    "--memory-swap",
+                    "128m",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--security-opt",
+                    "seccomp=builtin",
+                    "--user",
+                    "65534:65534",
+                    &self.runtime.config.worker_image,
+                    "python3",
+                    "-c",
+                    RELAY_SOURCE,
+                    &destination.host,
+                    &port,
+                ],
+                deadline,
+            )?;
+            self.relays.push(relay.clone());
+            self.runtime
+                .docker_checked(&["network", "connect", &self.internal, &relay], deadline)?;
+            self.await_ready(&relay, deadline)?;
+            let address = self.runtime.docker_checked(
+                &[
+                    "inspect",
+                    "--format",
+                    &format!(
+                        "{{{{(index .NetworkSettings.Networks \"{}\").IPAddress}}}}",
+                        self.internal
+                    ),
+                    &relay,
+                ],
+                deadline,
+            )?;
+            let address = String::from_utf8_lossy(&address.stdout).trim().to_owned();
+            if address.is_empty() {
+                return Err(TyrionError::SecurityInvariantViolation(
+                    "brokered egress relay has no address on the Attempt network".into(),
+                ));
+            }
+            self.aliases.push(format!("{}:{address}", destination.host));
+        }
+        Ok(())
     }
 
-    fn delete_sandbox(&self, name: &str) -> Result<(), TyrionError> {
-        let deadline = unix_timestamp()?.saturating_add(15);
-        self.openshell_checked(&["sandbox", "delete", name], deadline)?;
+    fn await_ready(&self, relay: &str, deadline: i64) -> Result<(), TyrionError> {
+        loop {
+            let logs = self
+                .runtime
+                .docker_checked(&["logs", relay], deadline.min(unix_timestamp()? + 60))?;
+            if String::from_utf8_lossy(&logs.stderr).contains("tyrion-relay-ready")
+                || String::from_utf8_lossy(&logs.stdout).contains("tyrion-relay-ready")
+            {
+                return Ok(());
+            }
+            if unix_timestamp()? >= deadline {
+                return Err(TyrionError::WorkerLeaseExpired {
+                    operation: "while a brokered egress relay was starting",
+                });
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn host_aliases(&self) -> Vec<&str> {
+        self.aliases.iter().map(String::as_str).collect()
+    }
+
+    fn delete(mut self) -> Result<(), TyrionError> {
+        self.remove()
+    }
+
+    fn remove(&mut self) -> Result<(), TyrionError> {
+        let deadline = unix_timestamp()?.saturating_add(60);
+        for relay in std::mem::take(&mut self.relays) {
+            self.runtime.delete_container(&relay)?;
+        }
+        for network in [self.egress.clone(), self.internal.clone()] {
+            let output = self
+                .runtime
+                .docker(&["network", "rm", &network], deadline)?;
+            if !output.status.success() && !reports_missing(&output.stderr) {
+                return Err(command_failure(
+                    "Docker network removal",
+                    output.status,
+                    &output.stderr,
+                ));
+            }
+        }
         Ok(())
     }
 }
 
+impl ContainedCodexRuntime {
+    fn docker(&self, arguments: &[&str], deadline: i64) -> Result<Output, TyrionError> {
+        ensure_lease_active(deadline)?;
+        run_until(self.docker_command(arguments), deadline)
+    }
+
+    fn docker_checked(&self, arguments: &[&str], deadline: i64) -> Result<Output, TyrionError> {
+        let output = self.docker(arguments, deadline)?;
+        require_success("Docker", output)
+    }
+
+    /// Every Docker invocation runs with a cleared environment, an explicit
+    /// daemon address rather than an ambient context, and a Tyrion-owned CLI
+    /// configuration that carries no registry credential.
+    fn docker_command(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.config.docker_binary);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("PATH", DOCKER_PATH)
+            .env("DOCKER_HOST", &self.config.docker_host)
+            .env("DOCKER_CONFIG", self.data_dir.join("docker"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Forward the declared credentials by name only. Docker reads each value
+    /// from this process, so it never appears in a command line, in the
+    /// container's persistent environment, or in Tyrion's durable state.
+    fn credential_arguments(&self) -> Vec<String> {
+        self.config
+            .worker_credentials
+            .iter()
+            .flat_map(|variable| ["--env".to_owned(), variable.clone()])
+            .collect()
+    }
+
+    fn apply_credentials(&self, command: &mut Command) {
+        for variable in &self.config.worker_credentials {
+            if let Some(value) = std::env::var_os(variable) {
+                command.env(variable, value);
+            }
+        }
+    }
+
+    /// Remove a container and confirm its absence independently. `docker exec`
+    /// is never used as a liveness probe because it restarts a stopped
+    /// container.
+    fn delete_container(&self, name: &str) -> Result<(), TyrionError> {
+        let deadline = unix_timestamp()?.saturating_add(60);
+        let removal = self.docker(&["rm", "--force", "--volumes", name], deadline)?;
+        if !removal.status.success() && !reports_missing(&removal.stderr) {
+            return Err(command_failure(
+                "Docker container removal",
+                removal.status,
+                &removal.stderr,
+            ));
+        }
+        let present = self.docker(&["inspect", "--type", "container", name], deadline)?;
+        if present.status.success() {
+            return Err(TyrionError::SecurityInvariantViolation(format!(
+                "Docker container {name} survived forced removal"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn reports_missing(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    stderr.contains("no such container") || stderr.contains("not found")
+}
+
+fn text_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
-    if config.openshell_version != "openshell 0.0.104"
-        || config.codex_version != CODEX_VERSION
-        || config.source_revision != SOURCE_REVISION
-        || config.source_patch_sha256 != SOURCE_PATCH_SHA256
-        || config.base_image != BASE_IMAGE
-        || config.policy_sha256 != POLICY_SHA256
-    {
+    if config.codex_version != CODEX_VERSION {
         return Err(TyrionError::InvalidRequest(
-            "Codex Worker configuration does not match the pinned repaired OpenShell profile"
-                .into(),
+            "Codex Worker configuration does not match the pinned Codex version".into(),
         ));
     }
     if config.vcpus != 2
-        || config.memory_mib != 2048
-        || config.overlay_disk_mib != 4096
+        || config.memory_mib != 6144
+        || config.writable_storage_mib != 4096
         || config.max_processes != 256
     {
         return Err(TyrionError::InvalidRequest(
-            "Codex Worker configuration must use 2 vCPUs, 2048 MiB memory, 4096 MiB overlay, and 256 processes".into(),
+            "Worker containment must use 2 vCPUs, 6144 MiB combined memory, 4096 MiB writable storage, and 256 processes".into(),
+        ));
+    }
+    if config.writable_storage_mib >= config.memory_mib {
+        return Err(TyrionError::InvalidRequest(
+            "the writable tmpfs is charged to the memory cgroup and must be smaller than it".into(),
         ));
     }
     if config.lease_ttl_seconds == 0 || config.lease_ttl_seconds > 3600 {
@@ -1307,97 +1759,139 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
             "Worker Lease TTL must be between 1 and 3600 seconds".into(),
         ));
     }
-    if config.model.trim().is_empty() || config.runtime_artifacts.is_empty() {
+    if config.model.trim().is_empty() {
         return Err(TyrionError::InvalidRequest(
-            "Codex model and pinned runtime artifacts are required".into(),
+            "Codex model is required".into(),
         ));
     }
-    if config.openshell_provider.trim().is_empty() {
+    if config.docker_host.trim().is_empty() {
         return Err(TyrionError::InvalidRequest(
-            "OpenShell provider name must not be empty".into(),
+            "an explicit Docker daemon address is required; Tyrion never resolves an ambient context".into(),
         ));
     }
-    verify_hash(&config.openshell_binary, &config.openshell_sha256)?;
-    verify_hash(&config.policy_path, &config.policy_sha256)?;
-    verify_hash(&config.gateway_config_path, &config.gateway_config_sha256)?;
-    verify_hash(&config.kernel_config_path, &config.kernel_config_sha256)?;
-    verify_hash(&config.source_patch_path, &config.source_patch_sha256)?;
-    verify_hash(&config.codex_binary, &config.codex_sha256)?;
-    if let Some(claude) = &config.claude {
-        if claude.policy_sha256 != CLAUDE_POLICY_SHA256
-            || claude.openshell_provider.trim().is_empty()
-            || claude.version.trim().is_empty()
-        {
+    if !is_digest_pinned(&config.worker_image) {
+        return Err(TyrionError::InvalidRequest(
+            "the Worker image must be pinned by an exact sha256 registry digest".into(),
+        ));
+    }
+    if !is_image_id(&config.worker_image_id) {
+        return Err(TyrionError::InvalidRequest(
+            "the expected Worker image identity must be a lowercase sha256 digest".into(),
+        ));
+    }
+    if let Some(egress) = &config.egress {
+        if egress.destinations.is_empty() {
             return Err(TyrionError::InvalidRequest(
-                "Claude runtime does not match the pinned OpenShell profile".into(),
+                "brokered egress must name at least one destination or be omitted".into(),
             ));
         }
-        verify_hash(&claude.policy_path, &claude.policy_sha256)?;
+        for destination in &egress.destinations {
+            if destination.host.trim().is_empty()
+                || destination.host.contains(char::is_whitespace)
+                || destination.port == 0
+            {
+                return Err(TyrionError::InvalidRequest(
+                    "each brokered egress destination needs a host and a nonzero port".into(),
+                ));
+            }
+        }
+    }
+    for variable in &config.worker_credentials {
+        if variable.trim().is_empty()
+            || !variable
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(TyrionError::InvalidRequest(
+                "each forwarded Worker credential must name one environment variable".into(),
+            ));
+        }
+        if std::env::var_os(variable).is_none() {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Worker credential {variable} is not present in the daemon environment"
+            )));
+        }
+    }
+    verify_hash(&config.docker_binary, &config.docker_sha256)?;
+    verify_hash(&config.codex_binary, &config.codex_sha256)?;
+    if let Some(claude) = &config.claude {
+        if claude.version.trim().is_empty() {
+            return Err(TyrionError::InvalidRequest(
+                "the Claude runtime profile requires a pinned version".into(),
+            ));
+        }
         verify_hash(&claude.binary, &claude.sha256)?;
     }
     if let Some(pi) = &config.pi {
-        if pi.policy_sha256 != PI_POLICY_SHA256
-            || pi.openshell_provider.trim().is_empty()
-            || pi.model_provider != "openai"
+        if pi.model_provider != "openai"
             || !pi.model.starts_with("openai/")
             || pi.model.len() == "openai/".len()
             || pi.version.trim().is_empty()
         {
             return Err(TyrionError::InvalidRequest(
-                "Pi runtime does not match the pinned OpenShell profile".into(),
+                "the Pi runtime profile requires the qualified OpenAI provider and model".into(),
             ));
         }
-        verify_hash(&pi.policy_path, &pi.policy_sha256)?;
         verify_hash(&pi.binary, &pi.sha256)?;
     }
-    for artifact in &config.runtime_artifacts {
-        verify_hash(&artifact.path, &artifact.sha256)?;
-    }
-    let gateway = fs::read_to_string(&config.gateway_config_path)?;
-    for required in [
-        "compute_drivers = [\"vm\"]",
-        "enabled = true",
-        "vcpus = 2",
-        "mem_mib = 2048",
-        "overlay_disk_mib = 4096",
-    ] {
-        if !gateway.lines().any(|line| line.trim() == required) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "gateway configuration is missing {required}"
-            )));
-        }
-    }
-    let kernel = fs::read_to_string(&config.kernel_config_path)?;
-    validate_kernel_config(&kernel)?;
-    let openshell = Command::new(&config.openshell_binary)
+    let version = Command::new(&config.docker_binary)
         .arg("--version")
         .env_clear()
-        .env("XDG_CONFIG_HOME", &config.openshell_config_home)
+        .env("PATH", DOCKER_PATH)
+        .env("DOCKER_HOST", &config.docker_host)
         .output()?;
-    let openshell = require_success("OpenShell version probe", openshell)?;
-    if String::from_utf8_lossy(&openshell.stdout).trim() != config.openshell_version {
+    let version = require_success("Docker version probe", version)?;
+    if String::from_utf8_lossy(&version.stdout).trim() != config.docker_version {
         return Err(TyrionError::InvalidRequest(
-            "OpenShell binary version does not match its pin".into(),
+            "the Docker CLI version does not match its pin".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_kernel_config(kernel: &str) -> Result<(), TyrionError> {
-    for required in [
-        "CONFIG_SECURITY=y",
-        "CONFIG_SECURITY_LANDLOCK=y",
-        "CONFIG_LSM=\"landlock,lockdown,yama,integrity\"",
-        "CONFIG_CGROUP_PIDS=y",
-        "CONFIG_SECCOMP_FILTER=y",
-    ] {
-        if !kernel.lines().any(|line| line == required) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "kernel configuration is missing {required}"
-            )));
-        }
+/// The Worker image must be present locally and must be exactly the pinned
+/// one. Tyrion never pulls, so provisioning stays an explicit operator step.
+fn validate_worker_image(config: &RuntimeConfig, data_dir: &Path) -> Result<(), TyrionError> {
+    let resolved = Command::new(&config.docker_binary)
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            &config.worker_image,
+        ])
+        .env_clear()
+        .env("PATH", DOCKER_PATH)
+        .env("DOCKER_HOST", &config.docker_host)
+        .env("DOCKER_CONFIG", data_dir.join("docker"))
+        .output()?;
+    let resolved = require_success("Docker Worker image probe", resolved)?;
+    let resolved = String::from_utf8_lossy(&resolved.stdout).trim().to_owned();
+    if resolved != config.worker_image_id {
+        return Err(TyrionError::InvalidRequest(format!(
+            "the provisioned Worker image is {resolved}, not the pinned {}",
+            config.worker_image_id
+        )));
     }
     Ok(())
+}
+
+fn is_digest_pinned(reference: &str) -> bool {
+    match reference.split_once("@sha256:") {
+        Some((repository, digest)) => !repository.is_empty() && is_hex64(digest),
+        None => false,
+    }
+}
+
+fn is_image_id(identity: &str) -> bool {
+    identity.strip_prefix("sha256:").is_some_and(is_hex64)
+}
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn create_base_bundle(repository: &Path, base: &str, bundle: &Path) -> Result<(), TyrionError> {
@@ -1583,35 +2077,34 @@ fn validate_candidate_bundle(
     })
 }
 
-fn attempt_script(base_revision: &str, model: &str, allow_empty_changes: bool) -> String {
-    let auth_setup = r#": "${CODEX_AUTH_ACCESS_TOKEN:?missing brokered Codex access placeholder}"
-: "${CODEX_AUTH_REFRESH_TOKEN:?missing brokered Codex refresh placeholder}"
-: "${CODEX_AUTH_ACCOUNT_ID:?missing brokered Codex account placeholder}"
-: "${CODEX_AUTH_ID_TOKEN:?missing brokered Codex identity placeholder}"
-for value in "$CODEX_AUTH_ACCESS_TOKEN" "$CODEX_AUTH_REFRESH_TOKEN" "$CODEX_AUTH_ACCOUNT_ID" "$CODEX_AUTH_ID_TOKEN"; do
-  case "$value" in
-    openshell:resolve:env:*) ;;
-    *) echo 'OpenShell exposed a raw Codex credential' >&2; exit 42 ;;
-  esac
+/// The direct Codex slice. Credentials reach it only as the named variables
+/// the Principal declared, delivered by Docker for this one execution.
+fn attempt_script(
+    base_revision: &str,
+    model: &str,
+    allow_empty_changes: bool,
+    credentials: &[String],
+) -> String {
+    let names = credentials.join(" ");
+    let auth_setup = if credentials.is_empty() {
+        "codex_credential_env=".to_owned()
+    } else {
+        let forwarded = credentials
+            .iter()
+            .map(|name| format!("{name}=\"${name}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"for name in {names}; do
+  eval "value=\${{$name:-}}"
+  if [ -z "$value" ]; then
+    echo "missing brokered Worker credential $name" >&2
+    exit 42
+  fi
 done
-mkdir -p "$root/home/.codex"
-last_refresh=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-cat >"$root/home/.codex/auth.json" <<AUTH
-{
-  "auth_mode": "chatgpt",
-  "OPENAI_API_KEY": null,
-  "tokens": {
-    "id_token": "e30.e30.placeholder",
-    "access_token": "$CODEX_AUTH_ACCESS_TOKEN",
-    "refresh_token": "$CODEX_AUTH_REFRESH_TOKEN",
-    "account_id": "$CODEX_AUTH_ACCOUNT_ID"
-  },
-  "last_refresh": "$last_refresh"
-}
-AUTH
-chmod 600 "$root/home/.codex/auth.json"
-codex_auth_env="CODEX_AUTH_ACCESS_TOKEN=$CODEX_AUTH_ACCESS_TOKEN CODEX_AUTH_REFRESH_TOKEN=$CODEX_AUTH_REFRESH_TOKEN CODEX_AUTH_ACCOUNT_ID=$CODEX_AUTH_ACCOUNT_ID CODEX_AUTH_ID_TOKEN=$CODEX_AUTH_ID_TOKEN"
-"#;
+codex_credential_env="{forwarded}""#
+        )
+    };
     let empty_change_action = if allow_empty_changes {
         "git -C \"$root/repository\" commit --allow-empty -qm 'test: record read-only assignment'"
     } else {
@@ -1626,12 +2119,8 @@ chmod 700 "$root/home"
 git clone -q "$root/base.bundle" "$root/repository"
 git -C "$root/repository" checkout -q --detach {base}
 {auth_setup}
-env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/home/.codex" $codex_auth_env \
-  ALL_PROXY="${{ALL_PROXY:-}}" HTTP_PROXY="${{HTTP_PROXY:-}}" HTTPS_PROXY="${{HTTPS_PROXY:-}}" NO_PROXY="${{NO_PROXY:-}}" \
-  http_proxy="${{http_proxy:-}}" https_proxy="${{https_proxy:-}}" no_proxy="${{no_proxy:-}}" grpc_proxy="${{grpc_proxy:-}}" \
-  SSL_CERT_FILE="${{SSL_CERT_FILE:-}}" CURL_CA_BUNDLE="${{CURL_CA_BUNDLE:-}}" GIT_SSL_CAINFO="${{GIT_SSL_CAINFO:-}}" \
-  REQUESTS_CA_BUNDLE="${{REQUESTS_CA_BUNDLE:-}}" NODE_EXTRA_CA_CERTS="${{NODE_EXTRA_CA_CERTS:-}}" \
-  NODE_USE_ENV_PROXY="${{NODE_USE_ENV_PROXY:-}}" DENO_CERT="${{DENO_CERT:-}}" \
+env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/home/.codex" \
+  TMPDIR="$root/tmp" $codex_credential_env \
   "$root/codex" exec --json --ephemeral --ignore-user-config \
   --dangerously-bypass-approvals-and-sandbox -C "$root/repository" \
   --model {model} --output-schema "$root/result-schema.json" \
@@ -1815,14 +2304,18 @@ fn git_output(directory: Option<&Path>, arguments: &[OsString]) -> Result<Output
 fn run_until(mut command: Command, deadline: i64) -> Result<Output, TyrionError> {
     ensure_lease_active(deadline)?;
     let mut child = command.spawn()?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        TyrionError::InvalidRequest("contained command stdout was not piped".into())
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        TyrionError::InvalidRequest("contained command stderr was not piped".into())
-    })?;
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
+    // Transfers redirect one stream straight to a file, so neither reader is
+    // guaranteed to exist.
+    // Short Docker commands dominate the seam, so poll quickly and back off.
+    let mut poll_interval = Duration::from_micros(200);
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_all(stdout)));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_all(stderr)));
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Output {
@@ -1838,7 +2331,8 @@ fn run_until(mut command: Command, deadline: i64) -> Result<Output, TyrionError>
                 operation: "while a contained command was running",
             });
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(poll_interval);
+        poll_interval = (poll_interval * 2).min(Duration::from_millis(20));
     }
 }
 
@@ -1849,8 +2343,11 @@ fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
 }
 
 fn join_reader(
-    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
 ) -> Result<Vec<u8>, TyrionError> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
     reader
         .join()
         .map_err(|_| TyrionError::InvalidRequest("contained output reader panicked".into()))?
@@ -1919,57 +2416,54 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt_script, result_schema, validate_kernel_config};
+    use super::{attempt_script, is_digest_pinned, is_image_id, result_schema};
 
     #[test]
-    fn repaired_kernel_activates_landlock_as_an_lsm() {
-        let inactive = "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n";
-        assert!(validate_kernel_config(inactive).is_err());
-
-        let active = "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n";
-        assert!(validate_kernel_config(active).is_ok());
-    }
-
-    #[test]
-    fn codex_receives_only_the_brokered_network_environment() {
+    fn a_worker_without_declared_credentials_receives_none() {
         let script = attempt_script(
             "0123456789012345678901234567890123456789",
             "test-model",
             false,
+            &[],
         );
-        for required in [
-            "HTTP_PROXY=\"${HTTP_PROXY:-}\"",
-            "HTTPS_PROXY=\"${HTTPS_PROXY:-}\"",
-            "SSL_CERT_FILE=\"${SSL_CERT_FILE:-}\"",
-            "CURL_CA_BUNDLE=\"${CURL_CA_BUNDLE:-}\"",
-            "CODEX_AUTH_ACCESS_TOKEN=$CODEX_AUTH_ACCESS_TOKEN",
+        assert!(script.contains("codex_credential_env="));
+        for absent in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GH_TOKEN",
+            "SSH_AUTH_SOCK",
         ] {
-            assert!(script.contains(required), "missing {required}");
+            assert!(!script.contains(absent), "unexpectedly forwarded {absent}");
         }
-        assert!(!script.contains("AWS_ACCESS_KEY_ID="));
-        assert!(!script.contains("GH_TOKEN="));
-        assert!(!script.contains("SSH_AUTH_SOCK="));
     }
 
     #[test]
-    fn codex_auth_file_is_locally_parseable_without_raw_credentials() {
+    fn declared_credentials_are_required_and_forwarded_by_name() {
         let script = attempt_script(
             "0123456789012345678901234567890123456789",
             "test-model",
             false,
+            &["OPENAI_API_KEY".to_owned()],
         );
-        let auth_file = script
-            .split("cat >\"$root/home/.codex/auth.json\" <<AUTH\n")
-            .nth(1)
-            .and_then(|tail| tail.split("\nAUTH\n").next())
-            .expect("attempt script contains the Codex auth file");
+        assert!(script.contains("for name in OPENAI_API_KEY; do"));
+        assert!(script.contains("missing brokered Worker credential"));
+        assert!(script.contains("codex_credential_env=\"OPENAI_API_KEY=\"$OPENAI_API_KEY\"\""));
+        assert!(!script.contains("openshell:resolve:env:"));
+    }
 
-        assert!(auth_file.contains("\"id_token\": \"e30.e30.placeholder\""));
-        assert!(auth_file.contains("\"last_refresh\": \"$last_refresh\""));
-        assert!(auth_file.contains("\"access_token\": \"$CODEX_AUTH_ACCESS_TOKEN\""));
-        assert!(auth_file.contains("\"account_id\": \"$CODEX_AUTH_ACCOUNT_ID\""));
-        assert!(!auth_file.contains("openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"));
-        assert!(!auth_file.contains("openshell:resolve:env:CODEX_AUTH_ID_TOKEN"));
+    #[test]
+    fn only_a_digest_pinned_worker_image_is_accepted() {
+        let digest = "a".repeat(64);
+        assert!(is_digest_pinned(&format!(
+            "registry.example/worker@sha256:{digest}"
+        )));
+        assert!(!is_digest_pinned("registry.example/worker:latest"));
+        assert!(!is_digest_pinned("registry.example/worker@sha256:short"));
+        assert!(!is_digest_pinned(&format!("@sha256:{digest}")));
+        assert!(is_image_id(&format!("sha256:{digest}")));
+        assert!(!is_image_id(&digest));
+        assert!(!is_image_id(&format!("sha256:{}", "A".repeat(64))));
     }
 
     #[test]

@@ -114,10 +114,10 @@ impl RunningDaemon {
     ) -> Self {
         let socket_path = data_dir.join("tyrion.sock");
         let root = data_dir.parent().unwrap();
-        fs::create_dir_all(root.join("fake-openshell")).unwrap();
-        let fake_openshell = write_executable(
-            &root.join("openshell"),
-            include_str!("fixtures/fake_openshell.sh"),
+        fs::create_dir_all(root.join("fake-docker")).unwrap();
+        let fake_docker = write_executable(
+            &root.join("docker"),
+            include_str!("fixtures/fake_docker.sh"),
         );
         let fake_codex =
             write_executable(&root.join("codex"), include_str!("fixtures/fake_codex.sh"));
@@ -125,7 +125,7 @@ impl RunningDaemon {
             &root.join("claude"),
             include_str!("fixtures/fake_claude.sh"),
         );
-        let worker_config = write_runtime_fixture(root, &fake_openshell, &fake_codex, &fake_claude);
+        let worker_config = write_runtime_fixture(root, &fake_docker, &fake_codex, &fake_claude);
         let mut command = Command::new(env!("CARGO_BIN_EXE_tyriond"));
         command
             .args([
@@ -1123,12 +1123,8 @@ fn selected_claude_adapter_drives_lifecycle_result_usage_and_session_identity() 
         event["type"] == "worker_activity"
             && event["payload"]["activity"] == "Claude produced a structured Result"
     }));
-    let log = fs::read_to_string(temp.path().join("fake-openshell/commands.log")).unwrap();
-    let claude_policy = temp.path().join("hard-claude-policy.yaml");
-    assert!(log.contains(&format!(
-        "--policy {} --provider fixture-claude",
-        path_text(&claude_policy)
-    )));
+    let log = fs::read_to_string(temp.path().join("fake-docker/commands.log")).unwrap();
+    assert!(log.contains("--security-opt seccomp=builtin"));
     assert!(log.contains("/sandbox/claude --version"));
 }
 
@@ -1158,7 +1154,7 @@ fn structured_adapter_descendants_are_reaped_before_trace_collection_finishes() 
         commission_id,
         "verified_complete",
     );
-    let log = fs::read_to_string(temp.path().join("fake-openshell/commands.log")).unwrap();
+    let log = fs::read_to_string(temp.path().join("fake-docker/commands.log")).unwrap();
     assert!(log.contains("descendant-terminated"));
 }
 
@@ -1894,7 +1890,7 @@ fn failed_interrupt_delivery_does_not_interrupt_the_worker_locally() {
         "claude-opus-review",
     );
 
-    wait_for_path(&temp.path().join("fake-openshell/control-pipe-closed"));
+    wait_for_path(&temp.path().join("fake-docker/control-pipe-closed"));
     let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
         .args(["--socket", path_text(&daemon.socket_path)])
         .args([
@@ -2187,8 +2183,8 @@ fn restart_recovers_a_stranded_structured_worker_and_retries() {
                 && attempt["lease"]["status"] == "expired"
                 && attempt["reservation"]["status"] == "revoked"
         }));
-    let log = fs::read_to_string(temp.path().join("fake-openshell/commands.log")).unwrap();
-    assert!(log.contains("sandbox delete"));
+    let log = fs::read_to_string(temp.path().join("fake-docker/commands.log")).unwrap();
+    assert!(log.contains("rm --force"));
     assert!(log.contains("descendant-terminated"));
 }
 
@@ -2589,7 +2585,7 @@ fn worker_catalog() -> Value {
                 "authority_actions": ["deterministic.echo", "codex.git_change"],
                 "authority_scope_types": ["repository", "path", "action"],
                 "assignment_constraints": ["coding"],
-                "containment_profile": "openshell-repaired-v0.0.104",
+                "containment_profile": "docker-hardened-v1",
                 "replacement_class": "deep-coding",
                 "available": true,
                 "metrics": {
@@ -2620,7 +2616,7 @@ fn worker_catalog() -> Value {
                 "authority_actions": ["deterministic.echo", "codex.git_change"],
                 "authority_scope_types": ["repository", "path", "action"],
                 "assignment_constraints": ["coding"],
-                "containment_profile": "openshell-repaired-v0.0.104",
+                "containment_profile": "docker-hardened-v1",
                 "replacement_class": "deep-coding",
                 "available": true,
                 "metrics": {
@@ -2651,7 +2647,7 @@ fn worker_catalog() -> Value {
                 "authority_actions": ["deterministic.echo"],
                 "authority_scope_types": ["action"],
                 "assignment_constraints": ["coding"],
-                "containment_profile": "openshell-repaired-v0.0.104",
+                "containment_profile": "docker-hardened-v1",
                 "replacement_class": "fast-coding",
                 "available": true,
                 "metrics": {
@@ -2682,7 +2678,7 @@ fn worker_catalog() -> Value {
                 "authority_actions": ["deterministic.echo", "codex.git_change"],
                 "authority_scope_types": ["repository", "path", "action"],
                 "assignment_constraints": ["coding"],
-                "containment_profile": "openshell-repaired-v0.0.104",
+                "containment_profile": "docker-hardened-v1",
                 "replacement_class": "deep-coding",
                 "available": true,
                 "metrics": {
@@ -2757,80 +2753,27 @@ fn connect_full_entry(daemon: &RunningDaemon, harness: &str, native_session_id: 
         .to_owned()
 }
 
-fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path, claude: &Path) -> PathBuf {
-    let policy = root.join("hard-policy.yaml");
-    fs::write(
-        &policy,
-        include_bytes!("../runtime/openshell/hard-landlock-policy.yaml"),
-    )
-    .unwrap();
-    let claude_policy = root.join("hard-claude-policy.yaml");
-    fs::write(
-        &claude_policy,
-        include_bytes!("../runtime/openshell/hard-landlock-claude-policy.yaml"),
-    )
-    .unwrap();
-    let pi_policy = root.join("hard-pi-policy.yaml");
-    fs::write(
-        &pi_policy,
-        include_bytes!("../runtime/openshell/hard-landlock-pi-policy.yaml"),
-    )
-    .unwrap();
-    let gateway = root.join("gateway.toml");
-    fs::write(
-        &gateway,
-        "[openshell.gateway]\ncompute_drivers = [\"vm\"]\n\n[openshell.gateway.mtls_auth]\nenabled = true\n\n[openshell.drivers.vm]\nvcpus = 2\nmem_mib = 2048\noverlay_disk_mib = 4096\n",
-    )
-    .unwrap();
-    let kernel = root.join("kernel.config");
-    fs::write(
-        &kernel,
-        "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n",
-    )
-    .unwrap();
-    let runtime_artifact = root.join("libkrunfw.5.dylib");
-    fs::write(&runtime_artifact, b"fixture runtime").unwrap();
-    let config_home = root.join("openshell-config");
-    fs::create_dir_all(&config_home).unwrap();
+fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path) -> PathBuf {
     let config = root.join("codex-worker.json");
     fs::write(
         &config,
         serde_json::to_vec_pretty(&json!({
-            "openshell_binary": openshell,
-            "openshell_sha256": sha256_file(openshell),
-            "openshell_version": "openshell 0.0.104",
-            "openshell_config_home": config_home,
-            "policy_path": policy,
-            "policy_sha256": sha256_file(&policy),
-            "gateway_config_path": gateway,
-            "gateway_config_sha256": sha256_file(&gateway),
-            "kernel_config_path": kernel,
-            "kernel_config_sha256": sha256_file(&kernel),
-            "runtime_artifacts": [{
-                "path": runtime_artifact,
-                "sha256": sha256_file(&runtime_artifact)
-            }],
-            "source_revision": "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354",
-            "source_patch_path": concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/openshell/repaired-v0.0.104.patch"),
-            "source_patch_sha256": "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402",
-            "base_image": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
+            "docker_binary": docker,
+            "docker_sha256": sha256_file(docker),
+            "docker_version": "Docker version 28.0.4, build fixture",
+            "docker_host": "unix:///fixture/docker.sock",
+            "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
+            "worker_image_id": format!("sha256:{}", "1".repeat(64)),
             "codex_binary": codex,
             "codex_version": "codex-cli 0.147.0",
             "codex_sha256": sha256_file(codex),
             "model": "fixture-model",
-            "openshell_provider": "fixture-codex",
             "claude": {
-                "policy_path": claude_policy,
-                "policy_sha256": sha256_file(&claude_policy),
-                "openshell_provider": "fixture-claude",
                 "binary": claude,
                 "version": "2.1.204 (Claude Code)",
                 "sha256": sha256_file(claude)
             },
             "pi": {
-                "policy_path": pi_policy,
-                "policy_sha256": sha256_file(&pi_policy),
-                "openshell_provider": "fixture-pi",
                 "model_provider": "openai",
                 "model": "openai/fixture-pi",
                 "binary": claude,
@@ -2839,8 +2782,8 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path, claude: &P
             },
             "lease_ttl_seconds": 30,
             "vcpus": 2,
-            "memory_mib": 2048,
-            "overlay_disk_mib": 4096,
+            "memory_mib": 6144,
+            "writable_storage_mib": 4096,
             "max_processes": 256
         }))
         .unwrap(),
