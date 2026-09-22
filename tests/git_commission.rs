@@ -1437,6 +1437,129 @@ fn unauthorized_changed_path_is_rejected_before_verification() {
     assert!(!fixture.principal_checkout.join("outside.txt").exists());
 }
 
+/// A byte-level fingerprint of the Principal checkout: every path, its mode,
+/// and its content or symlink target. Used to prove a Commission leaves the
+/// Principal's own directory exactly as it found it.
+fn checkout_fingerprint(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, current: &Path, out: &mut Vec<String>) {
+        let mut entries = fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            let relative = path.strip_prefix(root).unwrap().display().to_string();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let mode = metadata.permissions().mode();
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                out.push(format!("{relative} symlink {mode:o} {}", target.display()));
+            } else if metadata.is_dir() {
+                out.push(format!("{relative} dir {mode:o}"));
+                walk(root, &path, out);
+            } else {
+                let digest = format!("{:x}", Sha256::digest(fs::read(&path).unwrap()));
+                out.push(format!("{relative} file {mode:o} {digest}"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The Principal's directory is an input, never a workspace. A Worker runs in
+/// a container that cannot see it, and Integration targets a daemon-owned
+/// repository, so a completed Commission must leave it byte-identical.
+#[test]
+fn a_completed_commission_leaves_the_principal_checkout_byte_identical() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let fake_state = temp.path().join("fake-docker");
+    fs::create_dir(&fake_state).unwrap();
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
+    );
+    let fake_codex = write_executable(
+        &temp.path().join("codex"),
+        include_str!("fixtures/fake_codex.sh"),
+    );
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+
+    let before = checkout_fingerprint(&principal_checkout);
+    assert!(
+        !before.is_empty(),
+        "fingerprint should observe real content"
+    );
+
+    let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+
+    let after = checkout_fingerprint(&principal_checkout);
+    assert_eq!(
+        before, after,
+        "a completed Commission modified the Principal checkout"
+    );
+    // The accepted artifact exists, but only inside Tyrion's own repository.
+    assert!(!principal_checkout.join("issue-4.txt").exists());
+    assert!(data_dir
+        .join("integrations")
+        .join(&commission_id)
+        .join("repository")
+        .join("issue-4.txt")
+        .exists());
+    // Nothing the daemon wrote escaped its own data directory.
+    let head = Command::new("git")
+        .args(["-C", path_text(&principal_checkout), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        base_revision,
+        "the Principal checkout moved off its base revision"
+    );
+}
+
+/// A symlink is a path a Worker may be authorized to write, aimed at a host
+/// file it is not authorized to read. It must be rejected for being a symlink
+/// out of the repository, not merely caught later by whichever criterion
+/// happens to read that path.
+#[test]
+fn a_symlink_aimed_at_the_host_is_rejected_before_verification() {
+    let fixture = FailedFixture::new("symlink-escape");
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &fixture.proposal_path);
+
+    let failed = wait_for_failed_attempt(&daemon, &attachment_token, &commission_id);
+    assert_eq!(failed["results"], json!([]));
+    assert!(
+        failed["blockers"][0]["requirement"]
+            .as_str()
+            .unwrap()
+            .contains("points outside the repository"),
+        "expected an explicit symlink rejection, got {}",
+        failed["blockers"][0]["requirement"]
+    );
+    // Rejected before anything was integrated or verified.
+    assert!(!fixture.data_dir.join("integrations").exists());
+    assert!(!fixture.principal_checkout.join("outside.txt").exists());
+    let failed = failed.to_string();
+    assert!(
+        !failed.contains("BEGIN OPENSSH PRIVATE KEY") && !failed.contains("BEGIN RSA"),
+        "Result exposed host key material"
+    );
+}
+
 #[test]
 fn reverted_unauthorized_path_is_rejected_before_verification() {
     let fixture = FailedFixture::new("reverted-unauthorized-change");
