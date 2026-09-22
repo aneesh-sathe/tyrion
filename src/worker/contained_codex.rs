@@ -1159,6 +1159,9 @@ impl<'a> Sandbox<'a> {
         let home = format!("HOME={SANDBOX_ROOT}");
         let tmpdir = format!("TMPDIR={SANDBOX_ROOT}/tmp");
         let xdg = format!("XDG_CONFIG_HOME={SANDBOX_ROOT}/.config");
+        // Adapter dependencies live in the pinned image rather than being
+        // transferred per Attempt, so they are covered by the image digest
+        // Tyrion already verifies at launch.
         let workspace = format!("TYRION_WORKSPACE_ROOT={SANDBOX_ROOT}");
         // The container outlives no Worker Lease: it exits on its own when the
         // lease does, which bounds its lifetime even if Tyrion itself is lost.
@@ -1213,6 +1216,8 @@ impl<'a> Sandbox<'a> {
             &xdg,
             "--env",
             &workspace,
+            "--env",
+            "PYTHONPATH=/opt/tyrion",
         ];
         let aliases = self
             .network

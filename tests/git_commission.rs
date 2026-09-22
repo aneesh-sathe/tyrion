@@ -282,6 +282,10 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
         );
     }
     assert!(log.contains("registry.invalid/tyrion-worker@sha256:"));
+    // Adapters import native_skill from the pinned image. The fixture adapter
+    // is a shell script, so only this assertion catches a sandbox that could
+    // not satisfy a real Python adapter's imports.
+    assert!(log.contains("--env PYTHONPATH=/opt/tyrion"));
     assert!(log.contains("tyrion-containment-probe"));
     assert!(log.contains("descendant-terminated"));
     assert!(log.contains("/sandbox/codex --version"));
