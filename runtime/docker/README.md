@@ -6,11 +6,24 @@ rejected, so copy the example rather than editing an older OpenShell profile.
 
 ## Provision the image
 
+Build from the repository root, so the adapter sources are in context:
+
 ```sh
-docker build -t registry.example/tyrion-worker:2026-09-21 runtime/docker
-docker push registry.example/tyrion-worker:2026-09-21
-docker image inspect registry.example/tyrion-worker:2026-09-21 \
+docker build -f runtime/docker/Dockerfile -t registry.example/tyrion-worker:2026-09-22 .
+docker push registry.example/tyrion-worker:2026-09-22
+docker image inspect registry.example/tyrion-worker:2026-09-22 \
   --format '{{index .RepoDigests 0}}{{"\n"}}{{.Id}}'
+```
+
+The image carries the adapters' runtime dependencies -- `native_skill` and the
+Claude Agent SDK -- rather than transferring them per Attempt. They are then
+covered by the image digest Tyrion already verifies at launch, instead of
+needing a second pinned artifact kept in step with the first. Confirm a build
+can satisfy a real adapter:
+
+```sh
+docker run --rm -e PYTHONPATH=/opt/tyrion <image> \
+  python3 -c 'import native_skill, claude_agent_sdk; print("ok")'
 ```
 
 Put the digest reference in `worker_image` and the image ID in
@@ -46,3 +59,18 @@ The relay forwards TCP without terminating TLS, so a credential stays
 end to end encrypted to its destination and cannot be sent anywhere else.
 It does not bound spend or disclosure at that destination; Tyrion's effect
 gates and the Commission's spend ceilings remain the controls for that.
+
+## Reading the work a Commission produced
+
+Accepted work lands in a Git repository the daemon owns, never in your
+checkout:
+
+```sh
+REPO="$TYRION_DATA_DIR/integrations/$COMMISSION_ID/repository"
+git fetch "$REPO" tyrion-integration
+git diff HEAD FETCH_HEAD          # review before accepting anything
+git merge --ff-only FETCH_HEAD    # the only moment your checkout changes
+```
+
+`tyrion commission inspect $COMMISSION_ID` reports the accepted artifact
+revision, the changed paths, and the Evidence behind them.
