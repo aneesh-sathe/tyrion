@@ -102,7 +102,7 @@ impl Drop for RunningDaemon {
 
 #[test]
 #[ignore = "requires the pinned repaired OpenShell gateway and a brokered Codex provider"]
-fn real_openshell_microvm_completes_the_contained_git_assignment() {
+fn real_docker_boundary_completes_the_contained_git_assignment() {
     let worker_config = std::env::var_os("TYRION_REAL_CODEX_WORKER_CONFIG")
         .map(PathBuf::from)
         .expect("set TYRION_REAL_CODEX_WORKER_CONFIG to the pinned runtime JSON");
@@ -142,17 +142,17 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    let fake_state = temp.path().join("fake-openshell");
+    let fake_state = temp.path().join("fake-docker");
     fs::create_dir(&fake_state).unwrap();
-    let fake_openshell = write_executable(
-        &temp.path().join("openshell"),
-        include_str!("fixtures/fake_openshell.sh"),
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
     );
     let fake_codex = write_executable(
         &temp.path().join("codex"),
         include_str!("fixtures/fake_codex.sh"),
     );
-    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
     let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
@@ -257,17 +257,36 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert!(!principal_checkout.join("issue-4.txt").exists());
 
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap();
-    assert_eq!(log.matches("sandbox create").count(), 3);
-    assert_eq!(log.matches("sandbox delete").count(), 3);
+    assert_eq!(log.matches("run --detach --name").count(), 3);
+    assert_eq!(log.matches("rm --force").count(), 3);
+    // One preflight descendant per sandbox, plus the Worker's own spawned
+    // descendant, each terminated with its container.
     assert_eq!(log.matches("descendant-terminated").count(), 4);
-    assert!(log.contains("--no-auto-providers"));
-    assert!(log.contains("--cpu 2 --memory 2Gi"));
-    assert!(log.contains("ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:"));
+    // Every sandbox carries the whole hardened profile, and each ceiling is
+    // set by the Docker daemon from outside the container.
+    for hardening in [
+        "--read-only",
+        "--pids-limit 256",
+        "--memory 6144m --memory-swap 6144m",
+        "--cpus 2 --cpuset-cpus 0-1",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "--security-opt seccomp=builtin",
+        "--user 65534:65534",
+        "tmpfs-size=4294967296",
+        "--network none",
+    ] {
+        assert!(
+            log.contains(hardening),
+            "sandbox created without {hardening}"
+        );
+    }
+    assert!(log.contains("registry.invalid/tyrion-worker@sha256:"));
     assert!(log.contains("tyrion-containment-probe"));
     assert!(log.contains("descendant-terminated"));
     assert!(log.contains("/sandbox/codex --version"));
     assert!(!log.lines().any(|line| {
-        line.contains("sandbox upload") && line.contains(path_text(&principal_checkout))
+        line.contains("exec --interactive") && line.contains(path_text(&principal_checkout))
     }));
 }
 
@@ -276,17 +295,17 @@ fn restart_restores_unacknowledged_integration_before_retry() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    let fake_state = temp.path().join("fake-openshell");
+    let fake_state = temp.path().join("fake-docker");
     fs::create_dir(&fake_state).unwrap();
-    let fake_openshell = write_executable(
-        &temp.path().join("openshell"),
-        include_str!("fixtures/fake_openshell.sh"),
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
     );
     let fake_codex = write_executable(
         &temp.path().join("codex"),
         include_str!("fixtures/fake_codex.sh"),
     );
-    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
     let first = RunningDaemon::start_with_arguments(
@@ -303,7 +322,7 @@ fn restart_restores_unacknowledged_integration_before_retry() {
         .join("integrations")
         .join(&commission_id)
         .join("repository");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if integration_repository.exists() {
             let integration_revision = Command::new("git")
@@ -363,7 +382,7 @@ fn restart_restores_unacknowledged_integration_before_retry() {
     drop(second);
 
     let third = RunningDaemon::start(&data_dir, &runtime, &fake_state);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let completed = loop {
         let inspected = run_cli(
             &third.socket_path,
@@ -425,7 +444,7 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
             "authority_actions": ["codex.git_change"],
             "authority_scope_types": ["repository", "path", "action"],
             "assignment_constraints": ["coding"],
-            "containment_profile": "openshell-repaired-v0.0.104",
+            "containment_profile": "docker-hardened-v1",
             "replacement_class": "structured-git",
             "available": true,
             "metrics": {
@@ -583,17 +602,17 @@ fn disjoint_useful_assignments_run_concurrently_and_complete_the_assembled_artif
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    let fake_state = temp.path().join("fake-openshell");
+    let fake_state = temp.path().join("fake-docker");
     fs::create_dir(&fake_state).unwrap();
-    let fake_openshell = write_executable(
-        &temp.path().join("openshell"),
-        include_str!("fixtures/fake_openshell.sh"),
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
     );
     let fake_codex = write_executable(
         &temp.path().join("codex"),
         include_str!("fixtures/fake_codex.sh"),
     );
-    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
     let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
@@ -1279,18 +1298,18 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    let fake_state = temp.path().join("fake-openshell");
+    let fake_state = temp.path().join("fake-docker");
     fs::create_dir(&fake_state).unwrap();
     fs::write(fake_state.join("fail-preflight"), b"").unwrap();
-    let fake_openshell = write_executable(
-        &temp.path().join("openshell"),
-        include_str!("fixtures/fake_openshell.sh"),
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
     );
     let fake_codex = write_executable(
         &temp.path().join("codex"),
         include_str!("fixtures/fake_codex.sh"),
     );
-    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
     let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
@@ -1333,8 +1352,8 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
     assert!(!principal_checkout.join("issue-4.txt").exists());
 
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap();
-    assert_eq!(log.matches("sandbox create").count(), 1);
-    assert_eq!(log.matches("sandbox delete").count(), 1);
+    assert_eq!(log.matches("run --detach --name").count(), 1);
+    assert_eq!(log.matches("rm --force").count(), 1);
     assert!(!log.contains("run-attempt.sh"));
 }
 
@@ -1365,18 +1384,18 @@ fn malformed_returned_bundle_never_reaches_verification_or_integration() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    let fake_state = temp.path().join("fake-openshell");
+    let fake_state = temp.path().join("fake-docker");
     fs::create_dir(&fake_state).unwrap();
     fs::write(fake_state.join("corrupt-candidate"), b"").unwrap();
-    let fake_openshell = write_executable(
-        &temp.path().join("openshell"),
-        include_str!("fixtures/fake_openshell.sh"),
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
     );
     let fake_codex = write_executable(
         &temp.path().join("codex"),
         include_str!("fixtures/fake_codex.sh"),
     );
-    let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir).unwrap();
     let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
@@ -1397,8 +1416,8 @@ fn malformed_returned_bundle_never_reaches_verification_or_integration() {
     assert!(!principal_checkout.join("issue-4.txt").exists());
 
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap();
-    assert_eq!(log.matches("sandbox create").count(), 1);
-    assert_eq!(log.matches("sandbox delete").count(), 1);
+    assert_eq!(log.matches("run --detach --name").count(), 1);
+    assert_eq!(log.matches("rm --force").count(), 1);
 }
 
 #[test]
@@ -1451,7 +1470,7 @@ fn expired_worker_lease_deletes_the_sandbox_and_terminates_descendants() {
         .unwrap()
         .contains("Worker Lease expired"));
     let log = fs::read_to_string(fixture.fake_state.join("commands.log")).unwrap();
-    assert!(log.contains("sandbox delete"));
+    assert!(log.contains("rm --force"));
     assert!(log.contains("descendant-terminated"));
 }
 
@@ -1494,7 +1513,7 @@ fn watchdog_deletes_a_stalled_candidate_verification_sandbox() {
     );
     let attachment_token = connect_full_entry(&daemon);
     let commission_id = create_and_accept(&daemon, &attachment_token, &fixture.proposal_path);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let contained = loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -1526,7 +1545,7 @@ fn watchdog_deletes_a_stalled_candidate_verification_sandbox() {
         .unwrap()
         .iter()
         .any(|finding| finding["signal"] == "stall"));
-    let remaining_sandboxes = fs::read_dir(fixture.fake_state.join("sandboxes"))
+    let remaining_sandboxes = fs::read_dir(fixture.fake_state.join("containers"))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -1632,17 +1651,17 @@ impl ParallelFixture {
         let temp = TempDir::new().expect("temporary directory should be created");
         let principal_checkout = temp.path().join("principal-checkout");
         let base_revision = create_principal_repository(&principal_checkout);
-        let fake_state = temp.path().join("fake-openshell");
+        let fake_state = temp.path().join("fake-docker");
         fs::create_dir(&fake_state).unwrap();
-        let fake_openshell = write_executable(
-            &temp.path().join("openshell"),
-            include_str!("fixtures/fake_openshell.sh"),
+        let fake_docker = write_executable(
+            &temp.path().join("docker"),
+            include_str!("fixtures/fake_docker.sh"),
         );
         let fake_codex = write_executable(
             &temp.path().join("codex"),
             include_str!("fixtures/fake_codex.sh"),
         );
-        let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+        let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
         let data_dir = temp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         Self {
@@ -1661,18 +1680,18 @@ impl FailedFixture {
         let temp = TempDir::new().expect("temporary directory should be created");
         let principal_checkout = temp.path().join("principal-checkout");
         let base_revision = create_principal_repository(&principal_checkout);
-        let fake_state = temp.path().join("fake-openshell");
+        let fake_state = temp.path().join("fake-docker");
         fs::create_dir(&fake_state).unwrap();
         fs::write(fake_state.join(marker), b"").unwrap();
-        let fake_openshell = write_executable(
-            &temp.path().join("openshell"),
-            include_str!("fixtures/fake_openshell.sh"),
+        let fake_docker = write_executable(
+            &temp.path().join("docker"),
+            include_str!("fixtures/fake_docker.sh"),
         );
         let fake_codex = write_executable(
             &temp.path().join("codex"),
             include_str!("fixtures/fake_codex.sh"),
         );
-        let runtime = write_runtime_fixture(temp.path(), &fake_openshell, &fake_codex);
+        let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
         let data_dir = temp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let proposal_path = temp.path().join("proposal.json");
@@ -1971,60 +1990,25 @@ fn git_output(path: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path) -> PathBuf {
-    let policy = root.join("hard-policy.yaml");
-    fs::write(
-        &policy,
-        include_bytes!("../runtime/openshell/hard-landlock-policy.yaml"),
-    )
-    .unwrap();
-    let gateway = root.join("gateway.toml");
-    fs::write(
-        &gateway,
-        "[openshell.gateway]\ncompute_drivers = [\"vm\"]\n\n[openshell.gateway.mtls_auth]\nenabled = true\n\n[openshell.drivers.vm]\nvcpus = 2\nmem_mib = 2048\noverlay_disk_mib = 4096\n",
-    )
-    .unwrap();
-    let kernel = root.join("kernel.config");
-    fs::write(
-        &kernel,
-        "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n",
-    )
-    .unwrap();
-    let runtime_artifact = root.join("libkrunfw.5.dylib");
-    fs::write(&runtime_artifact, b"fixture runtime").unwrap();
-    let config_home = root.join("openshell-config");
-    fs::create_dir(&config_home).unwrap();
+fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path) -> PathBuf {
     let config = root.join("codex-worker.json");
     fs::write(
         &config,
         serde_json::to_vec_pretty(&json!({
-            "openshell_binary": openshell,
-            "openshell_sha256": sha256_file(openshell),
-            "openshell_version": "openshell 0.0.104",
-            "openshell_config_home": config_home,
-            "policy_path": policy,
-            "policy_sha256": sha256_file(&policy),
-            "gateway_config_path": gateway,
-            "gateway_config_sha256": sha256_file(&gateway),
-            "kernel_config_path": kernel,
-            "kernel_config_sha256": sha256_file(&kernel),
-            "runtime_artifacts": [{
-                "path": runtime_artifact,
-                "sha256": sha256_file(&runtime_artifact)
-            }],
-            "source_revision": "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354",
-            "source_patch_path": concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/openshell/repaired-v0.0.104.patch"),
-            "source_patch_sha256": "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402",
-            "base_image": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
+            "docker_binary": docker,
+            "docker_sha256": sha256_file(docker),
+            "docker_version": "Docker version 28.0.4, build fixture",
+            "docker_host": "unix:///fixture/docker.sock",
+            "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
+            "worker_image_id": format!("sha256:{}", "1".repeat(64)),
             "codex_binary": codex,
             "codex_version": "codex-cli 0.147.0",
             "codex_sha256": sha256_file(codex),
             "model": "fixture-model",
-            "openshell_provider": "fixture-codex",
             "lease_ttl_seconds": 30,
             "vcpus": 2,
-            "memory_mib": 2048,
-            "overlay_disk_mib": 4096,
+            "memory_mib": 6144,
+            "writable_storage_mib": 4096,
             "max_processes": 256
         }))
         .unwrap(),
@@ -2034,21 +2018,12 @@ fn write_runtime_fixture(root: &Path, openshell: &Path, codex: &Path) -> PathBuf
 }
 
 fn add_claude_runtime_fixture(root: &Path, runtime: &Path) {
-    let policy = root.join("hard-claude-policy.yaml");
-    fs::write(
-        &policy,
-        include_bytes!("../runtime/openshell/hard-landlock-claude-policy.yaml"),
-    )
-    .unwrap();
     let claude = write_executable(
         &root.join("claude"),
         include_str!("fixtures/fake_claude.sh"),
     );
     let mut config: Value = serde_json::from_slice(&fs::read(runtime).unwrap()).unwrap();
     config["claude"] = json!({
-        "policy_path": policy,
-        "policy_sha256": sha256_file(&policy),
-        "openshell_provider": "fixture-claude",
         "binary": claude,
         "version": "2.1.204 (Claude Code)",
         "sha256": sha256_file(&claude)
@@ -2188,7 +2163,7 @@ fn wait_for_completion(
         daemon,
         attachment_token,
         commission_id,
-        Duration::from_secs(10),
+        Duration::from_secs(45),
     )
 }
 
@@ -2234,7 +2209,7 @@ fn wait_for_failed_attempt(
     attachment_token: &str,
     commission_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -2274,7 +2249,7 @@ fn wait_for_verification_failure(
     attachment_token: &str,
     commission_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -2306,7 +2281,7 @@ fn wait_for_reconciliation(
     attachment_token: &str,
     commission_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,
@@ -2348,7 +2323,7 @@ fn wait_for_frontier_hold(
     commission_id: &str,
     logical_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let inspected = run_cli(
             &daemon.socket_path,

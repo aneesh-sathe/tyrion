@@ -64,16 +64,16 @@ fn run_prototype() -> Result<(), String> {
     let fixture_bin = scratch.path.join("bin");
     fs::create_dir(&fixture_bin).map_err(display_error)?;
     symlink(&current_executable, fixture_bin.join("codex")).map_err(display_error)?;
-    let openshell = write_executable(
-        &fixture_bin.join("openshell-worker-fixture"),
-        include_str!("../../tests/fixtures/fake_openshell.sh"),
+    let docker = write_executable(
+        &fixture_bin.join("docker-worker-fixture"),
+        include_str!("../../tests/fixtures/fake_docker.sh"),
     )?;
     let worker_codex = write_executable(
         &fixture_bin.join("codex-worker-fixture"),
         include_str!("../../tests/fixtures/fake_codex.sh"),
     )?;
-    fs::create_dir(scratch.path.join("fake-openshell")).map_err(display_error)?;
-    let runtime = write_runtime_fixture(&repository, &data_dir, &openshell, &worker_codex)?;
+    fs::create_dir(fixture_bin.join("fake-docker")).map_err(display_error)?;
+    let runtime = write_runtime_fixture(&repository, &data_dir, &docker, &worker_codex)?;
     state.apply(Action::RuntimePrepared { production_runtime })?;
     render(&state);
 
@@ -115,8 +115,8 @@ fn run_prototype() -> Result<(), String> {
     if fs::read_to_string(&integration_file).map_err(display_error)? != "contained codex result\n" {
         return Err("integrated artifact did not contain the expected result".into());
     }
-    let log = fs::read_to_string(scratch.path.join("fake-openshell/commands.log"))
-        .map_err(display_error)?;
+    let log =
+        fs::read_to_string(fixture_bin.join("fake-docker/commands.log")).map_err(display_error)?;
     let created = log.matches("sandbox create").count();
     let deleted = log.matches("sandbox delete").count();
     if status != "verified_complete" || principal_changed || created != 3 || deleted != 3 {
@@ -137,7 +137,7 @@ fn run_prototype() -> Result<(), String> {
     })?;
     render(&state);
     println!(
-        "\nVERDICT: zero-config orchestration is viable when Tyrion owns the runtime bundle; this machine still lacks the production OpenShell bundle, so containment is not attested."
+        "\nVERDICT: zero-config orchestration is viable when Tyrion owns the runtime bundle; this machine still lacks a provisioned pinned Worker image, so containment is not attested."
     );
     Ok(())
 }
@@ -154,7 +154,7 @@ fn run_fixture_entry() -> Result<(), String> {
         production_runtime: select_runtime(RuntimeFacts {
             tyrion_owned_bundle: true,
             boundary_attested: false,
-            openshell_version: Some("openshell 0.0.104".into()),
+            docker_version: Some("Docker version 28.0.4".into()),
             guest_codex_version: Some(EXPECTED_CODEX.into()),
             ambient_codex_version: None,
         })
@@ -322,7 +322,7 @@ fn inspect_production_runtime() -> String {
     select_runtime(RuntimeFacts {
         tyrion_owned_bundle: false,
         boundary_attested: false,
-        openshell_version: command_version("openshell"),
+        docker_version: command_version("docker"),
         guest_codex_version: None,
         ambient_codex_version: command_version("codex"),
     })
@@ -365,67 +365,29 @@ fn create_principal_repository(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn write_runtime_fixture(
-    repository: &Path,
+    _repository: &Path,
     data_dir: &Path,
-    openshell: &Path,
+    docker: &Path,
     codex: &Path,
 ) -> Result<PathBuf, String> {
     let runtime_dir = data_dir.join("ephemeral-runtime");
     fs::create_dir(&runtime_dir).map_err(display_error)?;
-    let policy = runtime_dir.join("hard-policy.yaml");
-    fs::copy(
-        repository.join("runtime/openshell/hard-landlock-policy.yaml"),
-        &policy,
-    )
-    .map_err(display_error)?;
-    let gateway = runtime_dir.join("gateway.toml");
-    fs::write(
-        &gateway,
-        "[openshell.gateway]\ncompute_drivers = [\"vm\"]\n\n[openshell.gateway.mtls_auth]\nenabled = true\n\n[openshell.drivers.vm]\nvcpus = 2\nmem_mib = 2048\noverlay_disk_mib = 4096\n",
-    )
-    .map_err(display_error)?;
-    let kernel = runtime_dir.join("kernel.config");
-    fs::write(
-        &kernel,
-        "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n",
-    )
-    .map_err(display_error)?;
-    let artifact = runtime_dir.join("libkrunfw.5.dylib");
-    fs::write(&artifact, b"prototype fixture runtime").map_err(display_error)?;
-    let config_home = data_dir
-        .parent()
-        .ok_or_else(|| "data directory has no parent".to_owned())?
-        .join("openshell-config");
-    fs::create_dir(&config_home).map_err(display_error)?;
     let config = runtime_dir.join("codex-worker.json");
     let value = json!({
-        "openshell_binary": openshell,
-        "openshell_sha256": sha256_file(openshell)?,
-        "openshell_version": "openshell 0.0.104",
-        "openshell_config_home": config_home,
-        "policy_path": policy,
-        "policy_sha256": sha256_file(&policy)?,
-        "gateway_config_path": gateway,
-        "gateway_config_sha256": sha256_file(&gateway)?,
-        "kernel_config_path": kernel,
-        "kernel_config_sha256": sha256_file(&kernel)?,
-        "runtime_artifacts": [{
-            "path": artifact,
-            "sha256": sha256_file(&artifact)?
-        }],
-        "source_revision": "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354",
-        "source_patch_path": repository.join("runtime/openshell/repaired-v0.0.104.patch"),
-        "source_patch_sha256": "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402",
-        "base_image": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
+        "docker_binary": docker,
+        "docker_sha256": sha256_file(docker)?,
+        "docker_version": "Docker version 28.0.4, build fixture",
+        "docker_host": "unix:///fixture/docker.sock",
+        "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
+        "worker_image_id": format!("sha256:{}", "1".repeat(64)),
         "codex_binary": codex,
         "codex_version": EXPECTED_CODEX,
         "codex_sha256": sha256_file(codex)?,
         "model": "fixture-model",
-        "openshell_provider": "fixture-codex",
         "lease_ttl_seconds": 30,
         "vcpus": 2,
-        "memory_mib": 2048,
-        "overlay_disk_mib": 4096,
+        "memory_mib": 6144,
+        "writable_storage_mib": 4096,
         "max_processes": 256
     });
     fs::write(

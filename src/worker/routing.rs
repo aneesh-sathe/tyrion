@@ -237,7 +237,7 @@ impl WorkerCatalog {
                     )));
                 }
             }
-            if configuration.containment_profile != "openshell-repaired-v0.0.104"
+            if configuration.containment_profile != super::contained_codex::CONTAINMENT_PROFILE
                 && configuration.containment_profile != descriptor.containment_profile
             {
                 return Err(TyrionError::InvalidRequest(format!(
@@ -993,7 +993,7 @@ mod tests {
             model: "codex".into(),
             settings: BTreeMap::new(),
             max_storage_bytes: u64::MAX,
-            containment_profile: "openshell-repaired-v0.0.104".into(),
+            containment_profile: crate::worker::contained_codex::CONTAINMENT_PROFILE.into(),
             supports_claude: false,
             supports_pi: true,
             pi_model_provider: Some("openai".into()),

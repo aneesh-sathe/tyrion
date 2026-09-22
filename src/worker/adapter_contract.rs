@@ -656,7 +656,7 @@ mod tests {
             }],
             "configuration_fingerprint": "configuration-sha256",
             "containment_enforced": true,
-            "containment_profile": "openshell-repaired-v0.0.104"
+            "containment_profile": "docker-hardened-v1"
         })
     }
 
@@ -678,7 +678,7 @@ mod tests {
         });
         AdapterContractExpectation {
             configuration_id: "codex-deep",
-            containment_profile: "openshell-repaired-v0.0.104",
+            containment_profile: "docker-hardened-v1",
             expected_skills: &SKILLS,
             allowed_skills: &SKILLS,
             commission_id: "commission-1",
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(report.output_tokens, 45);
         assert_eq!(report.native_skills, ["code-review"]);
         assert_eq!(report.result_summary, "implemented backend");
-        assert_eq!(report.containment_profile, "openshell-repaired-v0.0.104");
+        assert_eq!(report.containment_profile, "docker-hardened-v1");
     }
 
     #[test]
