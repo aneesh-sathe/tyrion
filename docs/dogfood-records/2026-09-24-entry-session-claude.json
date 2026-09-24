@@ -1,0 +1,1112 @@
+{
+  "checksum": "sha256:32421ac03b6f96a80669cfa7e936c525f811f9779afa00904339cfb44dd745ef",
+  "dogfood_readiness": {
+    "automatic_ready_claims_supported": false,
+    "blockers": [],
+    "status": "unassessed"
+  },
+  "exported_at": 1790265033415,
+  "format": "tyrion.commission",
+  "record": {
+    "activity_journal": {
+      "useful_concurrency": {
+        "elapsed_time_reduction_millis": 0,
+        "end_to_end_elapsed_millis": 0,
+        "occurred": false,
+        "overlap_millis": 0,
+        "parallel_execution_window_millis": 0,
+        "serial_attempt_millis": 0,
+        "serial_execution_millis": 0,
+        "success_metric": "verified execution elapsed-time reduction"
+      }
+    },
+    "approval_gates": [],
+    "assignments": [
+      {
+        "competition": null,
+        "created_at": 1790264876,
+        "id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+        "logical_id": "legacy-assignment",
+        "plan_revision": 1,
+        "position": 0,
+        "purpose": "critical_path",
+        "read_scopes": [],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_model_spend_cents": 50,
+          "max_paid_service_spend_cents": 0,
+          "max_storage_bytes": 10485760
+        },
+        "route": {
+          "decided_at": 1790264876,
+          "rationale": {
+            "eligible": [
+              "claude-haiku-cheap"
+            ],
+            "entry_harness": "claude",
+            "entry_harness_preference_applied": false,
+            "ineligible": [],
+            "ordering": [
+              "expected_verified_correctness",
+              "preference_adherence",
+              "first_pass_acceptance",
+              "commission_elapsed_time_contribution",
+              "cost",
+              "continuity"
+            ]
+          },
+          "selected_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/fd78f2da30999b5c85335cea3484664680184fc7e2641141a5c0f7efab2fcd4c"
+              ],
+              "kind": "claude_agent_sdk",
+              "sha256": "fd78f2da30999b5c85335cea3484664680184fc7e2641141a5c0f7efab2fcd4c",
+              "version": "0.2.0"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "docker-hardened-v1-517b4b0b4206c075",
+            "context": {
+              "capacity_tokens": 200000,
+              "strategy": "fresh"
+            },
+            "harness": "claude",
+            "id": "claude-haiku-cheap",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 1,
+              "expected_verified_correctness": 9000,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "claude-haiku-4-5-20251001",
+            "replacement_class": "cheap-coding",
+            "resource_limits": {
+              "max_concurrency_slots": 1,
+              "max_model_spend_cents": 200,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760
+            },
+            "selected_skills": [],
+            "settings": {},
+            "skills": [],
+            "tools": [
+              "git"
+            ]
+          },
+          "status": "selected"
+        },
+        "skill_defaults": [],
+        "status": "accepted",
+        "write_scopes": [
+          "greet.py"
+        ]
+      }
+    ],
+    "attachments": [
+      {
+        "adapter_identity": "tyrion-native-entry-mcp",
+        "adapter_version": "0.1.0",
+        "harness": "claude",
+        "id": "5bd057b8-a9f6-4c5d-9ded-2998bcd9e203",
+        "joined_at": 1790264876,
+        "mode": "limited",
+        "native_session_id": "native-entry-95d442b0-9aa3-4f16-bf38-d10ba4811115",
+        "role": "active"
+      },
+      {
+        "adapter_identity": "claude-mcp-entry",
+        "adapter_version": "1.0.0",
+        "harness": "claude",
+        "id": "4691dab1-7519-4564-82f0-6577a0879c4d",
+        "joined_at": 1790265033,
+        "mode": "limited",
+        "native_session_id": "export-session",
+        "role": "observer"
+      }
+    ],
+    "attempts": [
+      {
+        "assignment_id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+        "cleanup_pending": false,
+        "completed_at": 1790264891,
+        "completed_at_ms": 1790264891975,
+        "execution_completed_at_ms": 1790264890508,
+        "id": "22684b2d-464d-4037-8212-02d32f680ba2",
+        "lease": {
+          "expires_at": 1790265476,
+          "id": "0f2403da-9c3d-475e-9b87-297d96606c11",
+          "issued_at": 1790264876,
+          "mandate_revision": 1,
+          "released_at": 1790264891,
+          "status": "released"
+        },
+        "reservation": {
+          "concurrency_slots": 1,
+          "model_spend_cents": 50,
+          "paid_service_spend_cents": 0,
+          "status": "released",
+          "storage_bytes": 10485760
+        },
+        "revision_disposition": "current",
+        "started_at": 1790264876,
+        "started_at_ms": 1790264876161,
+        "status": "succeeded",
+        "worker_configuration": "claude-haiku-cheap",
+        "worker_context_packet": {
+          "advisory": {
+            "authority_effect": {
+              "approval_gates": false,
+              "credentials": false,
+              "resource_ceilings": false,
+              "routing": false
+            },
+            "budget": {
+              "accounting": "utf8_byte_upper_bound",
+              "complete_slice_limit_tokens": 15000,
+              "hard_max_tokens": 15000,
+              "target_tokens": 2000,
+              "tokens_used": 2,
+              "worker_context_fraction_basis_points": 800
+            },
+            "instruction": "Profile Claims are advisory and yield to every binding source above.",
+            "profile_claims": []
+          },
+          "binding": {
+            "acceptance_criteria": [
+              {
+                "id": "greets",
+                "required_evidence": "command_output",
+                "verification_depth": "standard",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {
+                  "argv": [
+                    "sh",
+                    "-c",
+                    "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+                  ],
+                  "kind": "command"
+                },
+                "verifier_configuration": "contained-command-v1",
+                "verifier_type": "deterministic"
+              }
+            ],
+            "authority_envelope": {
+              "actions": [
+                "codex.git_change"
+              ],
+              "destinations": [],
+              "effects": [],
+              "paths": [
+                "greet.py"
+              ],
+              "repositories": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+              ]
+            },
+            "commission_constraints": [],
+            "current_principal_instructions": [
+              "Create greet.py so that running it prints exactly: Hello from an Entry Session!"
+            ],
+            "current_repository_evidence": {
+              "artifact_revision": null,
+              "execution": {
+                "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+                "kind": "codex_git",
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+              },
+              "project_id": null
+            },
+            "resource_ceilings": {
+              "max_attempts": 1,
+              "max_elapsed_seconds": 600,
+              "max_model_spend_cents": 50,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760,
+              "max_worker_concurrency": 1
+            }
+          },
+          "precedence": [
+            "current_principal_instructions",
+            "commission_constraints",
+            "acceptance_criteria",
+            "authority_envelope",
+            "resource_ceilings",
+            "current_repository_evidence",
+            "advisory_profile_claims"
+          ],
+          "version": 1
+        }
+      }
+    ],
+    "attention_conditions": [],
+    "blockers": [],
+    "briefing": {
+      "artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+      "commission_id": "d861c6c7-b160-41a5-8574-a3b850e31f02",
+      "completion_revision": 2,
+      "criteria": [
+        {
+          "criterion_id": "greets",
+          "description": "greet.py prints the expected line",
+          "evidence": {
+            "artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+            "created_at": 1790264891,
+            "criterion_id": "greets",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 greet.py)\\\" = 'Hello from an Entry Session!'\"]",
+            "id": "0e16bb7d-98a0-45d3-bb12-c0548a6b8918",
+            "mandate_revision": 1,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "result_id": "f0ac51df-4362-4fb4-8e68-5a3703c85a1e",
+            "verifier_kind": "command"
+          },
+          "status": "passed"
+        }
+      ],
+      "learning_receipts": [],
+      "run_report": {
+        "approval_gates": {
+          "authorized": 0,
+          "consumed": 0,
+          "invalidated_or_revoked": 0,
+          "open": 0,
+          "required": 0
+        },
+        "conflicts": {
+          "reconciliation_required_events": 0
+        },
+        "context_transfer": {
+          "attachment_takeovers": 0,
+          "manual_events": 0,
+          "manual_worker_clarifications": 0
+        },
+        "corrections": {
+          "attempt_recoveries": 0,
+          "worker_reported": 0
+        },
+        "cost": {
+          "reported_model_cents": 2,
+          "reserved_model_spend_cents": 50,
+          "reserved_paid_service_spend_cents": 0
+        },
+        "failures": {
+          "failed_attempts": 0,
+          "failed_evidence": 0,
+          "failed_or_uncertain_effects": 0,
+          "interrupted_attempts": 0,
+          "security_invariant_failures": 0,
+          "uncertain_evidence": 0
+        },
+        "planned_principal_controls": {
+          "provenance": "accepted_known_uncertainty",
+          "total": 0,
+          "worker_controls": 0
+        },
+        "reconciliation": {
+          "assignments": 0,
+          "principal_effect_reconciliations": 0
+        },
+        "recovery_events": {
+          "attempt_recoveries": 0,
+          "restart_recoveries": 0,
+          "watchdog_findings": 0
+        },
+        "timing": {
+          "accepted_at": 1790264876,
+          "completed_at": 1790264891,
+          "created_at": 1790264876,
+          "total_elapsed_millis": 15000,
+          "worker_execution_millis": 14347
+        },
+        "unplanned_principal_interventions": {
+          "commission_amendments": 0,
+          "required_approval_gate_actions_excluded": true,
+          "total": 0,
+          "worker_controls": 0
+        },
+        "useful_concurrency": {
+          "elapsed_time_reduction_millis": 0,
+          "end_to_end_elapsed_millis": 0,
+          "occurred": false,
+          "overlap_millis": 0,
+          "parallel_execution_window_millis": 0,
+          "serial_attempt_millis": 0,
+          "serial_execution_millis": 0,
+          "success_metric": "verified execution elapsed-time reduction"
+        }
+      },
+      "summary": "Verified Complete: Create greet.py so that running it prints exactly: Hello from an Entry Session!",
+      "title": "Verified Completion"
+    },
+    "commission": {
+      "accepted_at": 1790264876,
+      "artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+      "authority": {
+        "actions": [
+          "codex.git_change"
+        ],
+        "destinations": [],
+        "effects": [],
+        "paths": [
+          "greet.py"
+        ],
+        "repositories": [
+          "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+        ]
+      },
+      "completed_at": 1790264891,
+      "constraints": [],
+      "control_revision": 0,
+      "created_at": 1790264876,
+      "execution": {
+        "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+        "kind": "codex_git",
+        "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+      },
+      "goal": "Create greet.py so that running it prints exactly: Hello from an Entry Session!",
+      "id": "d861c6c7-b160-41a5-8574-a3b850e31f02",
+      "known_uncertainties": [],
+      "project_id": null,
+      "proposed_plan": null,
+      "resource_ceilings": {
+        "max_attempts": 1,
+        "max_elapsed_seconds": 600,
+        "max_model_spend_cents": 50,
+        "max_paid_service_spend_cents": 0,
+        "max_storage_bytes": 10485760,
+        "max_worker_concurrency": 1
+      },
+      "revision": 2,
+      "status": "verified_complete",
+      "worker_requirements": {
+        "assignment_constraints": [],
+        "capabilities": [],
+        "exclude_configurations": [],
+        "min_context_tokens": 0,
+        "require_configurations": [],
+        "selected_skills": [],
+        "skills": [],
+        "tools": []
+      }
+    },
+    "commission_amendments": [],
+    "credential_exposure_grants": [],
+    "credential_grants": [],
+    "criteria": [
+      {
+        "description": "greet.py prints the expected line",
+        "id": "greets",
+        "required_evidence": "command_output",
+        "status": "passed",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "criterion_versions": [
+      {
+        "description": "greet.py prints the expected line",
+        "id": "greets",
+        "mandate_revision": 1,
+        "required_evidence": "command_output",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "events": [
+      {
+        "commission_revision": 0,
+        "created_at": 1790264876,
+        "payload": {},
+        "sequence": 33,
+        "type": "commission_proposed"
+      },
+      {
+        "commission_revision": 0,
+        "created_at": 1790264876,
+        "payload": {
+          "attachment_id": "5bd057b8-a9f6-4c5d-9ded-2998bcd9e203",
+          "role": "active"
+        },
+        "sequence": 34,
+        "type": "attachment_joined"
+      },
+      {
+        "commission_revision": 0,
+        "created_at": 1790264876,
+        "payload": {
+          "active_attachment_id": "5bd057b8-a9f6-4c5d-9ded-2998bcd9e203",
+          "previous_active_attachment_id": null
+        },
+        "sequence": 35,
+        "type": "active_attachment_changed"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264876,
+        "payload": {},
+        "sequence": 36,
+        "type": "commission_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264876,
+        "payload": {
+          "plan_revision": 1,
+          "reason": "initial_decomposition",
+          "source": "control_plane"
+        },
+        "sequence": 37,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264876,
+        "payload": {
+          "assignment_id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+          "logical_id": "legacy-assignment",
+          "plan_revision": 1
+        },
+        "sequence": 38,
+        "type": "assignment_ready"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264876,
+        "payload": {
+          "assignment_id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+          "logical_id": "legacy-assignment",
+          "plan_revision": 1,
+          "started_at_ms": 1790264876161,
+          "worker_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/fd78f2da30999b5c85335cea3484664680184fc7e2641141a5c0f7efab2fcd4c"
+              ],
+              "kind": "claude_agent_sdk",
+              "sha256": "fd78f2da30999b5c85335cea3484664680184fc7e2641141a5c0f7efab2fcd4c",
+              "version": "0.2.0"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "docker-hardened-v1-517b4b0b4206c075",
+            "context": {
+              "capacity_tokens": 200000,
+              "strategy": "fresh"
+            },
+            "harness": "claude",
+            "id": "claude-haiku-cheap",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 1,
+              "expected_verified_correctness": 9000,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "claude-haiku-4-5-20251001",
+            "replacement_class": "cheap-coding",
+            "resource_limits": {
+              "max_concurrency_slots": 1,
+              "max_model_spend_cents": 200,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760
+            },
+            "selected_skills": [],
+            "settings": {},
+            "skills": [],
+            "tools": [
+              "git"
+            ]
+          },
+          "worker_handle": "Arya",
+          "worker_id": "ededaf23-ba4e-4b5f-a8c2-7fa44aff2e0d"
+        },
+        "sequence": 39,
+        "type": "attempt_started"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264876,
+        "payload": {
+          "activity": "Worker launched",
+          "assignment_id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+          "worker_handle": "Arya",
+          "worker_id": "ededaf23-ba4e-4b5f-a8c2-7fa44aff2e0d"
+        },
+        "sequence": 40,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264876,
+        "payload": {
+          "assignment_id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+          "attempt_id": "22684b2d-464d-4037-8212-02d32f680ba2",
+          "concurrency_slots": 1,
+          "model_spend_cents": 50,
+          "paid_service_spend_cents": 0,
+          "reserved_atomically": true,
+          "storage_bytes": 10485760
+        },
+        "sequence": 41,
+        "type": "resources_reserved"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264890,
+        "payload": {},
+        "sequence": 42,
+        "type": "result_submitted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264890,
+        "payload": {
+          "activity": "Claude produced a structured Result",
+          "assignment_id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+          "attempt_id": "22684b2d-464d-4037-8212-02d32f680ba2",
+          "native_session_id": "335f86b4-aac0-472b-8901-af18c262d31b",
+          "usage": {
+            "cost_cents": 2,
+            "input_tokens": 102,
+            "output_tokens": 33
+          }
+        },
+        "sequence": 43,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264891,
+        "payload": {},
+        "sequence": 44,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264891,
+        "payload": {},
+        "sequence": 45,
+        "type": "result_integrated"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264891,
+        "payload": {},
+        "sequence": 46,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790264891,
+        "payload": {},
+        "sequence": 47,
+        "type": "result_accepted"
+      },
+      {
+        "commission_revision": 2,
+        "created_at": 1790264891,
+        "payload": {},
+        "sequence": 48,
+        "type": "commission_verified_complete"
+      },
+      {
+        "commission_revision": 2,
+        "created_at": 1790265033,
+        "payload": {
+          "attachment_id": "4691dab1-7519-4564-82f0-6577a0879c4d",
+          "role": "observer"
+        },
+        "sequence": 49,
+        "type": "attachment_joined"
+      }
+    ],
+    "evidence": [
+      {
+        "artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+        "created_at": 1790264891,
+        "criterion_id": "greets",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 greet.py)\\\" = 'Hello from an Entry Session!'\"]",
+        "id": "aaa8d3a4-1d77-4f86-84ca-4528a0a3e00c",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "f0ac51df-4362-4fb4-8e68-5a3703c85a1e",
+        "scope": "candidate",
+        "verification_attempt_id": "424ccdb6-6280-4bba-882e-f527afccc053",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+        "created_at": 1790264891,
+        "criterion_id": "greets",
+        "current": true,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 greet.py)\\\" = 'Hello from an Entry Session!'\"]",
+        "id": "0e16bb7d-98a0-45d3-bb12-c0548a6b8918",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "f0ac51df-4362-4fb4-8e68-5a3703c85a1e",
+        "scope": "integrated",
+        "verification_attempt_id": "f01b7fe1-2584-4544-a846-e4b94819f528",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "execution_frontier": [],
+    "frontier_holds": [],
+    "operation_requests": [],
+    "plans": [
+      {
+        "created_at": 1790264876,
+        "reason": "initial decomposition exposed the first safe Execution Frontier",
+        "revision": 1,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "greets"
+              ],
+              "dependencies": [],
+              "goal": "Create greet.py so that running it prints exactly: Hello from an Entry Session!",
+              "id": "legacy-assignment",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 50,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 10485760
+              },
+              "worker_requirements": {
+                "assignment_constraints": [],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [],
+                "selected_skills": [],
+                "skills": [],
+                "tools": []
+              },
+              "write_scopes": [
+                "greet.py"
+              ]
+            }
+          ]
+        },
+        "source": "control_plane"
+      }
+    ],
+    "recovery": {
+      "cancellation": null,
+      "resumable": false,
+      "resumable_blocker": null,
+      "state": "recovered"
+    },
+    "recovery_history": [],
+    "restart_recoveries": [],
+    "results": [
+      {
+        "artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+        "artifacts": [
+          {
+            "kind": "base_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/d861c6c7-b160-41a5-8574-a3b850e31f02/22684b2d-464d-4037-8212-02d32f680ba2/base.bundle",
+            "sha256": "bd368d1fdcc7011cf12bff1dea6646fac6b284f1b0eb6303381a8ede424a9405",
+            "size_bytes": 305
+          },
+          {
+            "kind": "candidate_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/d861c6c7-b160-41a5-8574-a3b850e31f02/22684b2d-464d-4037-8212-02d32f680ba2/candidate.bundle",
+            "sha256": "df270ca39dfaa8d71603ee44d8eeaf12452ab40b6578ebbbfd3535a1a5de7b3b",
+            "size_bytes": 601
+          },
+          {
+            "kind": "integrated_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/d861c6c7-b160-41a5-8574-a3b850e31f02/22684b2d-464d-4037-8212-02d32f680ba2/integrated.bundle",
+            "sha256": "68fe7aeef8b816652c8e7e754282f7b7ba11ae77391be965c94d8f265eca7803",
+            "size_bytes": 606
+          }
+        ],
+        "attempt_id": "22684b2d-464d-4037-8212-02d32f680ba2",
+        "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+        "candidate_commits": [
+          "33ebee8b9295e73ef1b332f6e686242fae50bf88"
+        ],
+        "changed_paths": [
+          "greet.py"
+        ],
+        "created_at": 1790264890,
+        "id": "f0ac51df-4362-4fb4-8e68-5a3703c85a1e",
+        "integrated_artifact_revision": "33ebee8b9295e73ef1b332f6e686242fae50bf88",
+        "known_effects": [],
+        "mandate_revision": 1,
+        "output": "Created greet.py file that prints 'Hello from an Entry Session!' when executed with python3. The output matches the acceptance criteria exactly.",
+        "plan_revision": 1,
+        "profile_claim_outcomes": [],
+        "revision_disposition": "current",
+        "skill_executions": [],
+        "status": "accepted",
+        "verification_outcomes": [
+          {
+            "criterion_id": "greets",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 greet.py)\\\" = 'Hello from an Entry Session!'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "candidate",
+            "verification_attempt_id": "424ccdb6-6280-4bba-882e-f527afccc053",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "greets",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 greet.py)\\\" = 'Hello from an Entry Session!'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 greet.py)\" = 'Hello from an Entry Session!'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "f01b7fe1-2584-4544-a846-e4b94819f528",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          }
+        ]
+      }
+    ],
+    "retention_materials": [
+      {
+        "attempt_id": "22684b2d-464d-4037-8212-02d32f680ba2",
+        "captured_adapter_events": 18,
+        "captured_worker_output": true,
+        "content_available": true,
+        "content_bytes": 2737,
+        "created_at": 1790264876,
+        "expired_at": null,
+        "expires_at": 1792856891,
+        "id": "transcript:22684b2d-464d-4037-8212-02d32f680ba2",
+        "kind": "raw_worker_transcript",
+        "pinned": false,
+        "result_id": null,
+        "retained_by_claim": false,
+        "retained_by_evidence": false,
+        "retained_for_uncertain_effect": false
+      }
+    ],
+    "run_report": {
+      "approval_gates": {
+        "authorized": 0,
+        "consumed": 0,
+        "invalidated_or_revoked": 0,
+        "open": 0,
+        "required": 0
+      },
+      "conflicts": {
+        "reconciliation_required_events": 0
+      },
+      "context_transfer": {
+        "attachment_takeovers": 0,
+        "manual_events": 0,
+        "manual_worker_clarifications": 0
+      },
+      "corrections": {
+        "attempt_recoveries": 0,
+        "worker_reported": 0
+      },
+      "cost": {
+        "reported_model_cents": 2,
+        "reserved_model_spend_cents": 50,
+        "reserved_paid_service_spend_cents": 0
+      },
+      "failures": {
+        "failed_attempts": 0,
+        "failed_evidence": 0,
+        "failed_or_uncertain_effects": 0,
+        "interrupted_attempts": 0,
+        "security_invariant_failures": 0,
+        "uncertain_evidence": 0
+      },
+      "planned_principal_controls": {
+        "provenance": "accepted_known_uncertainty",
+        "total": 0,
+        "worker_controls": 0
+      },
+      "reconciliation": {
+        "assignments": 0,
+        "principal_effect_reconciliations": 0
+      },
+      "recovery_events": {
+        "attempt_recoveries": 0,
+        "restart_recoveries": 0,
+        "watchdog_findings": 0
+      },
+      "timing": {
+        "accepted_at": 1790264876,
+        "completed_at": 1790264891,
+        "created_at": 1790264876,
+        "total_elapsed_millis": 15000,
+        "worker_execution_millis": 14347
+      },
+      "unplanned_principal_interventions": {
+        "commission_amendments": 0,
+        "required_approval_gate_actions_excluded": true,
+        "total": 0,
+        "worker_controls": 0
+      },
+      "useful_concurrency": {
+        "elapsed_time_reduction_millis": 0,
+        "end_to_end_elapsed_millis": 0,
+        "occurred": false,
+        "overlap_millis": 0,
+        "parallel_execution_window_millis": 0,
+        "serial_attempt_millis": 0,
+        "serial_execution_millis": 0,
+        "success_metric": "verified execution elapsed-time reduction"
+      }
+    },
+    "skill_associations": [],
+    "verification": {
+      "next_action": "closed",
+      "reason": "Every current Acceptance Criterion passes.",
+      "verdict": "passed"
+    },
+    "verification_gates": [],
+    "verification_recoveries": [],
+    "watchdog": {
+      "findings": [],
+      "monitored_signals": [
+        "stall",
+        "unhealthy_retry_pattern",
+        "repeated_verification_failure",
+        "abnormal_resource_use",
+        "lost_liveness",
+        "invalid_authority"
+      ]
+    },
+    "worker_commands": [],
+    "workers": [
+      {
+        "activity_at_ms": 1790264891975,
+        "assignment": {
+          "goal": "Create greet.py so that running it prints exactly: Hello from an Entry Session!",
+          "id": "d274dc85-668d-4244-a31c-03365a8a3e90",
+          "logical_id": "legacy-assignment"
+        },
+        "attempt_id": "22684b2d-464d-4037-8212-02d32f680ba2",
+        "available_controls": [
+          "inspect"
+        ],
+        "configuration": {
+          "adapter": {
+            "command": [
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/fd78f2da30999b5c85335cea3484664680184fc7e2641141a5c0f7efab2fcd4c"
+            ],
+            "kind": "claude_agent_sdk",
+            "sha256": "fd78f2da30999b5c85335cea3484664680184fc7e2641141a5c0f7efab2fcd4c",
+            "version": "0.2.0"
+          },
+          "assignment_constraints": [
+            "coding"
+          ],
+          "authority_actions": [
+            "codex.git_change"
+          ],
+          "authority_scope_types": [
+            "repository",
+            "path",
+            "action"
+          ],
+          "available": true,
+          "capabilities": [
+            "structured_lifecycle",
+            "semantic_interrupt",
+            "terminal_state",
+            "usage",
+            "skills",
+            "result_submission",
+            "contained"
+          ],
+          "containment_profile": "docker-hardened-v1-517b4b0b4206c075",
+          "context": {
+            "capacity_tokens": 200000,
+            "strategy": "fresh"
+          },
+          "harness": "claude",
+          "id": "claude-haiku-cheap",
+          "metrics": {
+            "commission_elapsed_time_contribution_ms": 1000,
+            "continuity": 0,
+            "cost_cents": 1,
+            "expected_verified_correctness": 9000,
+            "first_pass_acceptance": 9000,
+            "preference_adherence": 9000
+          },
+          "model": "claude-haiku-4-5-20251001",
+          "replacement_class": "cheap-coding",
+          "resource_limits": {
+            "max_concurrency_slots": 1,
+            "max_model_spend_cents": 200,
+            "max_paid_service_spend_cents": 0,
+            "max_storage_bytes": 10485760
+          },
+          "selected_skills": [],
+          "settings": {},
+          "skills": [],
+          "tools": [
+            "git"
+          ]
+        },
+        "elapsed_time_ms": 14347,
+        "handle": "Arya",
+        "id": "ededaf23-ba4e-4b5f-a8c2-7fa44aff2e0d",
+        "latest_meaningful_activity": "Result accepted",
+        "native_session_id": "335f86b4-aac0-472b-8901-af18c262d31b",
+        "routing_rationale": {
+          "eligible": [
+            "claude-haiku-cheap"
+          ],
+          "entry_harness": "claude",
+          "entry_harness_preference_applied": false,
+          "ineligible": [],
+          "ordering": [
+            "expected_verified_correctness",
+            "preference_adherence",
+            "first_pass_acceptance",
+            "commission_elapsed_time_contribution",
+            "cost",
+            "continuity"
+          ]
+        },
+        "started_at_ms": 1790264876161,
+        "status": "succeeded",
+        "usage": {
+          "cost_cents": 2,
+          "input_tokens": 102,
+          "output_tokens": 33
+        }
+      }
+    ]
+  },
+  "summary_markdown": "# Tyrion Commission Record\n\nChecksum: `sha256:32421ac03b6f96a80669cfa7e936c525f811f9779afa00904339cfb44dd745ef`\n\nCommission: `d861c6c7-b160-41a5-8574-a3b850e31f02`\n\nStatus: `verified_complete`\n\nDogfood readiness: `unassessed`\n\nAcceptance Criteria: `1/1` passed\n\nContainment scope: This export preserves containment Evidence but does not independently attest the runtime.\n",
+  "version": 1
+}
