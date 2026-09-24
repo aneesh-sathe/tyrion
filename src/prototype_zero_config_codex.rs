@@ -52,9 +52,9 @@ pub fn select_runtime(facts: RuntimeFacts) -> RuntimeDecision {
         None => reasons.push("Docker missing".into()),
     }
     match facts.guest_codex_version.as_deref() {
-        Some("codex-cli 0.147.0") => {}
-        Some(version) => reasons.push(format!("expected guest Codex 0.147.0, found {version}")),
-        None => reasons.push("pinned Linux guest Codex 0.147.0 missing".into()),
+        Some("codex-cli 0.156.1") => {}
+        Some(version) => reasons.push(format!("expected guest Codex 0.156.1, found {version}")),
+        None => reasons.push("pinned Linux guest Codex 0.156.1 missing".into()),
     }
     if facts.guest_codex_version.is_none() {
         if let Some(version) = facts.ambient_codex_version {

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -27,7 +27,7 @@ use crate::TyrionError;
 /// root, no host path is ever bind-mounted in, and the only writable mount is
 /// the sized `/sandbox` tmpfs.
 pub(super) const CONTAINMENT_PROFILE: &str = "docker-hardened-v1";
-const CODEX_VERSION: &str = "codex-cli 0.147.0";
+const CODEX_VERSION: &str = "codex-cli 0.156.1";
 /// The single writable mount inside every sandbox.
 const SANDBOX_ROOT: &str = "/sandbox";
 /// Every container and network Tyrion creates carries its Attempt, so
@@ -101,6 +101,12 @@ struct RuntimeConfig {
     /// host never implies permission to use it.
     #[serde(default)]
     worker_credentials: Vec<String>,
+    /// A Codex subscription login on the host. Codex reads tokens from a file
+    /// rather than the environment, so Tyrion reads this at dispatch and
+    /// streams a minimal disposable copy into the sandbox. Absent means Codex
+    /// Workers get no credential at all.
+    #[serde(default)]
+    codex_auth_file: Option<PathBuf>,
     #[serde(default)]
     claude: Option<ClaudeRuntimeConfig>,
     #[serde(default)]
@@ -448,6 +454,9 @@ impl ContainedCodexRuntime {
                 profile.binary_environment
             )));
         }
+        if configuration.adapter.kind == super::routing::WorkerAdapterKind::CodexAppServer {
+            self.deliver_codex_login(&sandbox, assignment.lease_expires_at)?;
+        }
         if let Some(git_attempt) = git_attempt {
             sandbox.upload(
                 &git_attempt.base_bundle,
@@ -458,6 +467,48 @@ impl ContainedCodexRuntime {
         Ok(StructuredAdapterSandbox {
             sandbox: Some(sandbox),
         })
+    }
+
+    /// Codex reads its subscription login from a file rather than the
+    /// environment, so the equivalent of forwarding one named variable is to
+    /// copy exactly the four token fields into a disposable guest home. Only
+    /// those fields travel; the host file is never uploaded wholesale, never
+    /// logged, and never reaches a command line.
+    fn deliver_codex_login(&self, sandbox: &Sandbox<'_>, deadline: i64) -> Result<(), TyrionError> {
+        let Some(path) = self.config.codex_auth_file.as_ref() else {
+            return Ok(());
+        };
+        let host: Value = serde_json::from_slice(&fs::read(path)?).map_err(|_| {
+            TyrionError::InvalidRequest("the Codex login file is not valid JSON".into())
+        })?;
+        let field = |name: &str| -> Result<String, TyrionError> {
+            host["tokens"][name]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    TyrionError::InvalidRequest(format!(
+                        "the Codex login file has no tokens.{name}; run `codex login` first"
+                    ))
+                })
+        };
+        let guest = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": Value::Null,
+            "tokens": {
+                "id_token": field("id_token")?,
+                "access_token": field("access_token")?,
+                "refresh_token": field("refresh_token")?,
+                "account_id": field("account_id")?,
+            },
+            "last_refresh": host["last_refresh"].as_str().unwrap_or_default(),
+        });
+        sandbox.upload_bytes(
+            &serde_json::to_vec(&guest)?,
+            "/sandbox/.codex/auth.json",
+            "600",
+            deadline,
+        )
     }
 
     fn structured_runtime_profile(
@@ -1261,6 +1312,47 @@ impl<'a> Sandbox<'a> {
         ]);
         command.stdin(Stdio::from(source));
         require_success("Docker sandbox upload", run_until(command, deadline)?)?;
+        Ok(())
+    }
+
+    /// Stream bytes Tyrion holds in memory into the sandbox. Used for
+    /// credential material, which must never touch host disk or a command
+    /// line on its way in.
+    fn upload_bytes(
+        &self,
+        bytes: &[u8],
+        remote: &str,
+        mode: &str,
+        deadline: i64,
+    ) -> Result<(), TyrionError> {
+        let quoted = shell_quote(remote);
+        let script = format!(
+            "set -eu; mkdir -p \"$(dirname {quoted})\"; umask 077; cat > {quoted}; chmod {mode} {quoted}"
+        );
+        let mut command = self.runtime.docker_command(&[
+            "exec",
+            "--interactive",
+            &self.name,
+            "sh",
+            "-c",
+            &script,
+        ]);
+        command.stdin(Stdio::piped());
+        ensure_lease_active(deadline)?;
+        let mut child = command.spawn()?;
+        {
+            let mut input = child.stdin.take().ok_or_else(|| {
+                TyrionError::InvalidRequest("sandbox upload has no input channel".into())
+            })?;
+            input.write_all(bytes)?;
+            input.flush()?;
+        }
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(TyrionError::InvalidRequest(
+                "Docker sandbox credential upload failed".into(),
+            ));
+        }
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 # Contained Codex Git assignments
 
-Tyrion supports one production Git assignment profile: Codex CLI `0.147.0`
+Tyrion supports one production Git assignment profile: Codex CLI `0.156.1`
 inside a hardened Docker container. One disposable container holds each
 Attempt, each verification run, and each comparison. The boundary is
 qualified in
@@ -59,7 +59,7 @@ It also pins the Docker CLI by SHA-256 and version, and takes an explicit
 
 Copy [`runtime/docker/codex-worker.example.json`](../runtime/docker/codex-worker.example.json),
 fill in the absolute paths and digests, and record the actual SHA-256 of the
-Linux aarch64 Codex binary. It must report `codex-cli 0.147.0`, and Tyrion
+Linux aarch64 Codex binary. It must report `codex-cli 0.156.1`, and Tyrion
 probes that version only after uploading it into the container, because it is
 a guest-only Linux binary.
 

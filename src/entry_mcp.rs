@@ -195,6 +195,7 @@ fn call_tool(state: &mut EntryState<'_>, params: &Value) -> Result<Value, Tyrion
     match params["name"].as_str().unwrap_or_default() {
         "tyrion_start_commission" => start_commission(state, &arguments),
         "tyrion_status" => commission_status(state, &arguments),
+        "tyrion_export_record" => export_record(state, &arguments),
         "tyrion_cancel_commission" => cancel_commission(state),
         name => Err(TyrionError::InvalidRequest(format!(
             "unknown Tyrion Entry tool {name}"
@@ -367,6 +368,27 @@ fn commission_status(state: &EntryState<'_>, arguments: &Value) -> Result<Value,
     Ok(tool_result(inspected))
 }
 
+/// The record is the artifact that says what actually happened. Requiring the
+/// Principal to leave the Entry Session and rejoin over the CLI to read it
+/// would defeat the point of the Entry Session.
+fn export_record(state: &EntryState<'_>, arguments: &Value) -> Result<Value, TyrionError> {
+    let commission_id = arguments
+        .get("commission_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| state.current_commission_id.clone())
+        .ok_or_else(|| {
+            TyrionError::InvalidRequest("no Commission is active in this session".into())
+        })?;
+    let exported = authenticated_data(
+        state,
+        Command::ExportCommissionRecord { commission_id },
+        None,
+        None,
+    )?;
+    Ok(tool_result(exported))
+}
+
 fn cancel_commission(state: &mut EntryState<'_>) -> Result<Value, TyrionError> {
     let commission_id = state.current_commission_id.clone().ok_or_else(|| {
         TyrionError::InvalidRequest("no Commission is active in this session".into())
@@ -473,6 +495,19 @@ fn tools() -> Value {
             "name": "tyrion_status",
             "title": "Inspect Tyrion Commission",
             "description": "Inspect the current Commission or a specified Commission id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "commission_id": {"type": "string"}
+                },
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "tyrion_export_record",
+            "title": "Export Tyrion Commission Record",
+            "description": "Export the checksummed durable record for the current Commission or a specified Commission id: mandate, routes, Attempts, Results, Evidence, Integration, events, and the final run report. Use it to show the user what was actually done and proven.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

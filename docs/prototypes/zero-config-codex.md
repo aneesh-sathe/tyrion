@@ -39,7 +39,7 @@ The design is viable if Tyrion owns a vetted runtime bundle and generates its
 session-local inputs. Ambient host executables are not enough: the tested
 machine had Codex `0.150.1` but no OpenShell, and the existing production
 contract requires repaired OpenShell `0.0.104` plus a pinned Linux Codex
-`0.147.0` Worker artifact. Distribution and discovery of that bundle is the
+`0.156.1` Worker artifact. Distribution and discovery of that bundle is the
 remaining production problem.
 
 Primary source: local branch `prototype/zero-config-codex`, created for

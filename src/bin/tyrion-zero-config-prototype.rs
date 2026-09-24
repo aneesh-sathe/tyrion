@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const EXPECTED_CODEX: &str = "codex-cli 0.147.0";
+const EXPECTED_CODEX: &str = "codex-cli 0.156.1";
 
 fn main() {
     if invoked_as_codex() {

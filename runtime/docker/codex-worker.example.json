@@ -6,7 +6,7 @@
   "worker_image": "registry.example/tyrion-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "worker_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "codex_binary": "/opt/tyrion/runtime/codex-linux-arm64",
-  "codex_version": "codex-cli 0.147.0",
+  "codex_version": "codex-cli 0.156.1",
   "codex_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "model": "gpt-5-codex",
   "egress": {

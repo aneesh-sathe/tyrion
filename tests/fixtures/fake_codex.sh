@@ -11,7 +11,7 @@ if [ "${1:-}" = "--version" ]; then
         printf '%s\n' 'codex-cli 0.146.0'
         exit 0
     fi
-    printf '%s\n' 'codex-cli 0.147.0'
+    printf '%s\n' 'codex-cli 0.156.1'
     exit 0
 fi
 
