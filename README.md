@@ -4,7 +4,9 @@ Tyrion is a local control plane for coding agents. You give it a Goal, define wh
 
 A Worker may produce a candidate Result, but it cannot declare its own work accepted. Tyrion checks the Result against the accepted criteria, integrates verified Git changes into daemon-owned state, and reports either Verified Completion or a concrete Blocker.
 
-This repository is a dogfood MVP, not a packaged end-user release. The deterministic path runs on a Unix host with no model account. The contained production Worker path currently targets Apple Silicon macOS and requires a repaired, pinned OpenShell runtime.
+This repository is a dogfood MVP, not a packaged end-user release. The deterministic path runs on a Unix host with no model account. The contained production Worker path targets Apple Silicon macOS and needs Docker plus a pinned Worker image.
+
+Both Tier 1 Worker harnesses run real models under that boundary today. On 2026-09-24 a single Commission ran Codex `gpt-5.6-sol` and Claude Haiku concurrently on disjoint Assignments and produced one verified integrated artifact, 20.1 seconds faster than running them in sequence. The exported records are checked in under [`docs/dogfood-records/`](docs/dogfood-records/).
 
 ## Why Tyrion exists
 
@@ -252,9 +254,9 @@ The repository contains reference structured adapters for Codex app-server, Clau
 
 ## Run with production Workers
 
-The deterministic walkthrough does not prove the MicroVM boundary. Real Git work requires the repaired OpenShell runtime and pinned artifacts.
+The deterministic walkthrough does not prove the containment boundary. Real Git work needs Docker, a pinned Worker image, and the pinned harness binaries.
 
-Do not begin by guessing values in the runtime JSON. Startup verifies paths, versions, hashes, the OpenShell source revision, policy files, the base image, VM limits, and native binaries. Follow the setup document for the role you need:
+Do not begin by guessing values in the runtime JSON. Startup verifies paths, versions, hashes, the Docker CLI identity, the Worker image identity, and the resource ceilings, and it refuses to start rather than run something unverified. Follow the setup document for the role you need:
 
 - [Contained Codex Git assignments](docs/contained-codex.md)
 - [Cross-harness Worker routing and control](docs/cross-harness-workers.md)
@@ -272,7 +274,9 @@ target/debug/tyriond \
   --credential-runtime /absolute/path/to/credential-runtime.json
 ```
 
-`runtime/openshell/codex-worker.example.json` documents the required shape. It is not ready to run until every path and digest matches the local repaired runtime.
+[`runtime/docker/codex-worker.example.json`](runtime/docker/codex-worker.example.json) documents the required shape and [`runtime/docker/README.md`](runtime/docker/README.md) explains each field. It is not ready to run until every path and digest matches your machine.
+
+`--credential-runtime` still uses the older OpenShell profile. It drives only the exceptional one-shot credentialed Effect Sandbox, not Worker containment, and is the last remaining OpenShell consumer.
 
 ## Inspect and control work
 
@@ -327,7 +331,9 @@ target/debug/tyrion principal --help
 - `src/store/schema.rs` owns schema and migration invariants.
 - `src/worker/` contains routing, adapter contracts, containment, and execution.
 - `adapters/` contains the reference structured Worker adapters and Pi Entry extension.
-- `runtime/openshell/` contains pinned policies, the repair patch, and runtime examples.
+- `runtime/docker/` contains the Worker image, its runtime configuration example, and setup notes.
+- `runtime/openshell/` remains only for the one-shot credentialed Effect Sandbox.
+- `docs/dogfood-records/` holds checksummed exported Commission records from real runs.
 - `tests/` exercises the public CLI and socket protocol with real SQLite state and daemon restarts.
 
 ## Verify the repository
@@ -341,13 +347,33 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-The default suite uses deterministic protocol fakes for external Agent Harnesses. The ignored real-runtime test is a separate boundary attestation and requires the repaired OpenShell setup described in [Contained Codex Git assignments](docs/contained-codex.md).
+The default suite uses deterministic protocol fakes for external Agent Harnesses. The ignored real-runtime test is a separate boundary attestation and needs the Docker setup described in [Contained Codex Git assignments](docs/contained-codex.md).
+
+Fakes are a convenience, not evidence. Running real harnesses for the first time surfaced ten defects the green suite could not, every one of them because a fake agreed with the adapter instead of behaving like the real harness. Where the two now disagree, the fake was changed.
 
 ## Project status
 
 Tyrion is built for one Principal on one local machine. It is not a multi-user service, a general workflow engine, or a claim that an agent can safely act without bounded authority and independent checks.
 
-The full product definition and testing decisions live in [issue 1](https://github.com/aneesh-sathe/tyrion/issues/1). Current implementation work is tracked in the repository issues.
+Proven with real models, with a checked-in record for each:
+
+- A Commission driven end to end from an Entry Session, the same MCP interface Claude Code holds open.
+- Codex and Claude running concurrently on disjoint Assignments, producing one verified integrated artifact and measurably beating serial execution.
+- Candidate and integrated verification, each in a separate fresh container.
+- Interruption, and restart recovery against a Worker container genuinely orphaned by killing the daemon mid-Attempt.
+
+Measured, not assumed:
+
+- The containment boundary, attacked directly rather than described. Every escape attempt blocked; the probe is `.scratch/docker-qual-20260921/escape.sh` and the results are in [the qualification](docs/prototypes/docker-containment-qualification.md).
+- A completed Commission leaves the Principal checkout byte-identical, asserted over every path, mode and content digest.
+
+Stated limits, because they matter more than the claims:
+
+- Sibling Attempts are isolated at namespace strength, not VM strength.
+- Containment does not bound what a provider credential can spend at the far end.
+- The exporter reports readiness only as `blocked` or `unassessed`. It never certifies itself ready.
+
+The full product definition and testing decisions live in [issue 1](https://github.com/aneesh-sathe/tyrion/issues/1). Remaining work is tracked in the repository issues.
 
 ## License
 
