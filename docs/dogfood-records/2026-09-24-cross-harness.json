@@ -1,0 +1,2303 @@
+{
+  "checksum": "sha256:acf61fe0e4ef2dd1d2f0d0214bcde93204e7caf28de1a0035a7cf8019599cc6e",
+  "dogfood_readiness": {
+    "automatic_ready_claims_supported": false,
+    "blockers": [],
+    "status": "unassessed"
+  },
+  "exported_at": 1790283878751,
+  "format": "tyrion.commission",
+  "record": {
+    "activity_journal": {
+      "useful_concurrency": {
+        "elapsed_time_reduction_millis": 20057,
+        "end_to_end_elapsed_millis": 22530,
+        "occurred": true,
+        "overlap_millis": 20057,
+        "parallel_execution_window_millis": 20652,
+        "serial_attempt_millis": 40709,
+        "serial_execution_millis": 40709,
+        "success_metric": "verified execution elapsed-time reduction"
+      }
+    },
+    "approval_gates": [],
+    "assignments": [
+      {
+        "competition": null,
+        "created_at": 1790283720,
+        "id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+        "logical_id": "alpha",
+        "plan_revision": 1,
+        "position": 0,
+        "purpose": "critical_path",
+        "read_scopes": [],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_model_spend_cents": 0,
+          "max_paid_service_spend_cents": 0,
+          "max_storage_bytes": 5242880
+        },
+        "route": {
+          "decided_at": 1790283720,
+          "rationale": {
+            "eligible": [
+              "codex-cheap"
+            ],
+            "entry_harness": "codex",
+            "entry_harness_preference_applied": false,
+            "ineligible": [
+              {
+                "configuration_id": "claude-cheap",
+                "failed_gates": [
+                  "required_configuration"
+                ]
+              }
+            ],
+            "ordering": [
+              "expected_verified_correctness",
+              "preference_adherence",
+              "first_pass_acceptance",
+              "commission_elapsed_time_contribution",
+              "cost",
+              "continuity"
+            ]
+          },
+          "selected_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/aab8ff18c66b6827a28da879fa7cf6fbd91a04bf1e2dfcd37aba36b29330c949"
+              ],
+              "kind": "codex_app_server",
+              "sha256": "aab8ff18c66b6827a28da879fa7cf6fbd91a04bf1e2dfcd37aba36b29330c949",
+              "version": "0.156.1"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "docker-hardened-v1-a2f66a9b639df2dd",
+            "context": {
+              "capacity_tokens": 200000,
+              "strategy": "fresh"
+            },
+            "harness": "codex",
+            "id": "codex-cheap",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 1,
+              "expected_verified_correctness": 9000,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "gpt-5.6-sol",
+            "replacement_class": "cheap-coding",
+            "resource_limits": {
+              "max_concurrency_slots": 2,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760
+            },
+            "selected_skills": [],
+            "settings": {
+              "reasoning_effort": "low"
+            },
+            "skills": [],
+            "tools": [
+              "git"
+            ]
+          },
+          "status": "selected"
+        },
+        "skill_defaults": [],
+        "status": "accepted",
+        "write_scopes": [
+          "alpha.py"
+        ]
+      },
+      {
+        "competition": null,
+        "created_at": 1790283720,
+        "id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+        "logical_id": "beta",
+        "plan_revision": 1,
+        "position": 1,
+        "purpose": "critical_path",
+        "read_scopes": [],
+        "resources": {
+          "concurrency_slots": 1,
+          "max_model_spend_cents": 50,
+          "max_paid_service_spend_cents": 0,
+          "max_storage_bytes": 5242880
+        },
+        "route": {
+          "decided_at": 1790283720,
+          "rationale": {
+            "eligible": [
+              "claude-cheap"
+            ],
+            "entry_harness": "codex",
+            "entry_harness_preference_applied": false,
+            "ineligible": [
+              {
+                "configuration_id": "codex-cheap",
+                "failed_gates": [
+                  "required_configuration",
+                  "resource_limits"
+                ]
+              }
+            ],
+            "ordering": [
+              "expected_verified_correctness",
+              "preference_adherence",
+              "first_pass_acceptance",
+              "commission_elapsed_time_contribution",
+              "cost",
+              "continuity"
+            ]
+          },
+          "selected_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/a71dba4166e10c7414eb9b82c558eb28cf3eb444805e4850dc0193633be5ad87"
+              ],
+              "kind": "claude_agent_sdk",
+              "sha256": "a71dba4166e10c7414eb9b82c558eb28cf3eb444805e4850dc0193633be5ad87",
+              "version": "0.2.0"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "docker-hardened-v1-a2f66a9b639df2dd",
+            "context": {
+              "capacity_tokens": 200000,
+              "strategy": "fresh"
+            },
+            "harness": "claude",
+            "id": "claude-cheap",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 2,
+              "expected_verified_correctness": 9000,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "claude-haiku-4-5-20251001",
+            "replacement_class": "cheap-coding",
+            "resource_limits": {
+              "max_concurrency_slots": 2,
+              "max_model_spend_cents": 50,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760
+            },
+            "selected_skills": [],
+            "settings": {},
+            "skills": [],
+            "tools": [
+              "git"
+            ]
+          },
+          "status": "selected"
+        },
+        "skill_defaults": [],
+        "status": "accepted",
+        "write_scopes": [
+          "beta.py"
+        ]
+      }
+    ],
+    "attachments": [
+      {
+        "adapter_identity": "codex-mcp-entry",
+        "adapter_version": "1.0.0",
+        "harness": "codex",
+        "id": "0d60c097-34fa-47ad-9909-815a7a0f8358",
+        "joined_at": 1790283720,
+        "mode": "full",
+        "native_session_id": "codex-run",
+        "role": "active"
+      }
+    ],
+    "attempts": [
+      {
+        "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+        "cleanup_pending": false,
+        "completed_at": 1790283742,
+        "completed_at_ms": 1790283742737,
+        "execution_completed_at_ms": 1790283740859,
+        "id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+        "lease": {
+          "expires_at": 1790284620,
+          "id": "c021346e-82cb-47c6-ac1f-324c99431d18",
+          "issued_at": 1790283720,
+          "mandate_revision": 1,
+          "released_at": 1790283742,
+          "status": "released"
+        },
+        "reservation": {
+          "concurrency_slots": 1,
+          "model_spend_cents": 0,
+          "paid_service_spend_cents": 0,
+          "status": "released",
+          "storage_bytes": 5242880
+        },
+        "revision_disposition": "current",
+        "started_at": 1790283720,
+        "started_at_ms": 1790283720207,
+        "status": "succeeded",
+        "worker_configuration": "codex-cheap",
+        "worker_context_packet": {
+          "advisory": {
+            "authority_effect": {
+              "approval_gates": false,
+              "credentials": false,
+              "resource_ceilings": false,
+              "routing": false
+            },
+            "budget": {
+              "accounting": "utf8_byte_upper_bound",
+              "complete_slice_limit_tokens": 15000,
+              "hard_max_tokens": 15000,
+              "target_tokens": 2000,
+              "tokens_used": 2,
+              "worker_context_fraction_basis_points": 800
+            },
+            "instruction": "Profile Claims are advisory and yield to every binding source above.",
+            "profile_claims": []
+          },
+          "binding": {
+            "acceptance_criteria": [
+              {
+                "id": "alpha",
+                "required_evidence": "command_output",
+                "verification_depth": "standard",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {
+                  "argv": [
+                    "sh",
+                    "-c",
+                    "test \"$(python3 alpha.py)\" = 'alpha ready'"
+                  ],
+                  "kind": "command"
+                },
+                "verifier_configuration": "contained-command-v1",
+                "verifier_type": "deterministic"
+              }
+            ],
+            "authority_envelope": {
+              "actions": [
+                "codex.git_change"
+              ],
+              "destinations": [],
+              "effects": [],
+              "paths": [
+                "alpha.py",
+                "beta.py"
+              ],
+              "repositories": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+              ]
+            },
+            "commission_constraints": [],
+            "current_principal_instructions": [
+              "Add two independent greeting modules, one per harness."
+            ],
+            "current_repository_evidence": {
+              "artifact_revision": null,
+              "execution": {
+                "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+                "kind": "codex_git",
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+              },
+              "project_id": null
+            },
+            "resource_ceilings": {
+              "max_attempts": 2,
+              "max_elapsed_seconds": 900,
+              "max_model_spend_cents": 50,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760,
+              "max_worker_concurrency": 2
+            }
+          },
+          "precedence": [
+            "current_principal_instructions",
+            "commission_constraints",
+            "acceptance_criteria",
+            "authority_envelope",
+            "resource_ceilings",
+            "current_repository_evidence",
+            "advisory_profile_claims"
+          ],
+          "version": 1
+        }
+      },
+      {
+        "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+        "cleanup_pending": false,
+        "completed_at": 1790283741,
+        "completed_at_ms": 1790283741770,
+        "execution_completed_at_ms": 1790283740269,
+        "id": "c0040549-76ec-44d4-bad7-2602b8391125",
+        "lease": {
+          "expires_at": 1790284620,
+          "id": "1c283e82-9ee8-4b9e-8679-db4fea886a1e",
+          "issued_at": 1790283720,
+          "mandate_revision": 1,
+          "released_at": 1790283741,
+          "status": "released"
+        },
+        "reservation": {
+          "concurrency_slots": 1,
+          "model_spend_cents": 50,
+          "paid_service_spend_cents": 0,
+          "status": "released",
+          "storage_bytes": 5242880
+        },
+        "revision_disposition": "current",
+        "started_at": 1790283720,
+        "started_at_ms": 1790283720212,
+        "status": "succeeded",
+        "worker_configuration": "claude-cheap",
+        "worker_context_packet": {
+          "advisory": {
+            "authority_effect": {
+              "approval_gates": false,
+              "credentials": false,
+              "resource_ceilings": false,
+              "routing": false
+            },
+            "budget": {
+              "accounting": "utf8_byte_upper_bound",
+              "complete_slice_limit_tokens": 15000,
+              "hard_max_tokens": 15000,
+              "target_tokens": 2000,
+              "tokens_used": 2,
+              "worker_context_fraction_basis_points": 800
+            },
+            "instruction": "Profile Claims are advisory and yield to every binding source above.",
+            "profile_claims": []
+          },
+          "binding": {
+            "acceptance_criteria": [
+              {
+                "id": "beta",
+                "required_evidence": "command_output",
+                "verification_depth": "standard",
+                "verification_environment": "tyrion-controlled-v1",
+                "verifier": {
+                  "argv": [
+                    "sh",
+                    "-c",
+                    "test \"$(python3 beta.py)\" = 'beta ready'"
+                  ],
+                  "kind": "command"
+                },
+                "verifier_configuration": "contained-command-v1",
+                "verifier_type": "deterministic"
+              }
+            ],
+            "authority_envelope": {
+              "actions": [
+                "codex.git_change"
+              ],
+              "destinations": [],
+              "effects": [],
+              "paths": [
+                "alpha.py",
+                "beta.py"
+              ],
+              "repositories": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+              ]
+            },
+            "commission_constraints": [],
+            "current_principal_instructions": [
+              "Add two independent greeting modules, one per harness."
+            ],
+            "current_repository_evidence": {
+              "artifact_revision": null,
+              "execution": {
+                "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+                "kind": "codex_git",
+                "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+              },
+              "project_id": null
+            },
+            "resource_ceilings": {
+              "max_attempts": 2,
+              "max_elapsed_seconds": 900,
+              "max_model_spend_cents": 50,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760,
+              "max_worker_concurrency": 2
+            }
+          },
+          "precedence": [
+            "current_principal_instructions",
+            "commission_constraints",
+            "acceptance_criteria",
+            "authority_envelope",
+            "resource_ceilings",
+            "current_repository_evidence",
+            "advisory_profile_claims"
+          ],
+          "version": 1
+        }
+      }
+    ],
+    "attention_conditions": [],
+    "blockers": [],
+    "briefing": {
+      "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+      "commission_id": "4df25433-e304-4683-b778-edc1c5be0abe",
+      "completion_revision": 2,
+      "criteria": [
+        {
+          "criterion_id": "alpha",
+          "description": "alpha.py prints its line",
+          "evidence": {
+            "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+            "created_at": 1790283742,
+            "criterion_id": "alpha",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+            "id": "b0bd2bfb-cfe0-460c-a041-83237756b2f8",
+            "mandate_revision": 1,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+            "verifier_kind": "command"
+          },
+          "status": "passed"
+        },
+        {
+          "criterion_id": "beta",
+          "description": "beta.py prints its line",
+          "evidence": {
+            "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+            "created_at": 1790283742,
+            "criterion_id": "beta",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+            "id": "bcbcc4c6-e30c-4898-86db-a17a658b7aa0",
+            "mandate_revision": 1,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+            "verifier_kind": "command"
+          },
+          "status": "passed"
+        }
+      ],
+      "learning_receipts": [],
+      "run_report": {
+        "approval_gates": {
+          "authorized": 0,
+          "consumed": 0,
+          "invalidated_or_revoked": 0,
+          "open": 0,
+          "required": 0
+        },
+        "conflicts": {
+          "reconciliation_required_events": 0
+        },
+        "context_transfer": {
+          "attachment_takeovers": 0,
+          "manual_events": 0,
+          "manual_worker_clarifications": 0
+        },
+        "corrections": {
+          "attempt_recoveries": 0,
+          "worker_reported": 0
+        },
+        "cost": {
+          "reported_model_cents": 3,
+          "reserved_model_spend_cents": 50,
+          "reserved_paid_service_spend_cents": 0
+        },
+        "failures": {
+          "failed_attempts": 0,
+          "failed_evidence": 1,
+          "failed_or_uncertain_effects": 0,
+          "interrupted_attempts": 0,
+          "security_invariant_failures": 0,
+          "uncertain_evidence": 0
+        },
+        "planned_principal_controls": {
+          "provenance": "accepted_known_uncertainty",
+          "total": 0,
+          "worker_controls": 0
+        },
+        "reconciliation": {
+          "assignments": 0,
+          "principal_effect_reconciliations": 0
+        },
+        "recovery_events": {
+          "attempt_recoveries": 0,
+          "restart_recoveries": 0,
+          "watchdog_findings": 0
+        },
+        "timing": {
+          "accepted_at": 1790283720,
+          "completed_at": 1790283742,
+          "created_at": 1790283720,
+          "total_elapsed_millis": 22000,
+          "worker_execution_millis": 40709
+        },
+        "unplanned_principal_interventions": {
+          "commission_amendments": 0,
+          "required_approval_gate_actions_excluded": true,
+          "total": 0,
+          "worker_controls": 0
+        },
+        "useful_concurrency": {
+          "elapsed_time_reduction_millis": 20057,
+          "end_to_end_elapsed_millis": 22530,
+          "occurred": true,
+          "overlap_millis": 20057,
+          "parallel_execution_window_millis": 20652,
+          "serial_attempt_millis": 40709,
+          "serial_execution_millis": 40709,
+          "success_metric": "verified execution elapsed-time reduction"
+        }
+      },
+      "summary": "Verified Complete: Add two independent greeting modules, one per harness.",
+      "title": "Verified Completion"
+    },
+    "commission": {
+      "accepted_at": 1790283720,
+      "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+      "authority": {
+        "actions": [
+          "codex.git_change"
+        ],
+        "destinations": [],
+        "effects": [],
+        "paths": [
+          "alpha.py",
+          "beta.py"
+        ],
+        "repositories": [
+          "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+        ]
+      },
+      "completed_at": 1790283742,
+      "constraints": [],
+      "control_revision": 0,
+      "created_at": 1790283720,
+      "execution": {
+        "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+        "kind": "codex_git",
+        "repository": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/entry-project"
+      },
+      "goal": "Add two independent greeting modules, one per harness.",
+      "id": "4df25433-e304-4683-b778-edc1c5be0abe",
+      "known_uncertainties": [],
+      "project_id": null,
+      "proposed_plan": {
+        "assignments": [
+          {
+            "criterion_ids": [
+              "alpha"
+            ],
+            "dependencies": [],
+            "goal": "Create alpha.py so that running it prints exactly: alpha ready",
+            "id": "alpha",
+            "purpose": "critical_path",
+            "read_scopes": [],
+            "resources": {
+              "concurrency_slots": 1,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "worker_requirements": {
+              "assignment_constraints": [
+                "coding"
+              ],
+              "capabilities": [],
+              "exclude_configurations": [],
+              "min_context_tokens": 0,
+              "require_configurations": [
+                "codex-cheap"
+              ],
+              "selected_skills": [],
+              "skills": [],
+              "tools": [
+                "git"
+              ]
+            },
+            "write_scopes": [
+              "alpha.py"
+            ]
+          },
+          {
+            "criterion_ids": [
+              "beta"
+            ],
+            "dependencies": [],
+            "goal": "Create beta.py so that running it prints exactly: beta ready",
+            "id": "beta",
+            "purpose": "critical_path",
+            "read_scopes": [],
+            "resources": {
+              "concurrency_slots": 1,
+              "max_model_spend_cents": 50,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 5242880
+            },
+            "worker_requirements": {
+              "assignment_constraints": [
+                "coding"
+              ],
+              "capabilities": [],
+              "exclude_configurations": [],
+              "min_context_tokens": 0,
+              "require_configurations": [
+                "claude-cheap"
+              ],
+              "selected_skills": [],
+              "skills": [],
+              "tools": [
+                "git"
+              ]
+            },
+            "write_scopes": [
+              "beta.py"
+            ]
+          }
+        ]
+      },
+      "resource_ceilings": {
+        "max_attempts": 2,
+        "max_elapsed_seconds": 900,
+        "max_model_spend_cents": 50,
+        "max_paid_service_spend_cents": 0,
+        "max_storage_bytes": 10485760,
+        "max_worker_concurrency": 2
+      },
+      "revision": 2,
+      "status": "verified_complete",
+      "worker_requirements": {
+        "assignment_constraints": [],
+        "capabilities": [],
+        "exclude_configurations": [],
+        "min_context_tokens": 0,
+        "require_configurations": [],
+        "selected_skills": [],
+        "skills": [],
+        "tools": []
+      }
+    },
+    "commission_amendments": [],
+    "credential_exposure_grants": [],
+    "credential_grants": [],
+    "criteria": [
+      {
+        "description": "alpha.py prints its line",
+        "id": "alpha",
+        "required_evidence": "command_output",
+        "status": "passed",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 alpha.py)\" = 'alpha ready'"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      },
+      {
+        "description": "beta.py prints its line",
+        "id": "beta",
+        "required_evidence": "command_output",
+        "status": "passed",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 beta.py)\" = 'beta ready'"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "criterion_versions": [
+      {
+        "description": "alpha.py prints its line",
+        "id": "alpha",
+        "mandate_revision": 1,
+        "required_evidence": "command_output",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 alpha.py)\" = 'alpha ready'"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      },
+      {
+        "description": "beta.py prints its line",
+        "id": "beta",
+        "mandate_revision": 1,
+        "required_evidence": "command_output",
+        "verification_depth": "standard",
+        "verification_environment": "tyrion-controlled-v1",
+        "verifier": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 beta.py)\" = 'beta ready'"
+          ],
+          "kind": "command"
+        },
+        "verifier_configuration": "contained-command-v1",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "events": [
+      {
+        "commission_revision": 0,
+        "created_at": 1790283720,
+        "payload": {},
+        "sequence": 1,
+        "type": "commission_proposed"
+      },
+      {
+        "commission_revision": 0,
+        "created_at": 1790283720,
+        "payload": {
+          "attachment_id": "0d60c097-34fa-47ad-9909-815a7a0f8358",
+          "role": "active"
+        },
+        "sequence": 2,
+        "type": "attachment_joined"
+      },
+      {
+        "commission_revision": 0,
+        "created_at": 1790283720,
+        "payload": {
+          "active_attachment_id": "0d60c097-34fa-47ad-9909-815a7a0f8358",
+          "previous_active_attachment_id": null
+        },
+        "sequence": 3,
+        "type": "active_attachment_changed"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {},
+        "sequence": 4,
+        "type": "commission_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "plan_revision": 1,
+          "reason": "initial_decomposition",
+          "source": "entry_model"
+        },
+        "sequence": 5,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "logical_id": "alpha",
+          "plan_revision": 1
+        },
+        "sequence": 6,
+        "type": "assignment_ready"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "logical_id": "beta",
+          "plan_revision": 1
+        },
+        "sequence": 7,
+        "type": "assignment_ready"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "logical_id": "alpha",
+          "plan_revision": 1,
+          "started_at_ms": 1790283720207,
+          "worker_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/aab8ff18c66b6827a28da879fa7cf6fbd91a04bf1e2dfcd37aba36b29330c949"
+              ],
+              "kind": "codex_app_server",
+              "sha256": "aab8ff18c66b6827a28da879fa7cf6fbd91a04bf1e2dfcd37aba36b29330c949",
+              "version": "0.156.1"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "docker-hardened-v1-a2f66a9b639df2dd",
+            "context": {
+              "capacity_tokens": 200000,
+              "strategy": "fresh"
+            },
+            "harness": "codex",
+            "id": "codex-cheap",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 1,
+              "expected_verified_correctness": 9000,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "gpt-5.6-sol",
+            "replacement_class": "cheap-coding",
+            "resource_limits": {
+              "max_concurrency_slots": 2,
+              "max_model_spend_cents": 0,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760
+            },
+            "selected_skills": [],
+            "settings": {
+              "reasoning_effort": "low"
+            },
+            "skills": [],
+            "tools": [
+              "git"
+            ]
+          },
+          "worker_handle": "Arya",
+          "worker_id": "d0dd56b9-98b9-4412-b257-5406f30a6320"
+        },
+        "sequence": 8,
+        "type": "attempt_started"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "activity": "Worker launched",
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "worker_handle": "Arya",
+          "worker_id": "d0dd56b9-98b9-4412-b257-5406f30a6320"
+        },
+        "sequence": 9,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+          "concurrency_slots": 1,
+          "model_spend_cents": 0,
+          "paid_service_spend_cents": 0,
+          "reserved_atomically": true,
+          "storage_bytes": 5242880
+        },
+        "sequence": 10,
+        "type": "resources_reserved"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "logical_id": "beta",
+          "plan_revision": 1,
+          "started_at_ms": 1790283720212,
+          "worker_configuration": {
+            "adapter": {
+              "command": [
+                "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/a71dba4166e10c7414eb9b82c558eb28cf3eb444805e4850dc0193633be5ad87"
+              ],
+              "kind": "claude_agent_sdk",
+              "sha256": "a71dba4166e10c7414eb9b82c558eb28cf3eb444805e4850dc0193633be5ad87",
+              "version": "0.2.0"
+            },
+            "assignment_constraints": [
+              "coding"
+            ],
+            "authority_actions": [
+              "codex.git_change"
+            ],
+            "authority_scope_types": [
+              "repository",
+              "path",
+              "action"
+            ],
+            "available": true,
+            "capabilities": [
+              "structured_lifecycle",
+              "semantic_interrupt",
+              "terminal_state",
+              "usage",
+              "skills",
+              "result_submission",
+              "contained"
+            ],
+            "containment_profile": "docker-hardened-v1-a2f66a9b639df2dd",
+            "context": {
+              "capacity_tokens": 200000,
+              "strategy": "fresh"
+            },
+            "harness": "claude",
+            "id": "claude-cheap",
+            "metrics": {
+              "commission_elapsed_time_contribution_ms": 1000,
+              "continuity": 0,
+              "cost_cents": 2,
+              "expected_verified_correctness": 9000,
+              "first_pass_acceptance": 9000,
+              "preference_adherence": 9000
+            },
+            "model": "claude-haiku-4-5-20251001",
+            "replacement_class": "cheap-coding",
+            "resource_limits": {
+              "max_concurrency_slots": 2,
+              "max_model_spend_cents": 50,
+              "max_paid_service_spend_cents": 0,
+              "max_storage_bytes": 10485760
+            },
+            "selected_skills": [],
+            "settings": {},
+            "skills": [],
+            "tools": [
+              "git"
+            ]
+          },
+          "worker_handle": "Brienne",
+          "worker_id": "673fc8ae-c9c5-4f6e-a6b8-f77e55b7f94d"
+        },
+        "sequence": 11,
+        "type": "attempt_started"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "activity": "Worker launched",
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "worker_handle": "Brienne",
+          "worker_id": "673fc8ae-c9c5-4f6e-a6b8-f77e55b7f94d"
+        },
+        "sequence": 12,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283720,
+        "payload": {
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "attempt_id": "c0040549-76ec-44d4-bad7-2602b8391125",
+          "concurrency_slots": 1,
+          "model_spend_cents": 50,
+          "paid_service_spend_cents": 0,
+          "reserved_atomically": true,
+          "storage_bytes": 5242880
+        },
+        "sequence": 13,
+        "type": "resources_reserved"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283740,
+        "payload": {},
+        "sequence": 14,
+        "type": "result_submitted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283740,
+        "payload": {
+          "activity": "Claude session started",
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "attempt_id": "c0040549-76ec-44d4-bad7-2602b8391125",
+          "native_session_id": "c4a8a21b-cded-48ec-806d-426ac0b0f777",
+          "usage": {
+            "cost_cents": 3,
+            "input_tokens": 100,
+            "output_tokens": 20
+          }
+        },
+        "sequence": 15,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283740,
+        "payload": {},
+        "sequence": 16,
+        "type": "result_submitted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283740,
+        "payload": {
+          "activity": "Codex produced a structured Result",
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+          "native_session_id": "01a0d539-bdb2-7401-850c-6dc397f1afcf",
+          "usage": {
+            "cost_cents": 0,
+            "input_tokens": 40403,
+            "output_tokens": 202
+          }
+        },
+        "sequence": 17,
+        "type": "worker_activity"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283740,
+        "payload": {},
+        "sequence": 18,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283741,
+        "payload": {},
+        "sequence": 19,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283741,
+        "payload": {
+          "artifact_revision": "c3ee6f6557799921a87be6773013f2b1802a07f7",
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "logical_id": "beta",
+          "plan_revision": 1,
+          "result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589",
+          "serialized": true
+        },
+        "sequence": 20,
+        "type": "result_integrated"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283741,
+        "payload": {},
+        "sequence": 21,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283741,
+        "payload": {},
+        "sequence": 22,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283741,
+        "payload": {
+          "assignment_id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "attempt_id": "c0040549-76ec-44d4-bad7-2602b8391125",
+          "result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589"
+        },
+        "sequence": 23,
+        "type": "result_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283741,
+        "payload": {
+          "execution_frontier": [],
+          "plan_revision": 2,
+          "reason": "evidence_advanced_frontier",
+          "source_result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589"
+        },
+        "sequence": 24,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283742,
+        "payload": {
+          "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "logical_id": "alpha",
+          "plan_revision": 1,
+          "result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+          "serialized": true
+        },
+        "sequence": 25,
+        "type": "result_integrated"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283742,
+        "payload": {},
+        "sequence": 26,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283742,
+        "payload": {},
+        "sequence": 27,
+        "type": "evidence_recorded"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283742,
+        "payload": {
+          "assignment_id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+          "result_id": "46275627-2290-4383-9665-59eeedc70e4d"
+        },
+        "sequence": 28,
+        "type": "result_accepted"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283742,
+        "payload": {
+          "attempt_ids": [
+            "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+            "c0040549-76ec-44d4-bad7-2602b8391125"
+          ],
+          "elapsed_time_reduction_millis": 20057,
+          "end_to_end_elapsed_millis": 22530,
+          "overlap_millis": 20057,
+          "parallel_execution_window_millis": 20652,
+          "serial_execution_millis": 40709,
+          "success_metric": "verified execution elapsed-time reduction",
+          "trigger_attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4"
+        },
+        "sequence": 29,
+        "type": "useful_concurrency_observed"
+      },
+      {
+        "commission_revision": 1,
+        "created_at": 1790283742,
+        "payload": {
+          "execution_frontier": [],
+          "plan_revision": 3,
+          "reason": "evidence_advanced_frontier",
+          "source_result_id": "46275627-2290-4383-9665-59eeedc70e4d"
+        },
+        "sequence": 30,
+        "type": "plan_revised"
+      },
+      {
+        "commission_revision": 2,
+        "created_at": 1790283742,
+        "payload": {},
+        "sequence": 31,
+        "type": "commission_verified_complete"
+      }
+    ],
+    "evidence": [
+      {
+        "artifact_revision": "c3ee6f6557799921a87be6773013f2b1802a07f7",
+        "created_at": 1790283740,
+        "criterion_id": "beta",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+        "id": "d0de55f2-27a0-4a91-865d-bc2c995c7f50",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 beta.py)\" = 'beta ready'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589",
+        "scope": "candidate",
+        "verification_attempt_id": "d58f3413-02ed-4200-9fb3-b4937b87dcc5",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "890279b9d32c9742bc863d4a3e3d70342e5dffc9",
+        "created_at": 1790283741,
+        "criterion_id": "alpha",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+        "id": "2e9aaa00-cbc4-42cb-a23a-d918b406304e",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 alpha.py)\" = 'alpha ready'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+        "scope": "candidate",
+        "verification_attempt_id": "b100c1c7-2a8e-4915-92e6-2bf2cdc80f58",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "c3ee6f6557799921a87be6773013f2b1802a07f7",
+        "created_at": 1790283741,
+        "criterion_id": "alpha",
+        "current": false,
+        "defect": "result",
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+        "id": "3a68c46c-8cc3-4ac3-943e-1b0f3f272bee",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=1; stdout=; stderr=python3: can't open file '/sandbox/repository/alpha.py': [Errno 2] No such file or directory\n",
+        "outcome": "failed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 alpha.py)\" = 'alpha ready'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589",
+        "scope": "integrated",
+        "verification_attempt_id": "597afc37-b9c1-48fb-9a58-7134f34dbdd6",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "c3ee6f6557799921a87be6773013f2b1802a07f7",
+        "created_at": 1790283741,
+        "criterion_id": "beta",
+        "current": false,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+        "id": "c11747cf-93c5-4f6e-b87f-66e23104d856",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 beta.py)\" = 'beta ready'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589",
+        "scope": "integrated",
+        "verification_attempt_id": "676a7244-a2d3-4b23-aed1-555ba1b54365",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+        "created_at": 1790283742,
+        "criterion_id": "alpha",
+        "current": true,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+        "id": "b0bd2bfb-cfe0-460c-a041-83237756b2f8",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 alpha.py)\" = 'alpha ready'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+        "scope": "integrated",
+        "verification_attempt_id": "15e67a51-f913-4f18-9fd9-de1165b06a9a",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      },
+      {
+        "artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+        "created_at": 1790283742,
+        "criterion_id": "beta",
+        "current": true,
+        "defect": null,
+        "environment": "tyrion-controlled-v1",
+        "evidence_type": "command_output",
+        "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+        "id": "bcbcc4c6-e30c-4898-86db-a17a658b7aa0",
+        "mandate_revision": 1,
+        "material_contradiction": false,
+        "observed": "exit=0; stdout=; stderr=",
+        "outcome": "passed",
+        "procedure": {
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(python3 beta.py)\" = 'beta ready'"
+          ],
+          "kind": "command"
+        },
+        "producer_attempt_id": null,
+        "result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+        "scope": "integrated",
+        "verification_attempt_id": "ccc78eea-d567-44bc-9707-af7dc8c0ff6d",
+        "verifier_configuration": "contained-command-v1",
+        "verifier_identity": "contained-command-1",
+        "verifier_kind": "command",
+        "verifier_type": "deterministic"
+      }
+    ],
+    "execution_frontier": [],
+    "frontier_holds": [],
+    "operation_requests": [],
+    "plans": [
+      {
+        "created_at": 1790283720,
+        "reason": "initial decomposition exposed the first safe Execution Frontier",
+        "revision": 1,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "alpha"
+              ],
+              "dependencies": [],
+              "goal": "Create alpha.py so that running it prints exactly: alpha ready",
+              "id": "alpha",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [
+                  "codex-cheap"
+                ],
+                "selected_skills": [],
+                "skills": [],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "alpha.py"
+              ]
+            },
+            {
+              "criterion_ids": [
+                "beta"
+              ],
+              "dependencies": [],
+              "goal": "Create beta.py so that running it prints exactly: beta ready",
+              "id": "beta",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 50,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [
+                  "claude-cheap"
+                ],
+                "selected_skills": [],
+                "skills": [],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "beta.py"
+              ]
+            }
+          ]
+        },
+        "source": "entry_model"
+      },
+      {
+        "created_at": 1790283741,
+        "reason": "current Evidence advanced the safe Execution Frontier",
+        "revision": 2,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "alpha"
+              ],
+              "dependencies": [],
+              "goal": "Create alpha.py so that running it prints exactly: alpha ready",
+              "id": "alpha",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [
+                  "codex-cheap"
+                ],
+                "selected_skills": [],
+                "skills": [],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "alpha.py"
+              ]
+            },
+            {
+              "criterion_ids": [
+                "beta"
+              ],
+              "dependencies": [],
+              "goal": "Create beta.py so that running it prints exactly: beta ready",
+              "id": "beta",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 50,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [
+                  "claude-cheap"
+                ],
+                "selected_skills": [],
+                "skills": [],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "beta.py"
+              ]
+            }
+          ],
+          "evidence_result_id": "6aec70b8-9cd4-4a39-9557-49a16ef02589",
+          "execution_frontier": []
+        },
+        "source": "control_plane"
+      },
+      {
+        "created_at": 1790283742,
+        "reason": "current Evidence advanced the safe Execution Frontier",
+        "revision": 3,
+        "snapshot": {
+          "assignments": [
+            {
+              "criterion_ids": [
+                "alpha"
+              ],
+              "dependencies": [],
+              "goal": "Create alpha.py so that running it prints exactly: alpha ready",
+              "id": "alpha",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 0,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [
+                  "codex-cheap"
+                ],
+                "selected_skills": [],
+                "skills": [],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "alpha.py"
+              ]
+            },
+            {
+              "criterion_ids": [
+                "beta"
+              ],
+              "dependencies": [],
+              "goal": "Create beta.py so that running it prints exactly: beta ready",
+              "id": "beta",
+              "purpose": "critical_path",
+              "read_scopes": [],
+              "resources": {
+                "concurrency_slots": 1,
+                "max_model_spend_cents": 50,
+                "max_paid_service_spend_cents": 0,
+                "max_storage_bytes": 5242880
+              },
+              "worker_requirements": {
+                "assignment_constraints": [
+                  "coding"
+                ],
+                "capabilities": [],
+                "exclude_configurations": [],
+                "min_context_tokens": 0,
+                "require_configurations": [
+                  "claude-cheap"
+                ],
+                "selected_skills": [],
+                "skills": [],
+                "tools": [
+                  "git"
+                ]
+              },
+              "write_scopes": [
+                "beta.py"
+              ]
+            }
+          ],
+          "evidence_result_id": "46275627-2290-4383-9665-59eeedc70e4d",
+          "execution_frontier": []
+        },
+        "source": "control_plane"
+      }
+    ],
+    "recovery": {
+      "cancellation": null,
+      "resumable": false,
+      "resumable_blocker": null,
+      "state": "recovered"
+    },
+    "recovery_history": [],
+    "restart_recoveries": [],
+    "results": [
+      {
+        "artifact_revision": "890279b9d32c9742bc863d4a3e3d70342e5dffc9",
+        "artifacts": [
+          {
+            "kind": "base_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/4df25433-e304-4683-b778-edc1c5be0abe/b5e44481-a685-4a61-bb9b-4e49f0bb38a4/base.bundle",
+            "sha256": "bd368d1fdcc7011cf12bff1dea6646fac6b284f1b0eb6303381a8ede424a9405",
+            "size_bytes": 305
+          },
+          {
+            "kind": "candidate_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/4df25433-e304-4683-b778-edc1c5be0abe/b5e44481-a685-4a61-bb9b-4e49f0bb38a4/candidate.bundle",
+            "sha256": "4a6f288cb0a739014435fffe8d9a8d7bf4eb4d95db295b04eb52e3323c2b7b0f",
+            "size_bytes": 584
+          },
+          {
+            "kind": "integrated_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/4df25433-e304-4683-b778-edc1c5be0abe/b5e44481-a685-4a61-bb9b-4e49f0bb38a4/integrated.bundle",
+            "sha256": "5b5f74f4ad06fbd4f654fd32844fcceaf559c33dee4a68f3319a9f61e7a930f1",
+            "size_bytes": 934
+          }
+        ],
+        "attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+        "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+        "candidate_commits": [
+          "890279b9d32c9742bc863d4a3e3d70342e5dffc9"
+        ],
+        "changed_paths": [
+          "alpha.py"
+        ],
+        "created_at": 1790283740,
+        "id": "46275627-2290-4383-9665-59eeedc70e4d",
+        "integrated_artifact_revision": "cebb168790473d867c88c33866df5dcaad580067",
+        "known_effects": [],
+        "mandate_revision": 1,
+        "output": "Created alpha.py. The exact acceptance command passed (exit code 0); running it prints exactly: alpha ready",
+        "plan_revision": 1,
+        "profile_claim_outcomes": [],
+        "revision_disposition": "current",
+        "skill_executions": [],
+        "status": "accepted",
+        "verification_outcomes": [
+          {
+            "criterion_id": "alpha",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 alpha.py)\" = 'alpha ready'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "candidate",
+            "verification_attempt_id": "b100c1c7-2a8e-4915-92e6-2bf2cdc80f58",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "alpha",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 alpha.py)\" = 'alpha ready'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "15e67a51-f913-4f18-9fd9-de1165b06a9a",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "beta",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 beta.py)\" = 'beta ready'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "ccc78eea-d567-44bc-9707-af7dc8c0ff6d",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          }
+        ]
+      },
+      {
+        "artifact_revision": "c3ee6f6557799921a87be6773013f2b1802a07f7",
+        "artifacts": [
+          {
+            "kind": "base_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/4df25433-e304-4683-b778-edc1c5be0abe/c0040549-76ec-44d4-bad7-2602b8391125/base.bundle",
+            "sha256": "bd368d1fdcc7011cf12bff1dea6646fac6b284f1b0eb6303381a8ede424a9405",
+            "size_bytes": 305
+          },
+          {
+            "kind": "candidate_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/4df25433-e304-4683-b778-edc1c5be0abe/c0040549-76ec-44d4-bad7-2602b8391125/candidate.bundle",
+            "sha256": "db1f65c31cb4d57542e6ccb8e8e4682b8a712540d9c86c4e2c1a936615bced1b",
+            "size_bytes": 580
+          },
+          {
+            "kind": "integrated_git_bundle",
+            "path": "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/artifacts/4df25433-e304-4683-b778-edc1c5be0abe/c0040549-76ec-44d4-bad7-2602b8391125/integrated.bundle",
+            "sha256": "20cb05ffcfc51c251dd626ee0fbb82d4ccc0d07053d8280c9306f017696096a9",
+            "size_bytes": 585
+          }
+        ],
+        "attempt_id": "c0040549-76ec-44d4-bad7-2602b8391125",
+        "base_revision": "e24de716a521c9911a92d51ec6876c9d69044c4c",
+        "candidate_commits": [
+          "c3ee6f6557799921a87be6773013f2b1802a07f7"
+        ],
+        "changed_paths": [
+          "beta.py"
+        ],
+        "created_at": 1790283740,
+        "id": "6aec70b8-9cd4-4a39-9557-49a16ef02589",
+        "integrated_artifact_revision": "c3ee6f6557799921a87be6773013f2b1802a07f7",
+        "known_effects": [],
+        "mandate_revision": 1,
+        "output": "Created beta.py file that prints exactly \"beta ready\" when executed. Verified the output matches the acceptance criteria test: test \"$(python3 beta.py)\" = 'beta ready'.",
+        "plan_revision": 1,
+        "profile_claim_outcomes": [],
+        "revision_disposition": "current",
+        "skill_executions": [],
+        "status": "accepted",
+        "verification_outcomes": [
+          {
+            "criterion_id": "beta",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 beta.py)\" = 'beta ready'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "candidate",
+            "verification_attempt_id": "d58f3413-02ed-4200-9fb3-b4937b87dcc5",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "alpha",
+            "defect": "result",
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 alpha.py)\\\" = 'alpha ready'\"]",
+            "material_contradiction": false,
+            "observed": "exit=1; stdout=; stderr=python3: can't open file '/sandbox/repository/alpha.py': [Errno 2] No such file or directory\n",
+            "outcome": "failed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 alpha.py)\" = 'alpha ready'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "597afc37-b9c1-48fb-9a58-7134f34dbdd6",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          },
+          {
+            "criterion_id": "beta",
+            "defect": null,
+            "environment": "tyrion-controlled-v1",
+            "evidence_type": "command_output",
+            "expected": "[\"sh\",\"-c\",\"test \\\"$(python3 beta.py)\\\" = 'beta ready'\"]",
+            "material_contradiction": false,
+            "observed": "exit=0; stdout=; stderr=",
+            "outcome": "passed",
+            "procedure": {
+              "argv": [
+                "sh",
+                "-c",
+                "test \"$(python3 beta.py)\" = 'beta ready'"
+              ],
+              "kind": "command"
+            },
+            "producer_attempt_id": null,
+            "scope": "integrated",
+            "verification_attempt_id": "676a7244-a2d3-4b23-aed1-555ba1b54365",
+            "verifier_configuration": "contained-command-v1",
+            "verifier_identity": "contained-command-1",
+            "verifier_kind": "command",
+            "verifier_type": "deterministic"
+          }
+        ]
+      }
+    ],
+    "retention_materials": [
+      {
+        "attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+        "captured_adapter_events": 12,
+        "captured_worker_output": true,
+        "content_available": true,
+        "content_bytes": 6980,
+        "created_at": 1790283720,
+        "expired_at": null,
+        "expires_at": 1792875742,
+        "id": "transcript:b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+        "kind": "raw_worker_transcript",
+        "pinned": false,
+        "result_id": null,
+        "retained_by_claim": false,
+        "retained_by_evidence": false,
+        "retained_for_uncertain_effect": false
+      },
+      {
+        "attempt_id": "c0040549-76ec-44d4-bad7-2602b8391125",
+        "captured_adapter_events": 16,
+        "captured_worker_output": true,
+        "content_available": true,
+        "content_bytes": 2310,
+        "created_at": 1790283720,
+        "expired_at": null,
+        "expires_at": 1792875742,
+        "id": "transcript:c0040549-76ec-44d4-bad7-2602b8391125",
+        "kind": "raw_worker_transcript",
+        "pinned": false,
+        "result_id": null,
+        "retained_by_claim": false,
+        "retained_by_evidence": false,
+        "retained_for_uncertain_effect": false
+      }
+    ],
+    "run_report": {
+      "approval_gates": {
+        "authorized": 0,
+        "consumed": 0,
+        "invalidated_or_revoked": 0,
+        "open": 0,
+        "required": 0
+      },
+      "conflicts": {
+        "reconciliation_required_events": 0
+      },
+      "context_transfer": {
+        "attachment_takeovers": 0,
+        "manual_events": 0,
+        "manual_worker_clarifications": 0
+      },
+      "corrections": {
+        "attempt_recoveries": 0,
+        "worker_reported": 0
+      },
+      "cost": {
+        "reported_model_cents": 3,
+        "reserved_model_spend_cents": 50,
+        "reserved_paid_service_spend_cents": 0
+      },
+      "failures": {
+        "failed_attempts": 0,
+        "failed_evidence": 1,
+        "failed_or_uncertain_effects": 0,
+        "interrupted_attempts": 0,
+        "security_invariant_failures": 0,
+        "uncertain_evidence": 0
+      },
+      "planned_principal_controls": {
+        "provenance": "accepted_known_uncertainty",
+        "total": 0,
+        "worker_controls": 0
+      },
+      "reconciliation": {
+        "assignments": 0,
+        "principal_effect_reconciliations": 0
+      },
+      "recovery_events": {
+        "attempt_recoveries": 0,
+        "restart_recoveries": 0,
+        "watchdog_findings": 0
+      },
+      "timing": {
+        "accepted_at": 1790283720,
+        "completed_at": 1790283742,
+        "created_at": 1790283720,
+        "total_elapsed_millis": 22000,
+        "worker_execution_millis": 40709
+      },
+      "unplanned_principal_interventions": {
+        "commission_amendments": 0,
+        "required_approval_gate_actions_excluded": true,
+        "total": 0,
+        "worker_controls": 0
+      },
+      "useful_concurrency": {
+        "elapsed_time_reduction_millis": 20057,
+        "end_to_end_elapsed_millis": 22530,
+        "occurred": true,
+        "overlap_millis": 20057,
+        "parallel_execution_window_millis": 20652,
+        "serial_attempt_millis": 40709,
+        "serial_execution_millis": 40709,
+        "success_metric": "verified execution elapsed-time reduction"
+      }
+    },
+    "skill_associations": [],
+    "verification": {
+      "next_action": "closed",
+      "reason": "Every current Acceptance Criterion passes.",
+      "verdict": "passed"
+    },
+    "verification_gates": [],
+    "verification_recoveries": [],
+    "watchdog": {
+      "findings": [],
+      "monitored_signals": [
+        "stall",
+        "unhealthy_retry_pattern",
+        "repeated_verification_failure",
+        "abnormal_resource_use",
+        "lost_liveness",
+        "invalid_authority"
+      ]
+    },
+    "worker_commands": [],
+    "workers": [
+      {
+        "activity_at_ms": 1790283742737,
+        "assignment": {
+          "goal": "Create alpha.py so that running it prints exactly: alpha ready",
+          "id": "675d40c9-22b1-4b09-8451-89f5687e2af4",
+          "logical_id": "alpha"
+        },
+        "attempt_id": "b5e44481-a685-4a61-bb9b-4e49f0bb38a4",
+        "available_controls": [
+          "inspect"
+        ],
+        "configuration": {
+          "adapter": {
+            "command": [
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/aab8ff18c66b6827a28da879fa7cf6fbd91a04bf1e2dfcd37aba36b29330c949"
+            ],
+            "kind": "codex_app_server",
+            "sha256": "aab8ff18c66b6827a28da879fa7cf6fbd91a04bf1e2dfcd37aba36b29330c949",
+            "version": "0.156.1"
+          },
+          "assignment_constraints": [
+            "coding"
+          ],
+          "authority_actions": [
+            "codex.git_change"
+          ],
+          "authority_scope_types": [
+            "repository",
+            "path",
+            "action"
+          ],
+          "available": true,
+          "capabilities": [
+            "structured_lifecycle",
+            "semantic_interrupt",
+            "terminal_state",
+            "usage",
+            "skills",
+            "result_submission",
+            "contained"
+          ],
+          "containment_profile": "docker-hardened-v1-a2f66a9b639df2dd",
+          "context": {
+            "capacity_tokens": 200000,
+            "strategy": "fresh"
+          },
+          "harness": "codex",
+          "id": "codex-cheap",
+          "metrics": {
+            "commission_elapsed_time_contribution_ms": 1000,
+            "continuity": 0,
+            "cost_cents": 1,
+            "expected_verified_correctness": 9000,
+            "first_pass_acceptance": 9000,
+            "preference_adherence": 9000
+          },
+          "model": "gpt-5.6-sol",
+          "replacement_class": "cheap-coding",
+          "resource_limits": {
+            "max_concurrency_slots": 2,
+            "max_model_spend_cents": 0,
+            "max_paid_service_spend_cents": 0,
+            "max_storage_bytes": 10485760
+          },
+          "selected_skills": [],
+          "settings": {
+            "reasoning_effort": "low"
+          },
+          "skills": [],
+          "tools": [
+            "git"
+          ]
+        },
+        "elapsed_time_ms": 20652,
+        "handle": "Arya",
+        "id": "d0dd56b9-98b9-4412-b257-5406f30a6320",
+        "latest_meaningful_activity": "Result accepted",
+        "native_session_id": "01a0d539-bdb2-7401-850c-6dc397f1afcf",
+        "routing_rationale": {
+          "eligible": [
+            "codex-cheap"
+          ],
+          "entry_harness": "codex",
+          "entry_harness_preference_applied": false,
+          "ineligible": [
+            {
+              "configuration_id": "claude-cheap",
+              "failed_gates": [
+                "required_configuration"
+              ]
+            }
+          ],
+          "ordering": [
+            "expected_verified_correctness",
+            "preference_adherence",
+            "first_pass_acceptance",
+            "commission_elapsed_time_contribution",
+            "cost",
+            "continuity"
+          ]
+        },
+        "started_at_ms": 1790283720207,
+        "status": "succeeded",
+        "usage": {
+          "cost_cents": 0,
+          "input_tokens": 40403,
+          "output_tokens": 202
+        }
+      },
+      {
+        "activity_at_ms": 1790283741770,
+        "assignment": {
+          "goal": "Create beta.py so that running it prints exactly: beta ready",
+          "id": "0eb8c3e3-c7de-467e-b2e1-03a3aeddb84f",
+          "logical_id": "beta"
+        },
+        "attempt_id": "c0040549-76ec-44d4-bad7-2602b8391125",
+        "available_controls": [
+          "inspect"
+        ],
+        "configuration": {
+          "adapter": {
+            "command": [
+              "/Users/aneeshsathe/projects/ideas/tyrion/.scratch/run1/data/worker-adapters/a71dba4166e10c7414eb9b82c558eb28cf3eb444805e4850dc0193633be5ad87"
+            ],
+            "kind": "claude_agent_sdk",
+            "sha256": "a71dba4166e10c7414eb9b82c558eb28cf3eb444805e4850dc0193633be5ad87",
+            "version": "0.2.0"
+          },
+          "assignment_constraints": [
+            "coding"
+          ],
+          "authority_actions": [
+            "codex.git_change"
+          ],
+          "authority_scope_types": [
+            "repository",
+            "path",
+            "action"
+          ],
+          "available": true,
+          "capabilities": [
+            "structured_lifecycle",
+            "semantic_interrupt",
+            "terminal_state",
+            "usage",
+            "skills",
+            "result_submission",
+            "contained"
+          ],
+          "containment_profile": "docker-hardened-v1-a2f66a9b639df2dd",
+          "context": {
+            "capacity_tokens": 200000,
+            "strategy": "fresh"
+          },
+          "harness": "claude",
+          "id": "claude-cheap",
+          "metrics": {
+            "commission_elapsed_time_contribution_ms": 1000,
+            "continuity": 0,
+            "cost_cents": 2,
+            "expected_verified_correctness": 9000,
+            "first_pass_acceptance": 9000,
+            "preference_adherence": 9000
+          },
+          "model": "claude-haiku-4-5-20251001",
+          "replacement_class": "cheap-coding",
+          "resource_limits": {
+            "max_concurrency_slots": 2,
+            "max_model_spend_cents": 50,
+            "max_paid_service_spend_cents": 0,
+            "max_storage_bytes": 10485760
+          },
+          "selected_skills": [],
+          "settings": {},
+          "skills": [],
+          "tools": [
+            "git"
+          ]
+        },
+        "elapsed_time_ms": 20057,
+        "handle": "Brienne",
+        "id": "673fc8ae-c9c5-4f6e-a6b8-f77e55b7f94d",
+        "latest_meaningful_activity": "Result accepted",
+        "native_session_id": "c4a8a21b-cded-48ec-806d-426ac0b0f777",
+        "routing_rationale": {
+          "eligible": [
+            "claude-cheap"
+          ],
+          "entry_harness": "codex",
+          "entry_harness_preference_applied": false,
+          "ineligible": [
+            {
+              "configuration_id": "codex-cheap",
+              "failed_gates": [
+                "required_configuration",
+                "resource_limits"
+              ]
+            }
+          ],
+          "ordering": [
+            "expected_verified_correctness",
+            "preference_adherence",
+            "first_pass_acceptance",
+            "commission_elapsed_time_contribution",
+            "cost",
+            "continuity"
+          ]
+        },
+        "started_at_ms": 1790283720212,
+        "status": "succeeded",
+        "usage": {
+          "cost_cents": 3,
+          "input_tokens": 100,
+          "output_tokens": 20
+        }
+      }
+    ]
+  },
+  "summary_markdown": "# Tyrion Commission Record\n\nChecksum: `sha256:acf61fe0e4ef2dd1d2f0d0214bcde93204e7caf28de1a0035a7cf8019599cc6e`\n\nCommission: `4df25433-e304-4683-b778-edc1c5be0abe`\n\nStatus: `verified_complete`\n\nDogfood readiness: `unassessed`\n\nAcceptance Criteria: `2/2` passed\n\nContainment scope: This export preserves containment Evidence but does not independently attest the runtime.\n",
+  "version": 1
+}
