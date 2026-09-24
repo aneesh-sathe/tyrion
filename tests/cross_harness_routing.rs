@@ -2569,7 +2569,7 @@ fn worker_catalog() -> Value {
             {
                 "id": "codex-deep",
                 "harness": "codex",
-                "adapter": {"kind": "codex_app_server", "version": "0.147.0"},
+                "adapter": {"kind": "codex_app_server", "version": "0.156.1"},
                 "model": "gpt-5.3-codex",
                 "settings": {"reasoning_effort": "xhigh"},
                 "tools": ["git"],
@@ -2631,7 +2631,7 @@ fn worker_catalog() -> Value {
             {
                 "id": "codex-fast",
                 "harness": "codex",
-                "adapter": {"kind": "codex_app_server", "version": "0.147.0"},
+                "adapter": {"kind": "codex_app_server", "version": "0.156.1"},
                 "model": "gpt-5.3-codex",
                 "settings": {"reasoning_effort": "low"},
                 "tools": ["git"],
@@ -2765,7 +2765,7 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
             "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
             "worker_image_id": format!("sha256:{}", "1".repeat(64)),
             "codex_binary": codex,
-            "codex_version": "codex-cli 0.147.0",
+            "codex_version": "codex-cli 0.156.1",
             "codex_sha256": sha256_file(codex),
             "model": "fixture-model",
             "claude": {

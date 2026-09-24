@@ -288,6 +288,7 @@ fn native_entry_mcp_runs_sequential_commissions_with_minimal_lifecycle_tools() {
         [
             "tyrion_start_commission",
             "tyrion_status",
+            "tyrion_export_record",
             "tyrion_cancel_commission"
         ]
     );
@@ -333,6 +334,31 @@ fn native_entry_mcp_runs_sequential_commissions_with_minimal_lifecycle_tools() {
         .unwrap()
         .to_owned();
     wait_for_current_commission(&mut input, &mut output, 4, "verified_complete");
+
+    // The record is what proves what happened, so an Entry Session must be
+    // able to read it without dropping to the CLI and rejoining.
+    let exported = mcp_request(
+        &mut input,
+        &mut output,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "tyrion_export_record", "arguments": {}}
+        }),
+    );
+    let record = &exported["result"]["structuredContent"];
+    assert_eq!(record["version"], 1);
+    assert!(record["checksum"]
+        .as_str()
+        .is_some_and(|checksum| checksum.starts_with("sha256:")));
+    assert_eq!(
+        record["record"]["commission"]["status"],
+        "verified_complete"
+    );
+    // The exporter never self-certifies readiness.
+    assert_ne!(record["dogfood_readiness"]["status"], "ready");
+
     daemon.restart();
     wait_for_current_commission(&mut input, &mut output, 50, "verified_complete");
     let duplicate = start_commission(
