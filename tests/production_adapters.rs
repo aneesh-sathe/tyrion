@@ -238,7 +238,14 @@ class ResultMessage:
 class ClaudeSDKClient:
     def __init__(self, options): self.options = options
     async def connect(self): pass
-    async def query(self, prompt): self.prompt = prompt
+    async def query(self, prompt):
+        self.prompt = prompt
+        # OpenAI rejects an array schema with no items. Claude does not, so the
+        # fake enforces the stricter rule to keep both adapters honest.
+        schema = (self.options.output_format or {}).get("schema", {})
+        for name, prop in schema.get("properties", {}).items():
+            if prop.get("type") == "array":
+                assert "items" in prop, f"array schema {name} is missing items"
     async def receive_response(self):
         assert self.options.tools == ["Skill"]
         assert self.options.allowed_tools == ["Skill"]

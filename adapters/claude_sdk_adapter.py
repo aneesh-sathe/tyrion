@@ -263,7 +263,11 @@ async def run():
                 "required": ["summary", "known_effects"],
                 "properties": {
                     "summary": {"type": "string", "minLength": 1},
-                    "known_effects": {"type": "array", "maxItems": 0},
+                    "known_effects": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 0,
+                    },
                 },
             },
         },

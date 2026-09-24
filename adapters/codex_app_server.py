@@ -318,7 +318,14 @@ def main():
                     "required": ["summary", "known_effects"],
                     "properties": {
                         "summary": {"type": "string", "minLength": 1},
-                        "known_effects": {"type": "array", "maxItems": 0},
+                        "known_effects": {
+                        "type": "array",
+                        # OpenAI structured output rejects an array schema
+                        # with no items; Claude accepts it, so only Codex
+                        # ever surfaced this.
+                        "items": {"type": "string"},
+                        "maxItems": 0,
+                    },
                     },
                 },
             },

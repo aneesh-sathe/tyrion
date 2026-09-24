@@ -92,6 +92,11 @@ struct RuntimeConfig {
     codex_binary: PathBuf,
     codex_version: String,
     codex_sha256: String,
+    /// Codex delegates file edits and shell work to a companion host binary
+    /// and fails the Assignment without it. It is pinned and transferred
+    /// exactly like the harness itself.
+    #[serde(default)]
+    codex_code_mode_host: Option<PinnedBinary>,
     model: String,
     /// Absent means every sandbox runs with no network at all.
     #[serde(default)]
@@ -134,6 +139,13 @@ struct EgressConfig {
 struct EgressDestination {
     host: String,
     port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinnedBinary {
+    path: PathBuf,
+    sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +467,18 @@ impl ContainedCodexRuntime {
             )));
         }
         if configuration.adapter.kind == super::routing::WorkerAdapterKind::CodexAppServer {
+            if let Some(host) = self.config.codex_code_mode_host.as_ref() {
+                sandbox.upload(
+                    &host.path,
+                    "/sandbox/codex-code-mode-host",
+                    assignment.lease_expires_at,
+                )?;
+                sandbox.exec_checked(
+                    &["chmod", "700", "/sandbox/codex-code-mode-host"],
+                    None,
+                    assignment.lease_expires_at,
+                )?;
+            }
             self.deliver_codex_login(&sandbox, assignment.lease_expires_at)?;
         }
         if let Some(git_attempt) = git_attempt {
@@ -1920,6 +1944,9 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
     }
     verify_hash(&config.docker_binary, &config.docker_sha256)?;
     verify_hash(&config.codex_binary, &config.codex_sha256)?;
+    if let Some(host) = &config.codex_code_mode_host {
+        verify_hash(&host.path, &host.sha256)?;
+    }
     if let Some(claude) = &config.claude {
         if claude.version.trim().is_empty() {
             return Err(TyrionError::InvalidRequest(
