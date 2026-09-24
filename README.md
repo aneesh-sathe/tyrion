@@ -274,7 +274,14 @@ target/debug/tyriond \
   --credential-runtime /absolute/path/to/credential-runtime.json
 ```
 
-[`runtime/docker/codex-worker.example.json`](runtime/docker/codex-worker.example.json) documents the required shape and [`runtime/docker/README.md`](runtime/docker/README.md) explains each field. It is not ready to run until every path and digest matches your machine.
+Generate the runtime file rather than writing one:
+
+```sh
+runtime/docker/generate-config.sh --image <your-image> --out .scratch/runtime \
+  --claude /path/to/claude-linux-arm64
+```
+
+It discovers every value Tyrion verifies, and runs each harness binary inside the hardened container to read its version. [`runtime/docker/codex-worker.example.json`](runtime/docker/codex-worker.example.json) documents the shape and [`runtime/docker/README.md`](runtime/docker/README.md) explains each field. It is not ready to run until every path and digest matches your machine.
 
 `--credential-runtime` still uses the older OpenShell profile. It drives only the exceptional one-shot credentialed Effect Sandbox, not Worker containment, and is the last remaining OpenShell consumer.
 

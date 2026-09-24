@@ -31,6 +31,31 @@ Put the digest reference in `worker_image` and the image ID in
 is not already present, and it fails again at sandbox creation if the
 container launched anything else.
 
+## Generate it instead of writing it
+
+Every value Tyrion checks at startup can be discovered from your machine, and a
+wrong digest makes `tyriond` exit before it binds its socket, which is correct
+but opaque. So generate the file:
+
+```sh
+runtime/docker/generate-config.sh \
+  --image tyrion-worker:2026-09-22 \
+  --out .scratch/runtime \
+  --claude  /path/to/claude-linux-arm64 \
+  --codex   /path/to/codex-linux-arm64 \
+  --codex-code-mode-host /path/to/codex-code-mode-host
+```
+
+It hashes each binary, resolves the image identity, picks up
+`~/.codex/auth.json` when present, and sets the egress destinations each
+harness needs. It also runs every harness binary **inside the hardened
+container** to read its version, which is the only place a Linux guest binary
+can report one and doubles as proof it runs under the profile at all.
+
+Then name the credentials a harness needs in `worker_credentials`, for example
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Codex needs nothing there:
+it reads its subscription login from `codex_auth_file`.
+
 ## Fields
 
 | Field | Meaning |
