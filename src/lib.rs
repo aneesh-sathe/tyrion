@@ -3,6 +3,7 @@ pub mod adapter_contract;
 mod artifact;
 mod attachment;
 mod client;
+mod containment;
 mod credential;
 mod daemon;
 mod domain;
