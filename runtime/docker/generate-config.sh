@@ -116,6 +116,49 @@ if codex_auth:
     runtime["codex_auth_file"] = codex_auth
 pathlib.Path(out, "codex-worker.json").write_text(json.dumps(runtime, indent=2) + "\n")
 print("\nwrote", pathlib.Path(out, "codex-worker.json"))
+
+# A catalog too, so cross-harness routing works out of the box. Without one the
+# daemon runs only the built-in contained Codex configuration.
+def file_sha256(path):
+    import hashlib
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+def configuration(cid, harness, kind, adapter, model, settings, cost):
+    return {
+        "id": cid, "harness": harness,
+        "adapter": {"kind": kind, "version": "1.0.0",
+                    "command": [str(pathlib.Path("adapters", adapter).resolve())],
+                    "sha256": file_sha256(pathlib.Path("adapters", adapter))},
+        "model": model, "settings": settings, "tools": ["git"], "skills": [],
+        "context": {"strategy": "fresh", "capacity_tokens": 200000},
+        "resource_limits": {"max_concurrency_slots": 2, "max_storage_bytes": 10485760,
+                            "max_model_spend_cents": 0, "max_paid_service_spend_cents": 0},
+        "capabilities": ["structured_lifecycle", "semantic_interrupt", "terminal_state",
+                         "usage", "skills", "result_submission", "contained"],
+        "authority_actions": ["codex.git_change"],
+        "authority_scope_types": ["repository", "path", "action"],
+        "assignment_constraints": ["coding"],
+        "containment_profile": "docker-hardened-v1",
+        "replacement_class": "coding", "available": True,
+        "metrics": {"expected_verified_correctness": 9000, "preference_adherence": 9000,
+                    "first_pass_acceptance": 9000,
+                    "commission_elapsed_time_contribution_ms": 1000,
+                    "cost_cents": cost, "continuity": 0},
+    }
+
+configurations = []
+if claude != "null":
+    configurations.append(configuration(
+        "claude-default", "claude", "claude_agent_sdk", "claude_sdk_adapter.py",
+        "claude-haiku-4-5-20251001", {}, 2))
+if cbin and not cbin.endswith("codex-unused"):
+    configurations.append(configuration(
+        "codex-default", "codex", "codex_app_server", "codex_app_server.py",
+        "gpt-5.6-sol", {"reasoning_effort": "low"}, 1))
+if configurations:
+    catalog = pathlib.Path(out, "worker-catalog.json")
+    catalog.write_text(json.dumps({"configurations": configurations}, indent=2) + "\n")
+    print("wrote", catalog, f"({len(configurations)} configurations)")
 if not codex_auth:
     print("note : no ~/.codex/auth.json found; run `codex login` before using Codex Workers")
 print("note : set worker_credentials to the env var names a harness needs,")
