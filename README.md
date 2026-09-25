@@ -375,6 +375,8 @@ Measured, not assumed:
 
 Stated limits, because they matter more than the claims:
 
+- **Tyrion does not bound model spend.** No harness gives it a hard monetary ceiling, so it does not pretend to enforce one. A budget a harness can honour is configured on that Worker; the spend control is the cap you set at the provider.
+
 - Sibling Attempts are isolated at namespace strength, not VM strength.
 - Containment does not bound what a provider credential can spend at the far end.
 - The exporter reports readiness only as `blocked` or `unassessed`. It never certifies itself ready.

@@ -194,14 +194,14 @@ async def run():
     context_strategy = configuration.get("context", {}).get("strategy")
     if context_strategy not in {"fresh", "fresh_with_retrieval"}:
         raise RuntimeError(f"unsupported context strategy: {context_strategy}")
-    if resource_limits["max_paid_service_spend_cents"] != 0:
-        raise RuntimeError("Claude adapter does not permit paid service spend")
-    model_budget_usd = resource_limits["max_model_spend_cents"] / 100
     settings = configuration.get("settings", {})
-    supported = {"effort", "max_turns", "native_skill_paths"}
+    supported = {"effort", "max_turns", "max_budget_usd", "native_skill_paths"}
     unknown = sorted(set(settings) - supported)
     if unknown:
         raise RuntimeError(f"unsupported Claude settings: {', '.join(unknown)}")
+    # Claude can genuinely honour a budget, so it is a setting on this Worker
+    # Configuration rather than a Commission ceiling Tyrion cannot enforce.
+    model_budget_usd = settings.get("max_budget_usd")
     repository, temporary_root = prepare_workspace()
     control_lines = asyncio.Queue()
     interrupted = False
@@ -435,8 +435,8 @@ async def run():
                 total_cost_usd = getattr(message, "total_cost_usd", None)
                 if not isinstance(total_cost_usd, (int, float)):
                     raise RuntimeError("Claude Agent SDK reported no model spend")
-                if total_cost_usd > model_budget_usd + 1e-9:
-                    raise RuntimeError("Claude Agent SDK exceeded the reserved model spend")
+                if model_budget_usd is not None and total_cost_usd > model_budget_usd + 1e-9:
+                    raise RuntimeError("Claude Agent SDK exceeded its configured budget")
                 aborted = message.terminal_reason in {"aborted_streaming", "aborted_tools"}
                 if message.is_error and not aborted:
                     emit({"type": "session.error", "message": message.result or message.subtype})

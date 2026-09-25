@@ -186,13 +186,8 @@ def main():
     context_strategy = configuration.get("context", {}).get("strategy")
     if context_strategy not in {"fresh", "fresh_with_retrieval"}:
         raise RuntimeError(f"unsupported context strategy: {context_strategy}")
-    if resource_limits["max_model_spend_cents"] != 0:
-        raise RuntimeError(
-            "Codex app-server has no hard monetary budget control; "
-            "use an unmetered provider and reserve zero model-spend cents"
-        )
-    if resource_limits["max_paid_service_spend_cents"] != 0:
-        raise RuntimeError("Codex adapter does not permit paid service spend")
+    # Codex exposes no monetary budget, so it reports spend rather than
+    # bounding it. The provider-side cap is the control.
     settings = configuration.get("settings", {})
     supported = {"reasoning_effort", "reasoning_summary", "service_tier", "personality"}
     unknown = sorted(set(settings) - supported)

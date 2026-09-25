@@ -1110,12 +1110,6 @@ pub(super) fn inspect_commission(
                 resources: Resources {
                     concurrency: resources["concurrency_slots"].as_u64().unwrap_or(u64::MAX),
                     storage: resources["max_storage_bytes"].as_u64().unwrap_or(u64::MAX),
-                    model_spend: resources["max_model_spend_cents"]
-                        .as_u64()
-                        .unwrap_or(u64::MAX),
-                    paid_spend: resources["max_paid_service_spend_cents"]
-                        .as_u64()
-                        .unwrap_or(u64::MAX),
                 },
             }
         })
@@ -1126,20 +1120,12 @@ pub(super) fn inspect_commission(
         Resources {
             concurrency: reserved_concurrency,
             storage: reserved_storage,
-            model_spend: reserved_model_spend,
-            paid_spend: reserved_paid_spend,
         },
         Resources {
             concurrency: commission["resource_ceilings"]["max_worker_concurrency"]
                 .as_u64()
                 .unwrap_or(0),
             storage: commission["resource_ceilings"]["max_storage_bytes"]
-                .as_u64()
-                .unwrap_or(0),
-            model_spend: commission["resource_ceilings"]["max_model_spend_cents"]
-                .as_u64()
-                .unwrap_or(0),
-            paid_spend: commission["resource_ceilings"]["max_paid_service_spend_cents"]
                 .as_u64()
                 .unwrap_or(0),
         },
