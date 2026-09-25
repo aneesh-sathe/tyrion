@@ -422,9 +422,9 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
     add_keychain_credential(&keychain, credential_reference, secret);
     let (destination, received) = start_http_effect_server();
 
-    let openshell = write_executable(
-        &temp.path().join("openshell"),
-        include_str!("fixtures/fake_effect_openshell.sh"),
+    let docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_effect_docker.sh"),
     );
     let adapter = write_executable(
         &temp.path().join("effect-adapter"),
@@ -442,22 +442,6 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
         ),
     )
     .unwrap();
-    let config_home = temp.path().join("openshell-config");
-    fs::create_dir(&config_home).unwrap();
-    let gateway = temp.path().join("gateway.toml");
-    fs::write(
-        &gateway,
-        "[openshell.gateway]\ncompute_drivers = [\"vm\"]\n\n[openshell.gateway.mtls_auth]\nenabled = true\n\n[openshell.drivers.vm]\nvcpus = 2\nmem_mib = 2048\noverlay_disk_mib = 4096\n",
-    )
-    .unwrap();
-    let kernel = temp.path().join("kernel.config");
-    fs::write(
-        &kernel,
-        "CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM=\"landlock,lockdown,yama,integrity\"\nCONFIG_CGROUP_PIDS=y\nCONFIG_SECCOMP_FILTER=y\n",
-    )
-    .unwrap();
-    let source_patch =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/openshell/repaired-v0.0.104.patch");
     let runtime_path = temp.path().join("credential-runtime.json");
     fs::write(
         &runtime_path,
@@ -474,31 +458,19 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
                 "destinations": {"dogfood-api": destination}
             },
             "effect_sandbox": {
-                "openshell_binary": path_text(&openshell),
-                "openshell_sha256": sha256_file(&openshell),
-                "openshell_version": "openshell 0.0.104",
-                "openshell_config_home": path_text(&config_home),
-                "base_image": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
-                "policy_path": path_text(&policy),
-                "policy_sha256": sha256_file(&policy),
-                "gateway_config_path": path_text(&gateway),
-                "gateway_config_sha256": sha256_file(&gateway),
-                "kernel_config_path": path_text(&kernel),
-                "kernel_config_sha256": sha256_file(&kernel),
-                "runtime_artifacts": [{
-                    "path": path_text(&openshell),
-                    "sha256": sha256_file(&openshell)
-                }],
-                "source_revision": "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354",
-                "source_patch_path": path_text(&source_patch),
-                "source_patch_sha256": sha256_file(&source_patch),
+                "docker_binary": path_text(&docker),
+                "docker_sha256": sha256_file(&docker),
+                "docker_version": "Docker version 28.0.4, build fixture",
+                "docker_host": "unix:///fixture/docker.sock",
+                "effect_image": format!("sha256:{}", "2".repeat(64)),
+                "effect_image_id": format!("sha256:{}", "2".repeat(64)),
                 "adapter_binary": path_text(&adapter),
                 "adapter_sha256": sha256_file(&adapter),
                 "adapter_version": "tyrion-effect-adapter 1.0.0",
                 "destination": "dogfood-api",
                 "vcpus": 2,
-                "memory_mib": 2048,
-                "overlay_disk_mib": 4096,
+                "memory_mib": 6144,
+                "writable_storage_mib": 4096,
                 "max_processes": 256
             }
         }))
@@ -692,15 +664,12 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
     assert!(request.contains(&format!("Authorization: Bearer {secret}")));
     assert!(request.contains("POST /effects/one-shot HTTP/1.1"));
     let sandbox_log_before_restart =
-        fs::read_to_string(temp.path().join("fake-effect-openshell/commands.log")).unwrap();
+        fs::read_to_string(temp.path().join("fake-effect-docker/commands.log")).unwrap();
     assert_eq!(
-        sandbox_log_before_restart.matches("sandbox create").count(),
-        1
+        sandbox_log_before_restart.matches("run --detach").count(),
+        2
     );
-    assert_eq!(
-        sandbox_log_before_restart.matches("sandbox delete").count(),
-        0
-    );
+    assert_eq!(sandbox_log_before_restart.matches("rm --force").count(), 0);
     assert!(keychain_contains(&keychain, credential_reference));
 
     daemon.restart();
@@ -721,14 +690,153 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
         "verified_absent"
     );
     let sandbox_log =
-        fs::read_to_string(temp.path().join("fake-effect-openshell/commands.log")).unwrap();
-    assert_eq!(sandbox_log.matches("sandbox create").count(), 1);
-    assert_eq!(sandbox_log.matches("sandbox delete").count(), 1);
-    assert!(sandbox_log.contains("--no-auto-providers"));
+        fs::read_to_string(temp.path().join("fake-effect-docker/commands.log")).unwrap();
+    // the sandbox plus its destination-pinned relay
+    assert_eq!(sandbox_log.matches("run --detach").count(), 2);
+    assert_eq!(sandbox_log.matches("rm --force").count(), 2);
+    // the effect sandbox carries the full hardened profile and reaches
+    // exactly the approved destination
+    for hardening in [
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "--security-opt seccomp=builtin",
+        "--user 65534:65534",
+        "--pids-limit 256",
+        "--network",
+        "--add-host",
+    ] {
+        assert!(
+            sandbox_log.replace('\\', "").contains(hardening),
+            "effect sandbox created without {hardening}"
+        );
+    }
+    // an internal bridge has no route off itself
+    assert!(sandbox_log.contains("network create --internal"));
     assert!(sandbox_log.contains("descendant-terminated"));
     assert!(!sandbox_log.contains(secret));
     assert!(!keychain_contains(&keychain, credential_reference));
     assert_secret_absent_from_tree(temp.path(), secret.as_bytes());
+}
+
+/// The OpenShell policy asserted that an Effect Sandbox could reach only its
+/// approved destination. That file is gone, so the equivalent guarantee now
+/// comes from the network shape, and it has to be demonstrated rather than
+/// configured: the bridge is internal, and the only name resolved on it is the
+/// approved destination pointing at the pinned relay.
+#[test]
+fn an_effect_sandbox_reaches_only_its_approved_destination() {
+    let temp = TempDir::new().unwrap();
+    let docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_effect_docker.sh"),
+    );
+    // Drive the fixture exactly as the runtime does, then read back what the
+    // sandbox was actually created with.
+    let run = |arguments: &[&str]| {
+        std::process::Command::new(&docker)
+            .args(arguments)
+            .output()
+            .expect("fake docker should run")
+    };
+    assert!(run(&[
+        "network",
+        "create",
+        "--internal",
+        "--subnet",
+        "10.88.7.0/24",
+        "probe-net"
+    ])
+    .status
+    .success());
+    let created = run(&[
+        "run",
+        "--detach",
+        "--name",
+        "probe-sandbox",
+        "--network",
+        "probe-net",
+        "--add-host",
+        "api.example:10.88.7.2",
+        "--read-only",
+        "--pids-limit",
+        "256",
+        "--memory",
+        "6144m",
+        "--memory-swap",
+        "6144m",
+        "--cpus",
+        "2",
+        "--cpuset-cpus",
+        "0-1",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--security-opt",
+        "seccomp=builtin",
+        "--user",
+        "65534:65534",
+        "--tmpfs",
+        "/sandbox:rw,exec,nosuid,nodev,size=4096m,mode=1777",
+        "--workdir",
+        "/sandbox",
+        "--env",
+        "HOME=/sandbox",
+        "sha256:probe",
+        "sleep",
+        "900",
+    ]);
+    assert!(created.status.success());
+
+    // A sandbox created without a pinned destination is refused outright.
+    let unpinned = run(&[
+        "run",
+        "--detach",
+        "--name",
+        "unpinned-sandbox",
+        "--network",
+        "probe-net",
+        "--read-only",
+        "--pids-limit",
+        "256",
+        "--memory",
+        "6144m",
+        "--memory-swap",
+        "6144m",
+        "--cpus",
+        "2",
+        "--cpuset-cpus",
+        "0-1",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--security-opt",
+        "seccomp=builtin",
+        "--user",
+        "65534:65534",
+        "--tmpfs",
+        "/sandbox:rw,exec,nosuid,nodev,size=4096m,mode=1777",
+        "sha256:probe",
+        "sleep",
+        "900",
+    ]);
+    assert!(
+        !unpinned.status.success(),
+        "an Effect Sandbox with no pinned destination must be refused"
+    );
+
+    let log = fs::read_to_string(temp.path().join("fake-effect-docker/commands.log")).unwrap();
+    let log = log.replace('\\', "");
+    // Internal: Docker gives the bridge no route off itself.
+    assert!(log.contains("network create --internal"));
+    // Exactly one destination is resolvable, and it points at the relay.
+    assert_eq!(log.matches("--add-host").count(), 1);
+    assert!(log.contains("--add-host api.example:10.88.7.2"));
+    // Nothing grants general egress.
+    assert!(!log.contains("--network host"));
+    assert!(!log.contains("--network bridge"));
 }
 
 #[test]

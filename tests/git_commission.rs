@@ -101,7 +101,7 @@ impl Drop for RunningDaemon {
 }
 
 #[test]
-#[ignore = "requires the pinned repaired OpenShell gateway and a brokered Codex provider"]
+#[ignore = "requires a provisioned Worker image and a real Codex credential"]
 fn real_docker_boundary_completes_the_contained_git_assignment() {
     let worker_config = std::env::var_os("TYRION_REAL_CODEX_WORKER_CONFIG")
         .map(PathBuf::from)

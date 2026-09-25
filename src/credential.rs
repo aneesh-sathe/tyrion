@@ -12,6 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::containment::RELAY_SOURCE;
 use crate::protocol::{CredentialUseMode, OperationRequest};
 use crate::TyrionError;
 
@@ -44,36 +45,22 @@ struct BrokerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EffectSandboxConfig {
-    openshell_binary: PathBuf,
-    openshell_sha256: String,
-    openshell_version: String,
-    openshell_config_home: PathBuf,
-    base_image: String,
-    policy_path: PathBuf,
-    policy_sha256: String,
-    gateway_config_path: PathBuf,
-    gateway_config_sha256: String,
-    kernel_config_path: PathBuf,
-    kernel_config_sha256: String,
-    runtime_artifacts: Vec<PinnedArtifact>,
-    source_revision: String,
-    source_patch_path: PathBuf,
-    source_patch_sha256: String,
+    docker_binary: PathBuf,
+    docker_sha256: String,
+    docker_version: String,
+    docker_host: String,
+    /// Content addressed like the Worker image: a registry digest reference or
+    /// a bare image id, never a tag.
+    effect_image: String,
+    effect_image_id: String,
     adapter_binary: PathBuf,
     adapter_sha256: String,
     adapter_version: String,
     destination: String,
     vcpus: u32,
     memory_mib: u64,
-    overlay_disk_mib: u64,
+    writable_storage_mib: u64,
     max_processes: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PinnedArtifact {
-    path: PathBuf,
-    sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -613,9 +600,9 @@ impl CredentialRuntime {
                 validate_effect_sandbox(sandbox, &self.config.broker)?;
                 let sandbox_name = effect_sandbox_name(operation_request_id)?;
                 let secret = self.read_secret(credential_reference).ok();
-                let mut logs = self.openshell_bounded(
+                let mut logs = self.docker_bounded(
                     sandbox,
-                    &["logs", &sandbox_name, "-n", "300"],
+                    &["logs", "--tail", "300", &sandbox_name],
                     None,
                     Duration::from_secs(15),
                     1024 * 1024,
@@ -715,27 +702,62 @@ impl CredentialRuntime {
             )));
         }
         let sandbox_name = effect_sandbox_name(operation_request_id)?;
+        let egress = match self.open_effect_egress(sandbox, &sandbox_name, binding, deadline) {
+            Ok(egress) => egress,
+            Err(error) => {
+                let _ = self.delete_sandbox(sandbox, &sandbox_name);
+                return Err(error);
+            }
+        };
         let cpu = sandbox.vcpus.to_string();
-        let memory = format!("{}Mi", sandbox.memory_mib);
-        let create = self.openshell(
+        let cpuset = format!("0-{}", sandbox.vcpus.saturating_sub(1));
+        let memory = format!("{}m", sandbox.memory_mib);
+        let pids = sandbox.max_processes.to_string();
+        let tmpfs = format!(
+            "/sandbox:rw,exec,nosuid,nodev,size={}m,mode=1777",
+            sandbox.writable_storage_mib
+        );
+        // Identical hardening to a Worker sandbox, on a network that reaches
+        // exactly one approved destination.
+        let create = self.docker(
             sandbox,
             &[
-                "sandbox",
-                "create",
+                "run",
+                "--detach",
                 "--name",
                 &sandbox_name,
-                "--from",
-                &sandbox.base_image,
-                "--policy",
-                path_text(&sandbox.policy_path)?,
-                "--no-auto-providers",
-                "--cpu",
-                &cpu,
+                "--network",
+                &egress.internal,
+                "--add-host",
+                &egress.alias,
+                "--read-only",
+                "--pids-limit",
+                &pids,
                 "--memory",
                 &memory,
-                "--no-tty",
-                "--",
-                "true",
+                "--memory-swap",
+                &memory,
+                "--cpus",
+                &cpu,
+                "--cpuset-cpus",
+                &cpuset,
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--security-opt",
+                "seccomp=builtin",
+                "--user",
+                "65534:65534",
+                "--tmpfs",
+                &tmpfs,
+                "--workdir",
+                "/sandbox",
+                "--env",
+                "HOME=/sandbox",
+                &sandbox.effect_image,
+                "sleep",
+                "900",
             ],
             None,
             deadline,
@@ -744,33 +766,40 @@ impl CredentialRuntime {
             let _ = self.delete_sandbox(sandbox, &sandbox_name);
             return Err(CredentialEffectError::Failed(error));
         }
+        let launched = self.docker(
+            sandbox,
+            &["inspect", "--format", "{{.Image}}", &sandbox_name],
+            None,
+            deadline,
+        )?;
+        let launched = require_success("Effect Sandbox image identity", launched)
+            .map_err(CredentialEffectError::Failed)?;
+        if String::from_utf8_lossy(&launched.stdout).trim() != sandbox.effect_image_id {
+            let _ = self.delete_sandbox(sandbox, &sandbox_name);
+            return Err(CredentialEffectError::Failed(
+                TyrionError::SecurityInvariantViolation(
+                    "Effect Sandbox launched an image other than the pinned one".into(),
+                ),
+            ));
+        }
         let execution = (|| -> Result<Value, CredentialEffectError> {
             require_success(
                 "Effect Sandbox adapter upload",
-                self.openshell(
+                self.docker_upload(
                     sandbox,
-                    &[
-                        "sandbox",
-                        "upload",
-                        &sandbox_name,
-                        path_text(&sandbox.adapter_binary)?,
-                        "/sandbox/effect-adapter",
-                    ],
-                    None,
+                    &sandbox_name,
+                    &sandbox.adapter_binary,
+                    "/sandbox/effect-adapter",
                     deadline,
                 )?,
             )?;
             require_success(
                 "Effect Sandbox adapter permission",
-                self.openshell(
+                self.docker(
                     sandbox,
                     &[
-                        "sandbox",
                         "exec",
-                        "-n",
                         &sandbox_name,
-                        "--no-tty",
-                        "--",
                         "chmod",
                         "700",
                         "/sandbox/effect-adapter",
@@ -782,34 +811,20 @@ impl CredentialRuntime {
             let preflight = "set -eu; printf tyrion-effect-containment-probe; test \"$(cat /sys/fs/cgroup/pids.max)\" = 256; test \"$(getconf _NPROCESSORS_ONLN)\" = 2; test ! -e /var/run/docker.sock; test ! -e /run/containerd/containerd.sock; test ! -e /home/sandbox/.ssh; test ! -e /home/sandbox/.aws; test ! -e /home/sandbox/.config/gh; test -z \"${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}${AWS_ACCESS_KEY_ID:-}${GH_TOKEN:-}${GITHUB_TOKEN:-}${SSH_AUTH_SOCK:-}\"";
             require_success(
                 "Effect Sandbox containment preflight",
-                self.openshell(
+                self.docker(
                     sandbox,
-                    &[
-                        "sandbox",
-                        "exec",
-                        "-n",
-                        &sandbox_name,
-                        "--no-tty",
-                        "--",
-                        "sh",
-                        "-c",
-                        preflight,
-                    ],
+                    &["exec", &sandbox_name, "sh", "-c", preflight],
                     None,
                     deadline,
                 )?,
             )?;
             let version = require_success(
                 "Effect Sandbox adapter version",
-                self.openshell(
+                self.docker(
                     sandbox,
                     &[
-                        "sandbox",
                         "exec",
-                        "-n",
                         &sandbox_name,
-                        "--no-tty",
-                        "--",
                         "/sandbox/effect-adapter",
                         "--version",
                     ],
@@ -832,15 +847,14 @@ impl CredentialRuntime {
             input.extend_from_slice(content_type.as_bytes());
             input.push(b'\n');
             input.extend_from_slice(body.as_bytes());
-            let mut output = match self.openshell_bounded(
+            let mut output = match self.docker_bounded(
                 sandbox,
                 &[
-                    "sandbox",
+                    // The secret travels on stdin, and `docker exec` forwards
+                    // none of it without --interactive.
                     "exec",
-                    "-n",
+                    "--interactive",
                     &sandbox_name,
-                    "--no-tty",
-                    "--",
                     "/sandbox/effect-adapter",
                     "--execute-stdin",
                 ],
@@ -862,9 +876,9 @@ impl CredentialRuntime {
             if leave_started_before_cleanup {
                 return Err(CredentialEffectError::LeaveStartedAfterEffect);
             }
-            let mut logs = match self.openshell(
+            let mut logs = match self.docker(
                 sandbox,
-                &["logs", &sandbox_name, "-n", "300"],
+                &["logs", "--tail", "300", &sandbox_name],
                 None,
                 deadline,
             ) {
@@ -906,7 +920,7 @@ impl CredentialRuntime {
                 "secret_material_retained": false,
                 "sandbox_fresh": true,
                 "sandbox_non_agentic": true,
-                "sandbox_policy_sha256": sandbox.policy_sha256,
+                "sandbox_image_id": sandbox.effect_image_id,
                 "adapter_sha256": sandbox.adapter_sha256,
             });
             let output_success = output.status.success();
@@ -978,14 +992,14 @@ impl CredentialRuntime {
         }
     }
 
-    fn openshell(
+    fn docker(
         &self,
         sandbox: &EffectSandboxConfig,
         arguments: &[&str],
         input: Option<&[u8]>,
         deadline: CredentialExecutionDeadline,
     ) -> Result<std::process::Output, CredentialEffectError> {
-        self.openshell_bounded(
+        self.docker_bounded(
             sandbox,
             arguments,
             input,
@@ -997,7 +1011,7 @@ impl CredentialRuntime {
         )
     }
 
-    fn openshell_bounded(
+    fn docker_bounded(
         &self,
         sandbox: &EffectSandboxConfig,
         arguments: &[&str],
@@ -1005,11 +1019,12 @@ impl CredentialRuntime {
         max_duration: Duration,
         max_output_bytes: u64,
     ) -> Result<std::process::Output, CredentialEffectError> {
-        let mut command = Command::new(&sandbox.openshell_binary);
+        let mut command = Command::new(&sandbox.docker_binary);
         command
             .args(arguments)
             .env_clear()
-            .env("XDG_CONFIG_HOME", &sandbox.openshell_config_home)
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("DOCKER_HOST", &sandbox.docker_host)
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -1021,18 +1036,154 @@ impl CredentialRuntime {
             .map_err(CredentialEffectError::Failed)
     }
 
+    /// Stream a host file in. `docker cp` reports success while writing
+    /// underneath a tmpfs mount instead of into it.
+    fn docker_upload(
+        &self,
+        sandbox: &EffectSandboxConfig,
+        name: &str,
+        local: &Path,
+        remote: &str,
+        deadline: CredentialExecutionDeadline,
+    ) -> Result<std::process::Output, CredentialEffectError> {
+        let bytes = fs::read(local).map_err(|error| CredentialEffectError::Failed(error.into()))?;
+        let script = format!("set -eu; umask 077; cat > {}", shell_quote(remote));
+        self.docker_bounded(
+            sandbox,
+            &["exec", "--interactive", name, "sh", "-c", &script],
+            Some(&bytes),
+            deadline
+                .remaining()
+                .map_err(CredentialEffectError::Failed)?
+                .min(Duration::from_secs(60)),
+            1024 * 1024,
+        )
+    }
+
+    /// A one-shot effect must reach exactly its approved destination. An
+    /// internal bridge has no route off itself, so a relay pinned to that one
+    /// host and port is the only way out, and the sandbox reaches it by name
+    /// so TLS still terminates at the real destination.
+    fn open_effect_egress(
+        &self,
+        sandbox: &EffectSandboxConfig,
+        sandbox_name: &str,
+        binding: &CredentialEffectBinding,
+        deadline: CredentialExecutionDeadline,
+    ) -> Result<EffectEgress, CredentialEffectError> {
+        // The resolved URL carries a path, and the origin parser accepts only a
+        // bare scheme and authority, which is what the relay pins to.
+        let origin = destination_origin_of(&binding.resolved_url).ok_or_else(|| {
+            CredentialEffectError::Failed(TyrionError::ControlDenied(
+                "the approved destination is not a usable origin".into(),
+            ))
+        })?;
+        let port = origin.port.unwrap_or(443).to_string();
+        let egress = EffectEgress {
+            internal: format!("{sandbox_name}-net"),
+            alias: format!("{}:{}", origin.host, EFFECT_RELAY_ADDRESS),
+        };
+        let external = format!("{sandbox_name}-out");
+        let relay = format!("{sandbox_name}-relay");
+        for arguments in [
+            vec![
+                "network",
+                "create",
+                "--internal",
+                "--subnet",
+                EFFECT_RELAY_SUBNET,
+                &egress.internal,
+            ],
+            vec!["network", "create", &external],
+        ] {
+            require_success(
+                "Effect Sandbox network",
+                self.docker(sandbox, &arguments, None, deadline)?,
+            )
+            .map_err(CredentialEffectError::Failed)?;
+        }
+        require_success(
+            "Effect Sandbox relay",
+            self.docker(
+                sandbox,
+                &[
+                    "run",
+                    "--detach",
+                    "--name",
+                    &relay,
+                    "--network",
+                    &external,
+                    "--read-only",
+                    "--pids-limit",
+                    "64",
+                    "--memory",
+                    "128m",
+                    "--memory-swap",
+                    "128m",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--security-opt",
+                    "seccomp=builtin",
+                    "--user",
+                    "65534:65534",
+                    &sandbox.effect_image,
+                    "python3",
+                    "-c",
+                    RELAY_SOURCE,
+                    origin.host,
+                    &port,
+                ],
+                None,
+                deadline,
+            )?,
+        )
+        .map_err(CredentialEffectError::Failed)?;
+        require_success(
+            "Effect Sandbox relay attachment",
+            self.docker(
+                sandbox,
+                &[
+                    "network",
+                    "connect",
+                    "--ip",
+                    EFFECT_RELAY_ADDRESS,
+                    &egress.internal,
+                    &relay,
+                ],
+                None,
+                deadline,
+            )?,
+        )
+        .map_err(CredentialEffectError::Failed)?;
+        Ok(egress)
+    }
+
     fn delete_sandbox(&self, sandbox: &EffectSandboxConfig, name: &str) -> Result<(), TyrionError> {
-        validate_hash(&sandbox.openshell_binary, &sandbox.openshell_sha256)?;
-        let mut command = Command::new(&sandbox.openshell_binary);
-        command
-            .args(["sandbox", "delete", name])
-            .env_clear()
-            .env("XDG_CONFIG_HOME", &sandbox.openshell_config_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = run_bounded_command(&mut command, None, Duration::from_secs(15), 1024 * 1024)?;
-        require_success("Effect Sandbox deletion", output)?;
+        validate_hash(&sandbox.docker_binary, &sandbox.docker_sha256)?;
+        let remove = |arguments: [&str; 4]| -> Result<(), TyrionError> {
+            let mut command = Command::new(&sandbox.docker_binary);
+            command
+                .args(arguments)
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("DOCKER_HOST", &sandbox.docker_host)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output =
+                run_bounded_command(&mut command, None, Duration::from_secs(15), 1024 * 1024)?;
+            if !output.status.success() && !reports_missing(&output.stderr) {
+                require_success("Effect Sandbox deletion", output)?;
+            }
+            Ok(())
+        };
+        let relay = format!("{name}-relay");
+        remove(["rm", "--force", "--volumes", name])?;
+        remove(["rm", "--force", "--volumes", &relay])?;
+        remove(["network", "rm", &format!("{name}-net"), ""])?;
+        remove(["network", "rm", &format!("{name}-out"), ""])?;
         Ok(())
     }
 
@@ -1309,150 +1460,95 @@ fn validate_effect_sandbox(
     sandbox: &EffectSandboxConfig,
     broker: &BrokerConfig,
 ) -> Result<(), TyrionError> {
-    const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e";
-    const SOURCE_REVISION: &str = "dd2b4e3bc0688bdd59f90030f7c1d52511d6e354";
-    const SOURCE_PATCH_SHA256: &str =
-        "6452fbe2836ffbe43e0e73c813db5dc5dda7ee70537b7033fc5429573160e402";
-    validate_hash(&sandbox.openshell_binary, &sandbox.openshell_sha256)?;
-    validate_hash(&sandbox.policy_path, &sandbox.policy_sha256)?;
-    validate_hash(&sandbox.gateway_config_path, &sandbox.gateway_config_sha256)?;
-    validate_hash(&sandbox.kernel_config_path, &sandbox.kernel_config_sha256)?;
-    validate_hash(&sandbox.source_patch_path, &sandbox.source_patch_sha256)?;
+    validate_hash(&sandbox.docker_binary, &sandbox.docker_sha256)?;
     validate_hash(&sandbox.adapter_binary, &sandbox.adapter_sha256)?;
-    for artifact in &sandbox.runtime_artifacts {
-        validate_hash(&artifact.path, &artifact.sha256)?;
-    }
-    if sandbox.openshell_version != "openshell 0.0.104"
-        || sandbox.base_image != BASE_IMAGE
-        || sandbox.source_revision != SOURCE_REVISION
-        || sandbox.source_patch_sha256 != SOURCE_PATCH_SHA256
-        || sandbox.vcpus != 2
-        || sandbox.memory_mib != 2048
-        || sandbox.overlay_disk_mib != 4096
+    if sandbox.vcpus != 2
+        || sandbox.memory_mib != 6144
+        || sandbox.writable_storage_mib != 4096
         || sandbox.max_processes != 256
-        || sandbox.runtime_artifacts.is_empty()
         || sandbox.adapter_version.trim().is_empty()
-        || !sandbox.openshell_config_home.is_dir()
+        || sandbox.docker_host.trim().is_empty()
+        || !is_content_addressed(&sandbox.effect_image)
+        || !is_image_id(&sandbox.effect_image_id)
     {
         return Err(TyrionError::InvalidRequest(
             "Effect Sandbox configuration does not match the bounded one-shot profile".into(),
         ));
     }
-    let gateway = fs::read_to_string(&sandbox.gateway_config_path)?;
-    for required in [
-        "compute_drivers = [\"vm\"]",
-        "enabled = true",
-        "vcpus = 2",
-        "mem_mib = 2048",
-        "overlay_disk_mib = 4096",
-    ] {
-        if !gateway.lines().any(|line| line.trim() == required) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "Effect Sandbox gateway configuration is missing {required}"
-            )));
-        }
-    }
-    let kernel = fs::read_to_string(&sandbox.kernel_config_path)?;
-    for required in [
-        "CONFIG_SECURITY=y",
-        "CONFIG_SECURITY_LANDLOCK=y",
-        "CONFIG_LSM=\"landlock,lockdown,yama,integrity\"",
-        "CONFIG_CGROUP_PIDS=y",
-        "CONFIG_SECCOMP_FILTER=y",
-    ] {
-        if !kernel.lines().any(|line| line == required) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "Effect Sandbox kernel configuration is missing {required}"
-            )));
-        }
-    }
-    let destination = broker
+    // The destination must be a configured broker destination and a usable
+    // origin, because that origin is exactly what the relay is pinned to.
+    let base = broker
         .destinations
         .get(&sandbox.destination)
         .ok_or_else(|| {
             TyrionError::InvalidRequest(
-                "Effect Sandbox destination is absent from the credential broker".into(),
+                "Effect Sandbox destination must name a configured broker destination".into(),
             )
         })?;
-    let origin = parse_destination_origin(destination).ok_or_else(|| {
-        TyrionError::InvalidRequest("invalid Effect Sandbox destination origin".into())
-    })?;
-    let port = origin.port.ok_or_else(|| {
-        TyrionError::InvalidRequest("Effect Sandbox destination requires an exact port".into())
-    })?;
-    let policy = fs::read_to_string(&sandbox.policy_path)?;
-    for required in [
-        "include_workdir: false".to_owned(),
-        "compatibility: hard_requirement".to_owned(),
-        "run_as_user: sandbox".to_owned(),
-        format!("- host: {}", origin.host),
-        format!("port: {port}"),
-        "enforcement: enforce".to_owned(),
-        "- path: /sandbox/effect-adapter".to_owned(),
-        "- path: /usr/bin/curl".to_owned(),
-    ] {
-        if !policy.lines().any(|line| line.trim() == required) {
-            return Err(TyrionError::InvalidRequest(format!(
-                "Effect Sandbox policy is missing {required}"
-            )));
-        }
-    }
-    let endpoint_hosts = policy
-        .lines()
-        .filter(|line| line.trim().starts_with("- host:"))
-        .collect::<Vec<_>>();
-    let endpoint_ports = policy
-        .lines()
-        .filter(|line| line.trim().starts_with("port:"))
-        .collect::<Vec<_>>();
-    let executable_paths = policy
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- path: "))
-        .filter(|path| *path == "/sandbox/effect-adapter" || *path == "/usr/bin/curl")
-        .collect::<Vec<_>>();
-    let allowed_paths = [
-        "/usr",
-        "/lib",
-        "/lib64",
-        "/proc",
-        "/sys/fs/cgroup",
-        "/dev/urandom",
-        "/etc",
-        "/sandbox",
-        "/tmp",
-        "/dev/null",
-        "/sandbox/effect-adapter",
-        "/usr/bin/curl",
-    ];
-    let unexpected_path = policy.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("- ")?;
-        (value.starts_with('/') && !allowed_paths.contains(&value)).then_some(value)
-    });
-    if endpoint_hosts.len() != 1
-        || endpoint_ports.len() != 1
-        || executable_paths.len() != 2
-        || unexpected_path.is_some()
-    {
+    if parse_destination_origin(base).is_none() {
         return Err(TyrionError::InvalidRequest(
-            "Effect Sandbox policy grants resources beyond the exact one-shot profile".into(),
+            "Effect Sandbox destination is not a usable origin".into(),
         ));
     }
-    let mut command = Command::new(&sandbox.openshell_binary);
-    command
-        .arg("--version")
-        .env_clear()
-        .env("XDG_CONFIG_HOME", &sandbox.openshell_config_home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let version = run_bounded_command(&mut command, None, Duration::from_secs(15), 1024 * 1024)?;
-    let version = require_success("OpenShell version probe", version)?;
-    if String::from_utf8_lossy(&version.stdout).trim() != sandbox.openshell_version {
+    let probe = |arguments: &[&str], label: &str| -> Result<String, TyrionError> {
+        let mut command = Command::new(&sandbox.docker_binary);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("DOCKER_HOST", &sandbox.docker_host)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_bounded_command(&mut command, None, Duration::from_secs(30), 1024 * 1024)?;
+        let output = require_success(label, output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    if probe(&["--version"], "Docker version probe")? != sandbox.docker_version {
         return Err(TyrionError::ControlDenied(
-            "OpenShell version does not match the Effect Sandbox pin".into(),
+            "Docker version does not match the Effect Sandbox pin".into(),
+        ));
+    }
+    // The image must already be present. Tyrion never pulls.
+    let resolved = probe(
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            &sandbox.effect_image,
+        ],
+        "Effect Sandbox image probe",
+    )?;
+    if resolved != sandbox.effect_image_id {
+        return Err(TyrionError::ControlDenied(
+            "the provisioned Effect Sandbox image is not the pinned one".into(),
         ));
     }
     Ok(())
+}
+
+/// A registry digest reference or a bare image id. Both name exact content; a
+/// tag does not.
+fn is_content_addressed(reference: &str) -> bool {
+    if is_image_id(reference) {
+        return true;
+    }
+    match reference.split_once("@sha256:") {
+        Some((repository, digest)) => !repository.is_empty() && is_hex64(digest),
+        None => false,
+    }
+}
+
+fn is_image_id(identity: &str) -> bool {
+    identity.strip_prefix("sha256:").is_some_and(is_hex64)
+}
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn require_success(
@@ -1469,12 +1565,6 @@ fn require_success(
     }
 }
 
-fn path_text(path: &Path) -> Result<&str, TyrionError> {
-    path.to_str().ok_or_else(|| {
-        TyrionError::InvalidRequest("credential runtime paths must contain valid UTF-8".into())
-    })
-}
-
 fn validate_destination(name: &str, destination: &str) -> Result<(), TyrionError> {
     if name.trim().is_empty()
         || name.contains('\0')
@@ -1487,9 +1577,39 @@ fn validate_destination(name: &str, destination: &str) -> Result<(), TyrionError
     Ok(())
 }
 
+/// A fixed address on the per-operation internal bridge. The sandbox resolves
+/// the approved destination's hostname to it, so TLS still terminates at the
+/// real destination and the relay never sees plaintext.
+const EFFECT_RELAY_ADDRESS: &str = "10.88.7.2";
+const EFFECT_RELAY_SUBNET: &str = "10.88.7.0/24";
+
+struct EffectEgress {
+    internal: String,
+    alias: String,
+}
+
+fn reports_missing(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    stderr.contains("no such")
+        || stderr.contains("not found")
+        || stderr.contains("already in progress")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 struct DestinationOrigin<'a> {
     host: &'a str,
     port: Option<u16>,
+}
+
+/// The scheme and authority of a full URL, with any path discarded.
+fn destination_origin_of(url: &str) -> Option<DestinationOrigin<'_>> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let origin_end = scheme.len() + 3 + authority.len();
+    parse_destination_origin(&url[..origin_end])
 }
 
 fn parse_destination_origin(destination: &str) -> Option<DestinationOrigin<'_>> {
