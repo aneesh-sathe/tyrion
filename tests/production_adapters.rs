@@ -453,7 +453,7 @@ class ClaudeSDKClient:
         false,
     );
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeded the reserved model spend"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeded its configured budget"));
 
     let git = git_bundle_fixture(temp.path(), "claude");
     let trace = run_adapter(
@@ -781,14 +781,20 @@ fn launch(kind: &str, model: &str) -> Value {
         "worker_configuration": {
             "adapter": {"kind": kind},
             "model": model,
-            "settings": {},
+            // Claude can honour a budget, so it is a setting on the Worker
+            // Configuration rather than a ceiling Tyrion cannot enforce.
+            "settings": if kind == "claude_agent_sdk" {
+                json!({"max_budget_usd": 1.0})
+            } else {
+                json!({})
+            },
             "tools": [],
             "skills": [],
             "context": {"strategy": "fresh", "capacity_tokens": 100000}
         },
         "resource_limits": {
             "max_storage_bytes": 1048576,
-            "max_model_spend_cents": if matches!(kind, "codex_app_server" | "pi_rpc") { 0 } else { 100 },
+            "max_model_spend_cents": 0,
             "max_paid_service_spend_cents": 0
         }
     })

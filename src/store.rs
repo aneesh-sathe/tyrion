@@ -7121,29 +7121,21 @@ impl Store {
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let (used_concurrency, used_storage, used_model_spend, used_paid_spend) = transaction
+        // Only capacity Tyrion can actually reclaim is summed. Spend is not:
+        // no harness gives Tyrion a hard monetary ceiling, so accumulating a
+        // pre-execution guess blocked retries without preventing overspend.
+        let (used_concurrency, used_storage) = transaction
             .query_row(
                 "SELECT COALESCE(SUM(CASE WHEN status = 'active' THEN concurrency_slots ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN status = 'active' THEN storage_bytes ELSE 0 END), 0),
-                        COALESCE(SUM(model_spend_cents), 0),
-                        COALESCE(SUM(paid_service_spend_cents), 0)
+                        COALESCE(SUM(CASE WHEN status = 'active' THEN storage_bytes ELSE 0 END), 0)
                  FROM resource_reservations
                  WHERE commission_id = ?1",
                 [commission_id],
-                |row| {
-                    Ok((
-                        row.get::<_, u32>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, u64>(2)?,
-                        row.get::<_, u64>(3)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?)),
             )?;
         let ceilings = Resources {
             concurrency: ready_candidates[0].max_worker_concurrency.into(),
             storage: ready_candidates[0].max_storage_bytes,
-            model_spend: ready_candidates[0].max_model_spend_cents,
-            paid_spend: ready_candidates[0].max_paid_service_spend_cents,
         };
         let candidates = ready_candidates
             .into_iter()
@@ -7157,8 +7149,6 @@ impl Store {
                 resources: Resources {
                     concurrency: candidate.reserved_concurrency_slots.into(),
                     storage: candidate.reserved_storage_bytes,
-                    model_spend: candidate.reserved_model_spend_cents,
-                    paid_spend: candidate.reserved_paid_service_spend_cents,
                 },
                 item: candidate,
             })
@@ -7176,8 +7166,6 @@ impl Store {
             Resources {
                 concurrency: used_concurrency.into(),
                 storage: used_storage,
-                model_spend: used_model_spend,
-                paid_spend: used_paid_spend,
             },
             ceilings,
         );
@@ -8560,8 +8548,6 @@ impl Store {
                 Ok(Resources {
                     concurrency: row.get(0)?,
                     storage: row.get(1)?,
-                    model_spend: row.get(2)?,
-                    paid_spend: row.get(3)?,
                 })
             })?;
             comparison_resources(rows.collect::<Result<Vec<_>, _>>()?)?
@@ -8590,8 +8576,8 @@ impl Store {
                 serde_json::to_string(&write_scopes)?,
                 comparison_budget.concurrency,
                 comparison_budget.storage,
-                comparison_budget.model_spend,
-                comparison_budget.paid_spend,
+                0_u64,
+                0_u64,
                 group,
                 uncertainty,
                 comparison_rule,
@@ -8732,8 +8718,6 @@ impl Store {
         let reconciliation_budget = Resources {
             concurrency: ready.reserved_concurrency_slots.into(),
             storage: ready.max_storage_bytes,
-            model_spend: ready.reserved_model_spend_cents,
-            paid_spend: ready.reserved_paid_service_spend_cents,
         };
         let goal = format!(
             "Reconcile {kind} for Assignment {} without selecting a silent winner: {message}. Authorized reconciliation write scope: {}",
@@ -8771,8 +8755,8 @@ impl Store {
                 serde_json::to_string(affected_paths)?,
                 reconciliation_budget.concurrency,
                 reconciliation_budget.storage,
-                reconciliation_budget.model_spend,
-                reconciliation_budget.paid_spend,
+                0_u64,
+                0_u64,
                 competition_group,
                 message,
                 comparison_rule,
@@ -14867,8 +14851,6 @@ fn validate_commission_plan(
     let mut owned_criteria = HashSet::new();
     let mut competitions: HashMap<&str, (&str, &str, Vec<Resources>)> = HashMap::new();
     let mut competition_assignments: HashMap<&str, Vec<&PlannedAssignment>> = HashMap::new();
-    let mut cumulative_model_spend = 0_u64;
-    let mut cumulative_paid_spend = 0_u64;
     for assignment in &plan.assignments {
         if assignment.id.trim().is_empty() || assignment.goal.trim().is_empty() {
             return Err(TyrionError::InvalidRequest(
@@ -14913,20 +14895,6 @@ fn validate_commission_plan(
             &assignment.resources,
             &proposal.resource_ceilings,
         )?;
-        cumulative_model_spend = cumulative_model_spend
-            .checked_add(assignment.resources.max_model_spend_cents)
-            .ok_or_else(|| {
-                TyrionError::InvalidRequest(
-                    "planned cumulative model spend exceeds the Commission ceiling".into(),
-                )
-            })?;
-        cumulative_paid_spend = cumulative_paid_spend
-            .checked_add(assignment.resources.max_paid_service_spend_cents)
-            .ok_or_else(|| {
-                TyrionError::InvalidRequest(
-                    "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
-                )
-            })?;
         for scope in assignment
             .read_scopes
             .iter()
@@ -14974,8 +14942,6 @@ fn validate_commission_plan(
             entry.2.push(Resources {
                 concurrency: assignment.resources.concurrency_slots.into(),
                 storage: assignment.resources.max_storage_bytes,
-                model_spend: assignment.resources.max_model_spend_cents,
-                paid_spend: assignment.resources.max_paid_service_spend_cents,
             });
         }
     }
@@ -14996,48 +14962,6 @@ fn validate_commission_plan(
     {
         return Err(TyrionError::InvalidRequest(
             "max_attempts must include one comparison Assignment per competition group".into(),
-        ));
-    }
-    let reconciliation_model_spend = comparison_requirements
-        .iter()
-        .try_fold(0_u64, |total, (_, _, resources)| {
-            total.checked_add(resources.model_spend)
-        });
-    let reconciliation_paid_spend = comparison_requirements
-        .iter()
-        .try_fold(0_u64, |total, (_, _, resources)| {
-            total.checked_add(resources.paid_spend)
-        });
-    cumulative_model_spend = cumulative_model_spend
-        .checked_add(reconciliation_model_spend.ok_or_else(|| {
-            TyrionError::InvalidRequest(
-                "planned cumulative model spend exceeds the Commission ceiling".into(),
-            )
-        })?)
-        .ok_or_else(|| {
-            TyrionError::InvalidRequest(
-                "planned cumulative model spend exceeds the Commission ceiling".into(),
-            )
-        })?;
-    cumulative_paid_spend = cumulative_paid_spend
-        .checked_add(reconciliation_paid_spend.ok_or_else(|| {
-            TyrionError::InvalidRequest(
-                "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
-            )
-        })?)
-        .ok_or_else(|| {
-            TyrionError::InvalidRequest(
-                "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
-            )
-        })?;
-    if cumulative_model_spend > proposal.resource_ceilings.max_model_spend_cents {
-        return Err(TyrionError::InvalidRequest(
-            "planned cumulative model spend exceeds the Commission ceiling".into(),
-        ));
-    }
-    if cumulative_paid_spend > proposal.resource_ceilings.max_paid_service_spend_cents {
-        return Err(TyrionError::InvalidRequest(
-            "planned cumulative paid-service spend exceeds the Commission ceiling".into(),
         ));
     }
     if comparison_requirements
@@ -15257,8 +15181,6 @@ fn comparison_resources(
     for member in members {
         comparison.concurrency = comparison.concurrency.max(member.concurrency);
         comparison.storage = comparison.storage.max(member.storage);
-        comparison.model_spend = comparison.model_spend.max(member.model_spend);
-        comparison.paid_spend = comparison.paid_spend.max(member.paid_spend);
         member_storage = member_storage.checked_add(member.storage).ok_or_else(|| {
             TyrionError::InvalidRequest("competition comparison storage budget overflows".into())
         })?;

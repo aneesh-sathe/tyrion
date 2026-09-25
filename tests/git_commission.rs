@@ -744,44 +744,6 @@ fn concurrent_read_only_assignments_verify_without_mutating_the_artifact() {
 }
 
 #[test]
-fn planned_spend_reservations_cannot_exceed_the_commission_ceiling() {
-    let fixture = ParallelFixture::new();
-    let proposal_path = fixture.temp.path().join("oversubscribed-spend.json");
-    write_parallel_git_proposal(
-        &proposal_path,
-        &fixture.principal_checkout,
-        &fixture.base_revision,
-    );
-    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
-    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(10);
-    proposal["plan"]["assignments"][0]["resources"]["max_model_spend_cents"] = json!(6);
-    proposal["plan"]["assignments"][1]["resources"]["max_model_spend_cents"] = json!(6);
-    fs::write(
-        &proposal_path,
-        serde_json::to_vec_pretty(&proposal).unwrap(),
-    )
-    .unwrap();
-    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
-    let attachment_token = connect_full_entry(&daemon);
-    let output = Command::new(env!("CARGO_BIN_EXE_tyrion"))
-        .args(["--socket", path_text(&daemon.socket_path)])
-        .args([
-            "--attachment-token",
-            &attachment_token,
-            "proposal",
-            "create",
-            "--file",
-            path_text(&proposal_path),
-            "--idempotency-key",
-            "reject-oversubscribed-spend",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cumulative model spend"));
-}
-
-#[test]
 fn competition_members_must_share_one_dependency_frontier() {
     let fixture = ParallelFixture::new();
     let proposal_path = fixture
@@ -966,8 +928,9 @@ fn unexpected_scope_overlap_creates_an_explicit_reconciliation_assignment() {
         json!({
             "concurrency_slots": 1,
             "max_storage_bytes": 10_485_760,
-            "max_model_spend_cents": 3,
-            "max_paid_service_spend_cents": 2,
+            // Tyrion declares no spend ceiling it cannot enforce.
+            "max_model_spend_cents": 0,
+            "max_paid_service_spend_cents": 0,
         })
     );
     let event = reconciled["events"]

@@ -1,9 +1,12 @@
 #[derive(Clone, Copy, Default)]
+/// What Tyrion can actually enforce. Model spend is deliberately absent: no
+/// harness gives Tyrion a hard monetary ceiling, so gating dispatch on a
+/// pre-execution guess blocked real work without preventing any overspend.
+/// A budget a harness can honour lives in that Worker Configuration's
+/// settings, and what was actually spent is reported in the run report.
 pub(super) struct Resources {
     pub concurrency: u64,
     pub storage: u64,
-    pub model_spend: u64,
-    pub paid_spend: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -87,14 +90,6 @@ pub(super) fn resources_fit(used: Resources, requested: Resources, ceilings: Res
             .storage
             .checked_add(requested.storage)
             .is_some_and(|total| total <= ceilings.storage)
-        && used
-            .model_spend
-            .checked_add(requested.model_spend)
-            .is_some_and(|total| total <= ceilings.model_spend)
-        && used
-            .paid_spend
-            .checked_add(requested.paid_spend)
-            .is_some_and(|total| total <= ceilings.paid_spend)
 }
 
 pub(super) fn scopes_overlap(left: &[String], right: &[String]) -> bool {
@@ -113,8 +108,6 @@ fn competitions_match(left: Option<&Competition>, right: Option<&Competition>) -
 fn reserve(used: &mut Resources, requested: Resources) {
     used.concurrency += requested.concurrency;
     used.storage += requested.storage;
-    used.model_spend += requested.model_spend;
-    used.paid_spend += requested.paid_spend;
 }
 
 fn path_is_within_scope(path: &str, scope: &str) -> bool {
@@ -136,22 +129,26 @@ mod tests {
         let used = Resources {
             concurrency: 1,
             storage: 5,
-            model_spend: 3,
-            paid_spend: 0,
         };
         let ceilings = Resources {
             concurrency: 2,
             storage: 10,
-            model_spend: 5,
-            paid_spend: 0,
         };
+        // Exactly at both ceilings still fits.
         assert!(resources_fit(
             used,
             Resources {
                 concurrency: 1,
                 storage: 5,
-                model_spend: 2,
-                paid_spend: 0,
+            },
+            ceilings,
+        ));
+        // Either dimension alone is enough to miss.
+        assert!(!resources_fit(
+            used,
+            Resources {
+                concurrency: 2,
+                storage: 5,
             },
             ceilings,
         ));
@@ -159,9 +156,7 @@ mod tests {
             used,
             Resources {
                 concurrency: 1,
-                storage: 5,
-                model_spend: 3,
-                paid_spend: 0,
+                storage: 6,
             },
             ceilings,
         ));
@@ -178,8 +173,6 @@ mod tests {
                     resources: Resources {
                         concurrency: 1,
                         storage: 5,
-                        model_spend: 1,
-                        paid_spend: 0,
                     },
                 },
                 Work {
@@ -195,8 +188,6 @@ mod tests {
                     resources: Resources {
                         concurrency: 2,
                         storage: 0,
-                        model_spend: 0,
-                        paid_spend: 0,
                     },
                 },
             ],
@@ -205,8 +196,6 @@ mod tests {
             Resources {
                 concurrency: 2,
                 storage: 10,
-                model_spend: 10,
-                paid_spend: 0,
             },
         );
         assert_eq!(frontier.selected, vec!["first"]);
