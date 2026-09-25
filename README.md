@@ -283,7 +283,7 @@ runtime/docker/generate-config.sh --image <your-image> --out .scratch/runtime \
 
 It discovers every value Tyrion verifies, and runs each harness binary inside the hardened container to read its version. [`runtime/docker/codex-worker.example.json`](runtime/docker/codex-worker.example.json) documents the shape and [`runtime/docker/README.md`](runtime/docker/README.md) explains each field. It is not ready to run until every path and digest matches your machine.
 
-`--credential-runtime` still uses the older OpenShell profile. It drives only the exceptional one-shot credentialed Effect Sandbox, not Worker containment, and is the last remaining OpenShell consumer.
+`--credential-runtime` drives the exceptional one-shot credentialed Effect Sandbox. It uses the same hardened Docker profile as a Worker, on a per-operation internal network whose only route out is a relay pinned to the one approved destination.
 
 ## Inspect and control work
 
@@ -339,7 +339,6 @@ target/debug/tyrion principal --help
 - `src/worker/` contains routing, adapter contracts, containment, and execution.
 - `adapters/` contains the reference structured Worker adapters and Pi Entry extension.
 - `runtime/docker/` contains the Worker image, its runtime configuration example, and setup notes.
-- `runtime/openshell/` remains only for the one-shot credentialed Effect Sandbox.
 - `docs/dogfood-records/` holds checksummed exported Commission records from real runs.
 - `tests/` exercises the public CLI and socket protocol with real SQLite state and daemon restarts.
 

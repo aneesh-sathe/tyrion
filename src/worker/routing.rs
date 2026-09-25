@@ -208,7 +208,7 @@ impl WorkerCatalog {
                 && !descriptor.supports_claude
             {
                 return Err(TyrionError::InvalidRequest(format!(
-                    "available Worker Configuration {} requires a pinned Claude OpenShell profile",
+                    "available Worker Configuration {} requires a pinned Claude runtime profile",
                     configuration.id
                 )));
             }
@@ -217,7 +217,7 @@ impl WorkerCatalog {
                 && !descriptor.supports_pi
             {
                 return Err(TyrionError::InvalidRequest(format!(
-                    "available Worker Configuration {} requires a pinned Pi OpenShell profile",
+                    "available Worker Configuration {} requires a pinned Pi runtime profile",
                     configuration.id
                 )));
             }
