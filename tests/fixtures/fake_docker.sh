@@ -22,6 +22,12 @@ operation=${1:-}
 shift || true
 
 case "$operation" in
+    info)
+        # info --format '{{.NCPU}} {{.MemTotal}}': a host roomy enough that no
+        # existing test is held. Tests exercise holds with --host-cpus and
+        # --host-memory-mib instead.
+        printf '%s\n' '16 34359738368'
+        ;;
     image)
         # image inspect --format {{.Id}} <reference>
         [[ ${1:-} == inspect ]]

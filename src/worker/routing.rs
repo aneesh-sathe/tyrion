@@ -38,6 +38,7 @@ pub(super) struct ContainedCodexDescriptor {
     pub supports_pi: bool,
     pub pi_model_provider: Option<String>,
     pub pi_model: Option<String>,
+    pub resources: super::contained_codex::ResourceProfile,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -66,6 +67,10 @@ pub(super) struct WorkerConfiguration {
     #[serde(default)]
     pub assignment_constraints: Vec<String>,
     pub containment_profile: String,
+    /// The container ceilings this configuration runs under. Absent means the
+    /// runtime's pinned profile; a declared one may only be smaller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_resources: Option<super::contained_codex::ResourceProfile>,
     pub replacement_class: String,
     pub available: bool,
     pub metrics: WorkerMetrics,
@@ -246,6 +251,19 @@ impl WorkerCatalog {
                 )));
             }
             configuration.containment_profile = descriptor.containment_profile.clone();
+            match configuration.containment_resources {
+                Some(declared) => {
+                    declared
+                        .validate_within(&descriptor.resources)
+                        .map_err(|error| {
+                            TyrionError::InvalidRequest(format!(
+                                "Worker Configuration {}: {error}",
+                                configuration.id
+                            ))
+                        })?
+                }
+                None => configuration.containment_resources = Some(descriptor.resources),
+            }
         }
         Ok(())
     }
@@ -869,6 +887,7 @@ fn deterministic_configuration() -> WorkerConfiguration {
         authority_scope_types: vec!["action".into()],
         assignment_constraints: Vec::new(),
         containment_profile: "in-process-deterministic".into(),
+        containment_resources: None,
         replacement_class: "deterministic".into(),
         available: true,
         metrics: WorkerMetrics {
@@ -903,6 +922,7 @@ fn contained_codex_configuration(descriptor: ContainedCodexDescriptor) -> Worker
     configuration.assignment_constraints = vec!["coding".into()];
     configuration.resource_limits.max_storage_bytes = descriptor.max_storage_bytes;
     configuration.containment_profile = descriptor.containment_profile;
+    configuration.containment_resources = Some(descriptor.resources);
     configuration.replacement_class = "contained-coding".into();
     configuration
 }
@@ -998,6 +1018,7 @@ mod tests {
             supports_pi: true,
             pi_model_provider: Some("openai".into()),
             pi_model: Some("openai/pinned-model".into()),
+            resources: pinned_profile(),
         };
 
         assert!(catalog
@@ -1039,5 +1060,93 @@ mod tests {
         };
 
         assert!(failed_gates(&configuration, &request).contains(&"pi_single_native_skill"));
+    }
+
+    fn pinned_profile() -> super::super::contained_codex::ResourceProfile {
+        super::super::contained_codex::ResourceProfile {
+            vcpus: 2,
+            memory_mib: 6144,
+            writable_storage_mib: 4096,
+            max_processes: 256,
+        }
+    }
+
+    fn structured_catalog(
+        declared: Option<super::super::contained_codex::ResourceProfile>,
+    ) -> (WorkerCatalog, ContainedCodexDescriptor) {
+        let mut configuration = deterministic_configuration();
+        configuration.id = "claude".into();
+        configuration.harness = "claude".into();
+        configuration.adapter.kind = WorkerAdapterKind::ClaudeAgentSdk;
+        configuration.containment_profile =
+            crate::worker::contained_codex::CONTAINMENT_PROFILE.into();
+        configuration.containment_resources = declared;
+        let descriptor = ContainedCodexDescriptor {
+            id: "contained".into(),
+            version: "1".into(),
+            model: "codex".into(),
+            settings: BTreeMap::new(),
+            max_storage_bytes: u64::MAX,
+            containment_profile: crate::worker::contained_codex::CONTAINMENT_PROFILE.into(),
+            supports_claude: true,
+            supports_pi: false,
+            pi_model_provider: None,
+            pi_model: None,
+            resources: pinned_profile(),
+        };
+        (
+            WorkerCatalog {
+                configurations: vec![configuration],
+            },
+            descriptor,
+        )
+    }
+
+    #[test]
+    fn contained_configurations_resolve_a_resource_profile_within_the_pinned_one() {
+        let (mut absent, descriptor) = structured_catalog(None);
+        absent.bind_structured_containment(&descriptor).unwrap();
+        assert_eq!(
+            absent.configurations[0].containment_resources,
+            Some(pinned_profile()),
+            "an undeclared profile inherits the pinned one"
+        );
+
+        let smaller = super::super::contained_codex::ResourceProfile {
+            vcpus: 1,
+            memory_mib: 2048,
+            writable_storage_mib: 1024,
+            max_processes: 128,
+        };
+        let (mut declared, descriptor) = structured_catalog(Some(smaller));
+        declared.bind_structured_containment(&descriptor).unwrap();
+        assert_eq!(
+            declared.configurations[0].containment_resources,
+            Some(smaller)
+        );
+
+        for oversized in [
+            super::super::contained_codex::ResourceProfile {
+                vcpus: 4,
+                ..pinned_profile()
+            },
+            super::super::contained_codex::ResourceProfile {
+                memory_mib: 8192,
+                ..pinned_profile()
+            },
+            // Storage without memory headroom above it would OOM on file writes.
+            super::super::contained_codex::ResourceProfile {
+                memory_mib: 2048,
+                writable_storage_mib: 2048,
+                ..pinned_profile()
+            },
+        ] {
+            let (mut catalog, descriptor) = structured_catalog(Some(oversized));
+            let error = catalog
+                .bind_structured_containment(&descriptor)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("must stay within the pinned"), "{error}");
+        }
     }
 }

@@ -104,13 +104,15 @@ Or from a clone: `cargo install --path . && tyrion init`.
 rerun:
 
 ```
-  1/6  docker            Docker version 28.0.4, build b8034c0 (linux/arm64)
+  1/6  docker            Docker version 28.0.4, build b8034c0 (linux/arm64, 12 CPUs, 7.7 GiB)
   2/6  worker image      sha256:346764c72dcd (built)
   3/6  claude code       2.1.274 (Claude Code) (downloaded, checksum verified)
   4/6  codex             codex-cli 0.156.1 (downloaded, checksum verified)
   5/6  configuration     ~/.local/state/tyrion/runtime/worker-runtime.json
   6/6  daemon            started on this runtime, Entry Session attached (1.5s)
 
+  capacity        1 Worker at once at 2 vCPUs and 6 GiB each
+                  give Docker more memory to run Workers in parallel
   claude workers  on, authenticated by CLAUDE_CODE_OAUTH_TOKEN
   codex workers   on, authenticated by ~/.codex/auth.json
 

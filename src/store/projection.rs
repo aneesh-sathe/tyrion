@@ -1092,6 +1092,7 @@ pub(super) fn inspect_commission(
         .iter()
         .filter_map(|attempt| attempt["reservation"]["paid_service_spend_cents"].as_u64())
         .sum::<u64>();
+    let host = super::host_load(connection)?;
     let candidates = assignments
         .iter()
         .filter(|assignment| assignment["status"] == "ready")
@@ -1103,6 +1104,8 @@ pub(super) fn inspect_commission(
         })
         .map(|assignment| {
             let resources = &assignment["resources"];
+            let (vcpus, memory_mib) =
+                super::host_demand(&assignment["route"]["selected_configuration"]);
             Work {
                 item: assignment,
                 write_scopes: json_string_vec(&assignment["write_scopes"]),
@@ -1110,6 +1113,8 @@ pub(super) fn inspect_commission(
                 resources: Resources {
                     concurrency: resources["concurrency_slots"].as_u64().unwrap_or(u64::MAX),
                     storage: resources["max_storage_bytes"].as_u64().unwrap_or(u64::MAX),
+                    vcpus,
+                    memory_mib,
                 },
             }
         })
@@ -1120,6 +1125,7 @@ pub(super) fn inspect_commission(
         Resources {
             concurrency: reserved_concurrency,
             storage: reserved_storage,
+            ..host.used
         },
         Resources {
             concurrency: commission["resource_ceilings"]["max_worker_concurrency"]
@@ -1128,6 +1134,7 @@ pub(super) fn inspect_commission(
             storage: commission["resource_ceilings"]["max_storage_bytes"]
                 .as_u64()
                 .unwrap_or(0),
+            ..host.ceilings()
         },
     );
     let execution_frontier = frontier
@@ -1146,11 +1153,17 @@ pub(super) fn inspect_commission(
         .held
         .into_iter()
         .map(|(assignment, reason)| {
-            json!({
+            let mut hold = json!({
                 "assignment_id": assignment["id"],
                 "logical_id": assignment["logical_id"],
                 "reason": reason.as_str(),
-            })
+            });
+            if reason == super::frontier::HoldReason::HostCapacityUnavailable {
+                let (vcpus, memory_mib) =
+                    super::host_demand(&assignment["route"]["selected_configuration"]);
+                hold["detail"] = json!(host.hold_detail(vcpus, memory_mib));
+            }
+            hold
         })
         .collect::<Vec<_>>();
 
@@ -1431,6 +1444,7 @@ pub(super) fn inspect_commission(
         "plans": plans,
         "execution_frontier": execution_frontier,
         "frontier_holds": frontier_holds,
+        "host_capacity": host.projection(),
         "assignments": assignments,
         "attempts": attempts,
         "workers": workers,

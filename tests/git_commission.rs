@@ -270,7 +270,7 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
         "--read-only",
         "--pids-limit 256",
         "--memory 6144m --memory-swap 6144m",
-        "--cpus 2 --cpuset-cpus 0-1",
+        "--cpus 2 --cpuset-cpus 0,1",
         "--cap-drop ALL",
         "--security-opt no-new-privileges",
         "--security-opt seccomp=builtin",
@@ -687,6 +687,181 @@ fn disjoint_useful_assignments_run_concurrently_and_complete_the_assembled_artif
     assert!(reservations
         .iter()
         .all(|event| event["payload"]["reserved_atomically"] == true));
+}
+
+/// A disposable fixture runtime plus a daemon started with extra arguments.
+fn fixture_daemon(temp: &TempDir, extra_arguments: &[&str]) -> (RunningDaemon, PathBuf) {
+    let fake_state = temp.path().join("fake-docker");
+    fs::create_dir(&fake_state).unwrap();
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
+    );
+    let fake_codex = write_executable(
+        &temp.path().join("codex"),
+        include_str!("fixtures/fake_codex.sh"),
+    );
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &runtime, extra_arguments);
+    (daemon, fake_state)
+}
+
+fn inspect_commission(
+    daemon: &RunningDaemon,
+    attachment_token: &str,
+    commission_id: &str,
+) -> Value {
+    run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            attachment_token,
+            "commission",
+            "inspect",
+            commission_id,
+        ],
+    )
+}
+
+#[test]
+fn concurrent_workers_are_pinned_to_disjoint_cpus_and_capacity_is_inspectable() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, fake_state) = fixture_daemon(&temp, &[]);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("parallel-proposal.json");
+    write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+
+    // The fixture engine reports 16 CPUs and 32 GiB; 1 GiB is kept back.
+    let host = &completed["host_capacity"];
+    assert_eq!(host["source"], "container_runtime");
+    assert_eq!(host["cpus"], 16);
+    assert_eq!(host["usable_memory_mib"], 32768 - 1024);
+    assert_eq!(host["default_worker_profile"]["vcpus"], 2);
+    // min(16 / 2 CPUs, 31744 / 6144 MiB) = 5 Workers at the pinned profile.
+    assert_eq!(host["derived_worker_ceiling"], 5);
+    assert_eq!(host["in_use"]["vcpus"], 0, "finished Workers hold nothing");
+
+    // The two Workers overlapped, so the second was given its own CPUs
+    // rather than contending for the first two.
+    let log = fs::read_to_string(fake_state.join("commands.log"))
+        .unwrap()
+        .replace('\\', "");
+    assert!(log.contains("--cpuset-cpus 0,1"), "{log}");
+    assert!(log.contains("--cpuset-cpus 2,3"), "{log}");
+    assert!(
+        completed["activity_journal"]["useful_concurrency"]["overlap_millis"]
+            .as_u64()
+            .is_some_and(|overlap| overlap > 0)
+    );
+}
+
+#[test]
+fn host_capacity_holds_workers_the_machine_cannot_run_together() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    // The Commission allows two concurrent Workers, but the declared host has
+    // room for exactly one 2-vCPU Worker.
+    let (daemon, _fake_state) = fixture_daemon(&temp, &["--host-cpus", "3"]);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("parallel-proposal.json");
+    write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let held = loop {
+        let inspected = inspect_commission(&daemon, &attachment_token, &commission_id);
+        let hold = inspected["frontier_holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hold| hold["reason"] == "host_capacity_unavailable")
+            .cloned();
+        let running = inspected["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt["status"] == "running");
+        if let Some(hold) = hold.filter(|_| running) {
+            break (inspected, hold);
+        }
+        assert_ne!(
+            inspected["commission"]["status"], "verified_complete",
+            "completed without ever holding for host capacity: {inspected}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no host hold observed: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let (inspected, hold) = held;
+    assert_eq!(inspected["host_capacity"]["source"], "principal");
+    assert_eq!(inspected["host_capacity"]["derived_worker_ceiling"], 1);
+    assert_eq!(inspected["host_capacity"]["in_use"]["vcpus"], 2);
+    let detail = hold["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("Needs 2 vCPUs") && detail.contains("3 CPUs"),
+        "{detail}"
+    );
+
+    // Held work is dispatched, not dropped, once the first Worker finishes,
+    // and the two never ran at the same time.
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    assert_eq!(
+        completed["activity_journal"]["useful_concurrency"]["overlap_millis"],
+        0
+    );
+}
+
+#[test]
+fn a_worker_profile_the_host_can_never_run_blocks_with_the_exact_requirement() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    // 4096 MiB less the 1024 MiB reserve cannot hold one 6144 MiB Worker.
+    let (daemon, fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "4096"]);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let blocker = loop {
+        let inspected = inspect_commission(&daemon, &attachment_token, &commission_id);
+        if let Some(blocker) = inspected["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|blocker| blocker["code"] == "host_capacity")
+        {
+            assert_eq!(inspected["assignments"][0]["status"], "resource_blocked");
+            assert!(inspected["attempts"].as_array().unwrap().is_empty());
+            break blocker.clone();
+        }
+        assert!(Instant::now() < deadline, "no host blocker: {inspected}");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let requirement = blocker["requirement"].as_str().unwrap();
+    assert!(
+        requirement.contains("needs 2 vCPUs and 6144 MiB"),
+        "{requirement}"
+    );
+    assert!(
+        requirement.contains("3072 MiB for Workers"),
+        "{requirement}"
+    );
+    assert!(requirement.contains("--host-memory-mib"), "{requirement}");
+    // Nothing was started only to be killed.
+    let log = fs::read_to_string(fake_state.join("commands.log")).unwrap_or_default();
+    assert!(!log.contains("run --detach"), "{log}");
 }
 
 #[test]

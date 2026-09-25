@@ -50,6 +50,14 @@ struct Arguments {
     watchdog_stall_milliseconds: u64,
     #[arg(long, hide = true)]
     fault_memory_now_epoch: Option<i64>,
+    /// Declare how many CPUs Workers may use, instead of what Docker reports.
+    /// Declaring more than the host has lets Workers share CPUs.
+    #[arg(long)]
+    host_cpus: Option<u64>,
+    /// Declare how much memory, in MiB, Workers may use, instead of what
+    /// Docker reports. Declaring more than the host has risks OOM kills.
+    #[arg(long)]
+    host_memory_mib: Option<u64>,
 }
 
 fn main() {
@@ -77,6 +85,8 @@ fn main() {
         hold_incremental_replay_milliseconds: arguments.fault_hold_incremental_replay_milliseconds,
         watchdog_stall_milliseconds: arguments.watchdog_stall_milliseconds,
         memory_now_epoch_seconds: arguments.fault_memory_now_epoch,
+        host_cpus: arguments.host_cpus,
+        host_memory_mib: arguments.host_memory_mib,
     };
     if let Err(error) =
         tyrion::run_daemon_with_options(&arguments.data_dir, &arguments.socket, options)

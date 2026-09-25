@@ -51,6 +51,9 @@ pub struct DaemonOptions {
     pub hold_incremental_replay_milliseconds: u64,
     pub watchdog_stall_milliseconds: u64,
     pub memory_now_epoch_seconds: Option<i64>,
+    /// Host capacity the Principal declares instead of what Docker reports.
+    pub host_cpus: Option<u64>,
+    pub host_memory_mib: Option<u64>,
 }
 
 impl Default for DaemonOptions {
@@ -75,6 +78,8 @@ impl Default for DaemonOptions {
             hold_incremental_replay_milliseconds: 0,
             watchdog_stall_milliseconds: 30_000,
             memory_now_epoch_seconds: None,
+            host_cpus: None,
+            host_memory_mib: None,
         }
     }
 }
@@ -105,8 +110,13 @@ pub fn run_daemon_with_options(
             hold_before_integration: options.hold_worker_before_integration,
             hold_after_integration: options.hold_worker_after_integration,
             hold_after_external_integration: options.hold_worker_after_external_integration,
+            host_capacity: crate::worker::HostCapacityOverride {
+                cpus: options.host_cpus,
+                memory_mib: options.host_memory_mib,
+            },
         },
     )?);
+    store.record_host_capacity(worker.host_capacity())?;
     let credential = options
         .credential_runtime
         .as_deref()

@@ -26,7 +26,7 @@ use crate::entry_mcp::connect_entry;
 use crate::native_entry_launcher::{
     daemon_is_ready, default_data_dir, RUNTIME_CATALOG, RUNTIME_CONFIG,
 };
-use crate::worker::CODEX_VERSION;
+use crate::worker::{CODEX_VERSION, HOST_MEMORY_RESERVE_MIB};
 use crate::{NativeHarness, TyrionError};
 
 const DOCKERFILE: &str = include_str!("../runtime/docker/Dockerfile");
@@ -57,7 +57,13 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     report(
         1,
         "docker",
-        &format!("{} ({})", docker.version, docker.platform.docker_arch),
+        &format!(
+            "{} ({}, {} CPUs, {:.1} GiB)",
+            docker.version,
+            docker.platform.docker_arch,
+            docker.cpus,
+            docker.memory_mib as f64 / 1024.0
+        ),
     );
 
     let (image_id, built) = docker.worker_image()?;
@@ -163,8 +169,8 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         "egress": {"destinations": destinations},
         "worker_credentials": claude_credentials,
         "lease_ttl_seconds": 900,
-        "vcpus": 2,
-        "memory_mib": 6144,
+        "vcpus": WORKER_VCPUS,
+        "memory_mib": WORKER_MEMORY_MIB,
         "writable_storage_mib": 4096,
         "max_processes": 256,
     });
@@ -195,6 +201,17 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     );
 
     println!();
+    let ceiling = worker_ceiling(docker.cpus, docker.memory_mib);
+    println!(
+        "  capacity        {ceiling} Worker{} at once at {WORKER_VCPUS} vCPUs and {} GiB each{}",
+        if ceiling == 1 { "" } else { "s" },
+        WORKER_MEMORY_MIB / 1024,
+        match ceiling {
+            0 => "\n                  Workers will be blocked: give Docker at least 8 GB of memory",
+            1 => "\n                  give Docker more memory to run Workers in parallel",
+            _ => "",
+        }
+    );
     println!(
         "  claude workers  {}",
         if claude_credentials.is_empty() {
@@ -214,6 +231,17 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     );
     println!("\nTyrion is ready. From any Git repository, run `tyrion claude` or `tyrion codex`.");
     Ok(())
+}
+
+/// The pinned Worker profile. The daemon accepts only this runtime profile;
+/// a Worker Configuration may declare a smaller one.
+const WORKER_VCPUS: u64 = 2;
+const WORKER_MEMORY_MIB: u64 = 6144;
+
+/// The same derivation the daemon uses to admit Workers.
+fn worker_ceiling(cpus: u64, memory_mib: u64) -> u64 {
+    (cpus / WORKER_VCPUS)
+        .min(memory_mib.saturating_sub(HOST_MEMORY_RESERVE_MIB) / WORKER_MEMORY_MIB)
 }
 
 fn report(step: u8, name: &str, detail: &str) {
@@ -274,6 +302,8 @@ struct Docker {
     /// never resolves an ambient Docker context.
     host: String,
     platform: Platform,
+    cpus: u64,
+    memory_mib: u64,
 }
 
 impl Docker {
@@ -310,11 +340,25 @@ impl Docker {
                 "use a Docker engine running linux/arm64 or linux/amd64",
             )
         })?;
+        // The daemon reads the same figures at startup to admit Workers.
+        let capacity = text(run(&mut docker(&[
+            "info",
+            "--format",
+            "{{.NCPU}} {{.MemTotal}}",
+        ]))?);
+        let mut fields = capacity.split_whitespace().map(str::parse::<u64>);
+        let (Some(Ok(cpus)), Some(Ok(memory_bytes))) = (fields.next(), fields.next()) else {
+            return Err(TyrionError::InvalidRequest(format!(
+                "Docker reported unreadable capacity: {capacity}"
+            )));
+        };
         Ok(Self {
             binary,
             version,
             host,
             platform,
+            cpus,
+            memory_mib: memory_bytes / (1024 * 1024),
         })
     }
 
@@ -935,5 +979,14 @@ mod tests {
             None,
             "a malformed digest must not be trusted"
         );
+    }
+
+    #[test]
+    fn worker_ceiling_is_bounded_by_the_scarcer_resource() {
+        // This development machine: 12 CPUs, but 7837 MiB of Docker memory.
+        assert_eq!(worker_ceiling(12, 7837), 1);
+        assert_eq!(worker_ceiling(12, 16384), 2);
+        assert_eq!(worker_ceiling(4, 65536), 2);
+        assert_eq!(worker_ceiling(12, 4096), 0);
     }
 }

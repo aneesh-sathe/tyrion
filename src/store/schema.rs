@@ -279,6 +279,20 @@ CREATE TABLE IF NOT EXISTS attempt_profile_claims (
         REFERENCES profile_claim_versions(claim_id, version)
 );
 
+-- What the container runtime can run at once, recorded at each daemon start.
+-- Absent when no contained runtime is configured. Admission holds the sum of
+-- every running Worker's profile within it, across all Commissions.
+CREATE TABLE IF NOT EXISTS host_capacity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cpus INTEGER NOT NULL CHECK (cpus > 0),
+    memory_mib INTEGER NOT NULL CHECK (memory_mib > 0),
+    reserve_mib INTEGER NOT NULL CHECK (reserve_mib >= 0),
+    source TEXT NOT NULL CHECK (source IN ('container_runtime', 'principal')),
+    worker_vcpus INTEGER NOT NULL CHECK (worker_vcpus > 0),
+    worker_memory_mib INTEGER NOT NULL CHECK (worker_memory_mib > 0),
+    observed_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS assignment_routes (
     assignment_id TEXT PRIMARY KEY REFERENCES assignments(id),
     status TEXT NOT NULL CHECK (status IN ('selected', 'attention_required')),
@@ -1154,7 +1168,7 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
         SELECT id, '{}', updated_at FROM profile_claims;
         "#,
     )?;
-    connection.pragma_update(None, "user_version", 17)?;
+    connection.pragma_update(None, "user_version", 18)?;
     Ok(())
 }
 
@@ -1267,7 +1281,8 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let results_schema = table_schema(connection, "results")?;
     let commissions_schema = table_schema(connection, "commissions")?;
     let workers_schema = table_schema(connection, "workers")?;
-    Ok(user_version < 17
+    Ok(user_version < 18
+        || !table_exists(connection, "host_capacity")?
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1429,7 +1444,8 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
     verify_integrity(connection)?;
     let user_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != 17
+    if user_version != 18
+        || !table_exists(connection, "host_capacity")?
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
