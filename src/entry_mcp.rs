@@ -129,7 +129,7 @@ struct CachedStart {
     result: Value,
 }
 
-fn connect_entry(socket: &Path, harness: NativeHarness) -> Result<String, TyrionError> {
+pub(crate) fn connect_entry(socket: &Path, harness: NativeHarness) -> Result<String, TyrionError> {
     let adapter = AdapterIdentity {
         harness: harness.as_str().into(),
         adapter_identity: ADAPTER_IDENTITY.into(),

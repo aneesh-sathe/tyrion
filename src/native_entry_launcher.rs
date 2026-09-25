@@ -177,18 +177,24 @@ fn ensure_local_daemon(explicit_socket: Option<&Path>) -> Result<LocalDaemon, Ty
         .arg(&data_dir)
         .arg("--socket")
         .arg(&socket);
-    let prototype_config = prototype_codex_worker_config(&data_dir)?;
-    if let Some(config) = &prototype_config {
-        command.arg("--codex-worker-config").arg(config);
+    // Written by `tyrion init`. Without it the daemon runs only the
+    // deterministic Worker, which cannot touch a repository.
+    let runtime = data_dir.join("runtime");
+    if runtime.join(RUNTIME_CONFIG).is_file() {
+        command
+            .arg("--codex-worker-config")
+            .arg(runtime.join(RUNTIME_CONFIG));
+        if runtime.join(RUNTIME_CATALOG).is_file() {
+            command
+                .arg("--worker-catalog")
+                .arg(runtime.join(RUNTIME_CATALOG));
+        }
     }
+    let log = data_dir.join("tyriond.log");
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(if prototype_config.is_some() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
+        .stderr(Stdio::from(File::create(&log)?))
         .spawn()
         .map_err(|error| {
             TyrionError::InvalidRequest(format!(
@@ -196,7 +202,9 @@ fn ensure_local_daemon(explicit_socket: Option<&Path>) -> Result<LocalDaemon, Ty
                 daemon_binary.display()
             ))
         })?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Startup verifies every pinned binary and the Docker engine, which takes
+    // longer than binding a socket.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if daemon_is_ready(&socket) {
             return Ok(LocalDaemon {
@@ -206,50 +214,21 @@ fn ensure_local_daemon(explicit_socket: Option<&Path>) -> Result<LocalDaemon, Ty
             });
         }
         if let Some(status) = child.try_wait()? {
+            let reason = fs::read_to_string(&log).unwrap_or_default();
             return Err(TyrionError::InvalidRequest(format!(
-                "Tyrion daemon exited before becoming ready: {status}"
+                "Tyrion daemon exited before becoming ready ({status}): {}\n  next: rerun `tyrion init`",
+                reason.trim()
             )));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             return Err(TyrionError::InvalidRequest(
-                "Tyrion daemon did not become ready within 5 seconds".into(),
+                "Tyrion daemon did not become ready within 30 seconds".into(),
             ));
         }
         thread::sleep(Duration::from_millis(20));
     }
-}
-
-// PROTOTYPE ONLY: prove that the native launcher can inject an ephemeral,
-// Tyrion-owned Worker runtime without asking the user for a JSON file.
-fn prototype_codex_worker_config(data_dir: &Path) -> Result<Option<PathBuf>, TyrionError> {
-    if std::env::var_os("TYRION_PROTOTYPE_ZERO_CONFIG_CODEX").as_deref() != Some("1".as_ref()) {
-        return Ok(None);
-    }
-    let configured = std::env::var_os("TYRION_PROTOTYPE_CODEX_WORKER_CONFIG").ok_or_else(|| {
-        TyrionError::InvalidRequest(
-            "zero-config Codex prototype requires its private Worker runtime".into(),
-        )
-    })?;
-    let configured = PathBuf::from(configured);
-    let metadata = fs::symlink_metadata(&configured)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(TyrionError::InvalidRequest(
-            "prototype Worker runtime must be a user-owned regular file".into(),
-        ));
-    }
-    let configured = fs::canonicalize(configured)?;
-    let data_dir = fs::canonicalize(data_dir)?;
-    if !configured.starts_with(&data_dir) {
-        return Err(TyrionError::InvalidRequest(
-            "prototype Worker runtime must remain inside the private Tyrion data directory".into(),
-        ));
-    }
-    Ok(Some(configured))
 }
 
 fn open_native_session_lock(data_dir: &Path) -> Result<File, TyrionError> {
@@ -279,7 +258,7 @@ fn open_native_session_lock(data_dir: &Path) -> Result<File, TyrionError> {
     }
 }
 
-fn daemon_is_ready(socket: &Path) -> bool {
+pub(crate) fn daemon_is_ready(socket: &Path) -> bool {
     send_request(
         socket,
         &Request {
@@ -297,7 +276,11 @@ fn daemon_is_ready(socket: &Path) -> bool {
     .is_ok()
 }
 
-fn default_data_dir() -> Result<PathBuf, TyrionError> {
+/// The runtime `tyrion init` generates, inside the data directory's `runtime/`.
+pub(crate) const RUNTIME_CONFIG: &str = "worker-runtime.json";
+pub(crate) const RUNTIME_CATALOG: &str = "worker-catalog.json";
+
+pub(crate) fn default_data_dir() -> Result<PathBuf, TyrionError> {
     if let Some(path) = std::env::var_os("TYRION_DATA_DIR").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path));
     }

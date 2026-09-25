@@ -37,7 +37,7 @@ Harness capability is a technical limit, not permission. Effective authority is 
 
 Consequential operations use exact, single-use Approval Gates. The approval binds the current revisions, target identity, parameters, consequences, limits, and operation digest. A changed request needs a new approval. Tyrion never treats ambient credentials or installed tools as authority.
 
-Credentialed effects use the macOS Keychain broker and, when necessary, a fresh one-shot Effect Sandbox. Secret values stay outside SQLite, Worker environments, Entry Sessions, command arguments, Evidence, and durable receipts. See [Credentialed effects](docs/credentialed-effects.md).
+Credentialed effects use the macOS Keychain broker and, when necessary, a fresh one-shot Effect Sandbox. Secret values stay outside SQLite, Worker environments, Entry Sessions, command arguments, Evidence, and durable receipts. See [Credentialed effects](credentialed-effects.md).
 
 ## Entry Sessions and Workers
 
@@ -99,10 +99,10 @@ The deterministic walkthrough does not prove the containment boundary. Real Git 
 
 Do not begin by guessing values in the runtime JSON. Startup verifies paths, versions, hashes, the Docker CLI identity, the Worker image identity, and the resource ceilings, and it refuses to start rather than run something unverified. Follow the setup document for the role you need:
 
-- [Contained Codex Git assignments](docs/contained-codex.md)
-- [Cross-harness Worker routing and control](docs/cross-harness-workers.md)
-- [Pi Entry and Worker adapters](docs/pi-adapter.md)
-- [Credentialed effects](docs/credentialed-effects.md)
+- [Contained Codex Git assignments](contained-codex.md)
+- [Cross-harness Worker routing and control](cross-harness-workers.md)
+- [Pi Entry and Worker adapters](pi-adapter.md)
+- [Credentialed effects](credentialed-effects.md)
 
 The daemon accepts these optional runtime files:
 
@@ -115,13 +115,6 @@ target/debug/tyriond \
   --credential-runtime /absolute/path/to/credential-runtime.json
 ```
 
-Generate the runtime file rather than writing one:
-
-```sh
-runtime/docker/generate-config.sh --image <your-image> --out .scratch/runtime \
-  --claude /path/to/claude-linux-arm64
-```
-
-It discovers every value Tyrion verifies, and runs each harness binary inside the hardened container to read its version. [`runtime/docker/codex-worker.example.json`](runtime/docker/codex-worker.example.json) documents the shape and [`runtime/docker/README.md`](runtime/docker/README.md) explains each field. It is not ready to run until every path and digest matches your machine.
+`tyrion init` generates the first two and `tyrion claude` or `tyrion codex` passes them automatically, so you only need these flags to run a daemon by hand. [`runtime/docker/README.md`](../runtime/docker/README.md) explains each field.
 
 `--credential-runtime` drives the exceptional one-shot credentialed Effect Sandbox. It uses the same hardened Docker profile as a Worker, on a per-operation internal network whose only route out is a relay pinned to the one approved destination.

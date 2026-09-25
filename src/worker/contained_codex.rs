@@ -28,7 +28,7 @@ use crate::TyrionError;
 /// root, no host path is ever bind-mounted in, and the only writable mount is
 /// the sized `/sandbox` tmpfs.
 pub(super) const CONTAINMENT_PROFILE: &str = "docker-hardened-v1";
-const CODEX_VERSION: &str = "codex-cli 0.156.1";
+pub(crate) const CODEX_VERSION: &str = "codex-cli 0.156.1";
 /// The single writable mount inside every sandbox.
 const SANDBOX_ROOT: &str = "/sandbox";
 /// Every container and network Tyrion creates carries its Attempt, so

@@ -42,7 +42,7 @@ evidence   : integrated passed
 Then you review it like any other change:
 
 ```sh
-git fetch "$TYRION_DATA_DIR/integrations/$COMMISSION_ID/repository" tyrion-integration
+git fetch ~/.local/state/tyrion/integrations/$COMMISSION_ID/repository tyrion-integration
 git diff HEAD FETCH_HEAD
 git merge --ff-only FETCH_HEAD
 ```
@@ -86,54 +86,70 @@ a whole Commission and requires them identical afterwards.
 
 ## Requirements
 
-- macOS on Apple silicon
-- Docker (Desktop, Colima or Lima)
-- Rust toolchain
-- A subscription or API access for at least one of Claude Code, Codex or Pi
+- macOS
+- Docker Desktop or Colima, running, with at least 2 CPUs and 8 GB of memory
+- A login for Claude Code, Codex, or both
 
-## Setup
-
-```sh
-git clone https://github.com/aneesh-sathe/tyrion && cd tyrion
-cargo build
-
-# build the Worker image your agents run inside
-docker build -f runtime/docker/Dockerfile -t tyrion-worker:local .
-
-# generate a pinned runtime configuration for this machine
-runtime/docker/generate-config.sh \
-  --image tyrion-worker:local \
-  --out .scratch/runtime \
-  --claude /path/to/claude-linux-arm64
-```
-
-The generator discovers everything Tyrion verifies at startup: binary hashes,
-the Docker CLI identity, the image identity, and each harness version, which it
-reads by running the binary **inside the hardened container**. Do not hand-write
-this file. A wrong digest makes the daemon refuse to start, which is correct but
-opaque.
-
-See [`runtime/docker/README.md`](runtime/docker/README.md) for each field, and
-[Contained Codex Git assignments](docs/contained-codex.md) for the full
-containment profile.
-
-A single `brew install` plus `tyrion init` is tracked in
-[#26](https://github.com/aneesh-sathe/tyrion/issues/26).
-
-## Run it
+## Install
 
 ```sh
-target/debug/tyriond \
-  --data-dir .scratch/tyrion-data \
-  --socket .scratch/tyrion-data/tyrion.sock \
-  --codex-worker-config .scratch/runtime/codex-worker.json \
-  --worker-catalog .scratch/runtime/worker-catalog.json &
-
-target/debug/tyrion claude     # or: tyrion codex, tyrion pi
+brew tap aneesh-sathe/tyrion https://github.com/aneesh-sathe/tyrion
+brew install --HEAD tyrion
+tyrion init
 ```
 
-That launches your normal harness with Tyrion attached. Describe the job and it
-takes over from there.
+Or from a clone: `cargo install --path . && tyrion init`.
+
+`tyrion init` does the setup you would otherwise do by hand, and is safe to
+rerun:
+
+```
+  1/6  docker            Docker version 28.0.4, build b8034c0 (linux/arm64)
+  2/6  worker image      sha256:346764c72dcd (built)
+  3/6  claude code       2.1.274 (Claude Code) (downloaded, checksum verified)
+  4/6  codex             codex-cli 0.156.1 (downloaded, checksum verified)
+  5/6  configuration     ~/.local/state/tyrion/runtime/worker-runtime.json
+  6/6  daemon            started on this runtime, Entry Session attached (1.5s)
+
+  claude workers  on, authenticated by CLAUDE_CODE_OAUTH_TOKEN
+  codex workers   on, authenticated by ~/.codex/auth.json
+
+Tyrion is ready. From any Git repository, run `tyrion claude` or `tyrion codex`.
+```
+
+It builds the image your agents run inside, downloads the Linux builds of each
+harness and checks them against their publishers' checksums, runs each one
+inside the hardened container to prove it works there, pins everything it
+found, and starts the daemon on the result. It spends no model tokens: your
+first real Commission is your first job. When something is wrong it says what
+to do next. See [`runtime/docker/README.md`](runtime/docker/README.md) for
+what it pins and why.
+
+Workers authenticate separately from your own harness session, so they need:
+
+- **Claude**: run `claude setup-token` and export the result as
+  `CLAUDE_CODE_OAUTH_TOKEN` in your shell profile, or export
+  `ANTHROPIC_API_KEY`.
+- **Codex**: run `codex login`.
+
+Rerun `tyrion init` after adding either.
+
+## Use it
+
+```sh
+cd your-project
+tyrion claude     # or: tyrion codex
+```
+
+That opens your normal harness with Tyrion attached. Describe the job; Tyrion
+takes it from there and reports back in the same conversation. Nothing changes
+in your checkout until you merge the result:
+
+```sh
+git fetch ~/.local/state/tyrion/integrations/$COMMISSION_ID/repository tyrion-integration
+git diff HEAD FETCH_HEAD
+git merge --ff-only FETCH_HEAD
+```
 
 ## Where it is going
 

@@ -19,6 +19,8 @@ mod contained_codex;
 mod routing;
 mod structured_process;
 
+pub(crate) use contained_codex::CODEX_VERSION;
+
 pub const DETERMINISTIC_ACTION: &str = "deterministic.echo";
 pub const CODEX_GIT_ACTION: &str = "codex.git_change";
 const MAX_RAW_ADAPTER_EVENT_BYTES: usize = 64 * 1024;
