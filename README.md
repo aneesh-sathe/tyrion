@@ -94,7 +94,7 @@ a whole Commission and requires them identical afterwards.
 
 ```sh
 brew tap aneesh-sathe/tyrion https://github.com/aneesh-sathe/tyrion
-brew install --HEAD tyrion
+brew install tyrion
 tyrion init
 ```
 
