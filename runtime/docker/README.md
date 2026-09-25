@@ -4,57 +4,38 @@
 [`codex-worker.example.json`](codex-worker.example.json). Unknown fields are
 rejected, so copy the example rather than editing an older OpenShell profile.
 
-## Provision the image
+## You do not write this file
 
-Build from the repository root, so the adapter sources are in context:
+`tyrion init` generates it. Every value Tyrion checks at startup can be
+discovered from your machine, and a wrong digest makes `tyriond` exit before it
+binds its socket, which is correct but opaque. So `init`:
 
-```sh
-docker build -f runtime/docker/Dockerfile -t registry.example/tyrion-worker:2026-09-22 .
-docker push registry.example/tyrion-worker:2026-09-22
-docker image inspect registry.example/tyrion-worker:2026-09-22 \
-  --format '{{index .RepoDigests 0}}{{"\n"}}{{.Id}}'
-```
+- pins the Docker CLI hash and version, and resolves the current Docker
+  context's endpoint once into `docker_host`
+- builds the Worker image from [`Dockerfile`](Dockerfile), tagged by a digest of
+  its build inputs, and pins its image ID
+- downloads the Linux Claude Code and Codex builds for the engine's
+  architecture and checks each against its publisher's SHA-256 manifest
+- streams each binary into a container under the exact Worker profile and reads
+  its version there, which is the only place a Linux guest binary can report
+  one and doubles as proof it runs under the profile at all
+- names `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` in
+  `worker_credentials` only if you have it exported, and picks up
+  `~/.codex/auth.json` when present, then sets the egress each harness needs
+- writes the file, and the Worker catalog, to `$TYRION_DATA_DIR/runtime/`
+  (default `~/.local/state/tyrion/runtime/`), where `tyrion claude` and
+  `tyrion codex` find them
+- starts a throwaway daemon on the result and drives one deterministic
+  Commission to `verified_complete`
 
-The image carries the adapters' runtime dependencies -- `native_skill` and the
-Claude Agent SDK -- rather than transferring them per Attempt. They are then
-covered by the image digest Tyrion already verifies at launch, instead of
-needing a second pinned artifact kept in step with the first. Confirm a build
-can satisfy a real adapter:
+[`codex-worker.example.json`](codex-worker.example.json) shows the shape.
+Unknown fields are rejected.
 
-```sh
-docker run --rm -e PYTHONPATH=/opt/tyrion <image> \
-  python3 -c 'import native_skill, claude_agent_sdk; print("ok")'
-```
-
-Put the digest reference in `worker_image` and the image ID in
-`worker_image_id`. Tyrion never pulls: it fails at startup if the pinned image
-is not already present, and it fails again at sandbox creation if the
-container launched anything else.
-
-## Generate it instead of writing it
-
-Every value Tyrion checks at startup can be discovered from your machine, and a
-wrong digest makes `tyriond` exit before it binds its socket, which is correct
-but opaque. So generate the file:
-
-```sh
-runtime/docker/generate-config.sh \
-  --image tyrion-worker:2026-09-22 \
-  --out .scratch/runtime \
-  --claude  /path/to/claude-linux-arm64 \
-  --codex   /path/to/codex-linux-arm64 \
-  --codex-code-mode-host /path/to/codex-code-mode-host
-```
-
-It hashes each binary, resolves the image identity, picks up
-`~/.codex/auth.json` when present, and sets the egress destinations each
-harness needs. It also runs every harness binary **inside the hardened
-container** to read its version, which is the only place a Linux guest binary
-can report one and doubles as proof it runs under the profile at all.
-
-Then name the credentials a harness needs in `worker_credentials`, for example
-`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Codex needs nothing there:
-it reads its subscription login from `codex_auth_file`.
+The image carries the adapters' runtime dependencies, `native_skill` and the
+Claude Agent SDK, rather than transferring them per Attempt, so the image ID
+Tyrion already verifies is their pin. Tyrion never pulls: it fails at startup if
+the pinned image is absent, and again at sandbox creation if the container
+launched anything else.
 
 ## Fields
 
@@ -82,8 +63,8 @@ that no provider variable is present.
 
 The relay forwards TCP without terminating TLS, so a credential stays
 end to end encrypted to its destination and cannot be sent anywhere else.
-It does not bound spend or disclosure at that destination; Tyrion's effect
-gates and the Commission's spend ceilings remain the controls for that.
+It does not bound spend or disclosure at that destination. Tyrion's effect
+gates bound what is sent, and your provider's spend cap bounds cost.
 
 ## Reading the work a Commission produced
 

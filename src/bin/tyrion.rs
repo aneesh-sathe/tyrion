@@ -18,7 +18,10 @@ use tyrion::protocol::{
 use tyrion::{launch_native_entry, NativeHarness};
 
 #[derive(Debug, Parser)]
-#[command(about = "Review and control Tyrion Commissions")]
+#[command(
+    version,
+    about = "Run coding agents in parallel under containment, and accept only verified work"
+)]
 struct Arguments {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
@@ -32,6 +35,16 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
+    /// Set up Docker, the Worker image, and the harness runtime on this machine.
+    Init {
+        /// Claude Code release channel (stable, latest) or exact version.
+        #[arg(long, default_value = "stable")]
+        claude_version: String,
+        #[arg(long, default_value = "claude-haiku-4-5-20251001")]
+        claude_model: String,
+        #[arg(long, default_value = "gpt-5.6-sol")]
+        codex_model: String,
+    },
     /// Launch Claude Code as a Tyrion Entry Session.
     Claude {
         #[arg(last = true)]
@@ -429,6 +442,22 @@ enum PrincipalCommand {
 
 fn main() {
     let arguments = Arguments::parse();
+    if let TopLevelCommand::Init {
+        claude_version,
+        claude_model,
+        codex_model,
+    } = &arguments.command
+    {
+        if let Err(error) = tyrion::run_init(&tyrion::InitOptions {
+            claude_version: claude_version.clone(),
+            claude_model: claude_model.clone(),
+            codex_model: codex_model.clone(),
+        }) {
+            eprintln!("\nerror: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let TopLevelCommand::Claude { claude_arguments } = &arguments.command {
         if let Err(error) = launch_native_entry(
             NativeHarness::Claude,
@@ -811,9 +840,9 @@ fn attachment_handshake(
 fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> {
     let (command, idempotency_key, expected_revision, expected_control_revision) =
         match &arguments.command {
-            TopLevelCommand::Claude { .. } => {
+            TopLevelCommand::Init { .. } | TopLevelCommand::Claude { .. } => {
                 return Err(tyrion::TyrionError::InvalidRequest(
-                    "Claude launch must be handled before protocol request construction".into(),
+                    "local commands must be handled before protocol request construction".into(),
                 ));
             }
             TopLevelCommand::Codex { .. } => {
