@@ -1,6 +1,6 @@
 # Tyrion as a software factory manager
 
-Status: in progress. Slices are issues #22 to #28. Slices 5 and 6 are done.
+Status: in progress. Slices are issues #22 to #28. Slices 1, 5 and 6 are done.
 
 ## Objective
 
@@ -48,7 +48,13 @@ single legacy Assignment. This is the central gap.
 `max_worker_concurrency != 1`. Two lines. The cap was correct for a walking
 skeleton and is now the thing preventing a factory.
 
-### 3. Concurrency is not capacity aware
+### 3. Concurrency is not capacity aware (done)
+
+Resolved by #22: admission holds the sum of running Worker profiles within
+the host's CPUs and memory across Commissions, each container gets its own
+CPUs, and a configuration may declare a smaller profile. It also found that
+every container had been pinned to the same two CPUs.
+
 
 The per-Worker profile is 2 vCPU and 6144 MiB, inherited from the OpenShell
 MicroVM and never revisited. The Docker VM on the development machine has 12

@@ -356,6 +356,38 @@ impl Store {
         Ok(Self { connection })
     }
 
+    /// Record the host Workers run on, observed at this daemon start. None
+    /// means no contained runtime, so no Worker holds host capacity.
+    pub(crate) fn record_host_capacity(
+        &mut self,
+        host: Option<(worker::HostCapacity, worker::ResourceProfile)>,
+    ) -> Result<(), TyrionError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM host_capacity", [])?;
+        if let Some((capacity, profile)) = host {
+            transaction.execute(
+                "INSERT INTO host_capacity (
+                    id, cpus, memory_mib, reserve_mib, source, worker_vcpus,
+                    worker_memory_mib, observed_at
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    capacity.cpus,
+                    capacity.memory_mib,
+                    capacity.reserve_mib,
+                    match capacity.source {
+                        worker::HostCapacitySource::ContainerRuntime => "container_runtime",
+                        worker::HostCapacitySource::Principal => "principal",
+                    },
+                    profile.vcpus,
+                    profile.memory_mib,
+                    unix_timestamp()?,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn create_proposal(
         &mut self,
         request: &Request,
@@ -7133,13 +7165,30 @@ impl Store {
                 [commission_id],
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?)),
             )?;
+        let host = host_load(&transaction)?;
         let ceilings = Resources {
             concurrency: ready_candidates[0].max_worker_concurrency.into(),
             storage: ready_candidates[0].max_storage_bytes,
+            ..host.ceilings()
         };
-        let candidates = ready_candidates
-            .into_iter()
-            .map(|candidate| Work {
+        let mut candidates = Vec::with_capacity(ready_candidates.len());
+        for candidate in ready_candidates {
+            let (vcpus, memory_mib) =
+                assignment_host_demand(&transaction, &candidate.assignment_id)?;
+            // A Worker profile this host could never run is an actionable
+            // Blocker, not a hold that would wait forever.
+            if vcpus > ceilings.vcpus || memory_mib > ceilings.memory_mib {
+                let requirement = host.never_fits_requirement(vcpus, memory_mib);
+                return block_ready_assignment(
+                    transaction,
+                    commission_id,
+                    &candidate.assignment_id,
+                    candidate.mandate_revision,
+                    "host_capacity",
+                    &requirement,
+                );
+            }
+            candidates.push(Work {
                 write_scopes: candidate.write_scopes.clone(),
                 competition: competition(
                     &candidate.competition_group,
@@ -7149,10 +7198,12 @@ impl Store {
                 resources: Resources {
                     concurrency: candidate.reserved_concurrency_slots.into(),
                     storage: candidate.reserved_storage_bytes,
+                    vcpus,
+                    memory_mib,
                 },
                 item: candidate,
-            })
-            .collect();
+            });
+        }
         let occupied = active_scopes
             .into_iter()
             .map(|(write_scopes, group, uncertainty, rule)| OccupiedWork {
@@ -7166,6 +7217,7 @@ impl Store {
             Resources {
                 concurrency: used_concurrency.into(),
                 storage: used_storage,
+                ..host.used
             },
             ceilings,
         );
@@ -8548,6 +8600,7 @@ impl Store {
                 Ok(Resources {
                     concurrency: row.get(0)?,
                     storage: row.get(1)?,
+                    ..Resources::default()
                 })
             })?;
             comparison_resources(rows.collect::<Result<Vec<_>, _>>()?)?
@@ -8718,6 +8771,7 @@ impl Store {
         let reconciliation_budget = Resources {
             concurrency: ready.reserved_concurrency_slots.into(),
             storage: ready.max_storage_bytes,
+            ..Resources::default()
         };
         let goal = format!(
             "Reconcile {kind} for Assignment {} without selecting a silent winner: {message}. Authorized reconciliation write scope: {}",
@@ -12562,6 +12616,161 @@ fn release_successful_attempt(
     Ok(())
 }
 
+/// The host Workers run on and what every running Worker holds against it,
+/// summed across all Commissions because they share one container runtime.
+struct HostLoad {
+    capacity: Option<HostRecord>,
+    used: Resources,
+}
+
+struct HostRecord {
+    cpus: u64,
+    memory_mib: u64,
+    reserve_mib: u64,
+    source: String,
+    worker_vcpus: u64,
+    worker_memory_mib: u64,
+    observed_at: i64,
+}
+
+impl HostLoad {
+    /// Only the host dimensions are set. Without a contained runtime nothing
+    /// holds host capacity, so it is unbounded.
+    fn ceilings(&self) -> Resources {
+        match &self.capacity {
+            Some(host) => Resources {
+                vcpus: host.cpus,
+                memory_mib: host.memory_mib.saturating_sub(host.reserve_mib),
+                ..Resources::default()
+            },
+            None => Resources {
+                vcpus: u64::MAX,
+                memory_mib: u64::MAX,
+                ..Resources::default()
+            },
+        }
+    }
+
+    fn describe(&self) -> String {
+        let ceilings = self.ceilings();
+        format!(
+            "this host provides {} CPUs and {} MiB for Workers, with {} vCPUs and {} MiB in use",
+            ceilings.vcpus, ceilings.memory_mib, self.used.vcpus, self.used.memory_mib
+        )
+    }
+
+    fn hold_detail(&self, vcpus: u64, memory_mib: u64) -> String {
+        format!(
+            "Needs {vcpus} vCPUs and {memory_mib} MiB; {}. It dispatches when running Workers finish.",
+            self.describe()
+        )
+    }
+
+    fn never_fits_requirement(&self, vcpus: u64, memory_mib: u64) -> String {
+        format!(
+            "The Worker profile needs {vcpus} vCPUs and {memory_mib} MiB, but {}. Give the container runtime more CPUs or memory, route to a Worker Configuration with a smaller containment_resources profile, or start tyriond with --host-cpus and --host-memory-mib to declare more.",
+            self.describe()
+        )
+    }
+
+    /// The derived ceiling and the capacity it came from.
+    fn projection(&self) -> Value {
+        let Some(host) = &self.capacity else {
+            return Value::Null;
+        };
+        let usable_memory_mib = host.memory_mib.saturating_sub(host.reserve_mib);
+        serde_json::json!({
+            "cpus": host.cpus,
+            "memory_mib": host.memory_mib,
+            "reserve_mib": host.reserve_mib,
+            "usable_memory_mib": usable_memory_mib,
+            "source": host.source,
+            "observed_at": host.observed_at,
+            "default_worker_profile": {
+                "vcpus": host.worker_vcpus,
+                "memory_mib": host.worker_memory_mib,
+            },
+            "derived_worker_ceiling": (host.cpus / host.worker_vcpus)
+                .min(usable_memory_mib / host.worker_memory_mib),
+            "in_use": {
+                "vcpus": self.used.vcpus,
+                "memory_mib": self.used.memory_mib,
+            },
+        })
+    }
+}
+
+fn host_load(connection: &Connection) -> Result<HostLoad, TyrionError> {
+    let capacity = connection
+        .query_row(
+            "SELECT cpus, memory_mib, reserve_mib, source, worker_vcpus, worker_memory_mib,
+                    observed_at
+             FROM host_capacity WHERE id = 1",
+            [],
+            |row| {
+                Ok(HostRecord {
+                    cpus: row.get(0)?,
+                    memory_mib: row.get(1)?,
+                    reserve_mib: row.get(2)?,
+                    source: row.get(3)?,
+                    worker_vcpus: row.get(4)?,
+                    worker_memory_mib: row.get(5)?,
+                    observed_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let (vcpus, memory_mib) = connection.query_row(
+        "SELECT COALESCE(SUM(json_extract(assignment_routes.selected_configuration_json,
+                                          '$.containment_resources.vcpus')), 0),
+                COALESCE(SUM(json_extract(assignment_routes.selected_configuration_json,
+                                          '$.containment_resources.memory_mib')), 0)
+         FROM resource_reservations
+         JOIN attempts ON attempts.id = resource_reservations.attempt_id
+         JOIN assignment_routes ON assignment_routes.assignment_id = attempts.assignment_id
+         WHERE resource_reservations.status = 'active'",
+        [],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+    )?;
+    Ok(HostLoad {
+        capacity,
+        used: Resources {
+            vcpus,
+            memory_mib,
+            ..Resources::default()
+        },
+    })
+}
+
+/// The host share an Assignment's routed Worker Configuration would hold.
+/// Zero for a Worker that never touches the container runtime.
+fn host_demand(configuration: &Value) -> (u64, u64) {
+    let resources = &configuration["containment_resources"];
+    (
+        resources["vcpus"].as_u64().unwrap_or(0),
+        resources["memory_mib"].as_u64().unwrap_or(0),
+    )
+}
+
+fn assignment_host_demand(
+    connection: &Connection,
+    assignment_id: &str,
+) -> Result<(u64, u64), TyrionError> {
+    let configuration = connection
+        .query_row(
+            "SELECT selected_configuration_json FROM assignment_routes
+             WHERE assignment_id = ?1 AND status = 'selected'",
+            [assignment_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .map(|encoded| serde_json::from_str::<Value>(&encoded))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    Ok(host_demand(&configuration))
+}
+
 fn block_ready_assignment(
     transaction: Transaction<'_>,
     commission_id: &str,
@@ -14942,6 +15151,7 @@ fn validate_commission_plan(
             entry.2.push(Resources {
                 concurrency: assignment.resources.concurrency_slots.into(),
                 storage: assignment.resources.max_storage_bytes,
+                ..Resources::default()
             });
         }
     }

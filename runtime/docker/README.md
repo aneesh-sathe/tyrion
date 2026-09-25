@@ -48,6 +48,41 @@ launched anything else.
 | `worker_credentials` | Names of environment variables `tyriond` was started with that may be forwarded into a Worker execution. Empty by default: availability on the host is not permission to use it. |
 | `vcpus`, `memory_mib`, `writable_storage_mib`, `max_processes` | The containment ceilings. Only `2 / 6144 / 4096 / 256` is accepted. |
 
+## Host capacity
+
+At startup the daemon asks the container runtime how many CPUs and how much
+memory it has (on macOS that is the Docker VM, not the Mac), keeps 1024 MiB back
+for the engine and the egress relays, and admits a Worker only while the sum of
+every running Worker's profile fits, across all Commissions. Each running
+container is pinned to CPUs no other running Worker holds.
+
+`tyrion commission inspect` shows the result as `host_capacity`: the figures,
+where they came from, the derived Worker ceiling at the pinned profile, and
+what is in use. Work that fits its Commission but not the machine appears in
+`frontier_holds` as `host_capacity_unavailable`, with the numbers, and
+dispatches when running Workers finish. A profile the machine could never run
+blocks its Assignment with the exact requirement instead of waiting forever.
+
+`tyriond --host-cpus N --host-memory-mib M` declares capacity instead. It is
+the only way to admit more than the runtime reports; declaring more CPUs than
+exist makes Workers share them, and declaring more memory risks OOM kills.
+
+## Smaller Workers
+
+A Worker Configuration in the catalog may declare a smaller profile, since a
+planning Worker needs far less than a build Worker:
+
+```json
+"containment_resources": {
+  "vcpus": 1, "memory_mib": 2048, "writable_storage_mib": 1024, "max_processes": 128
+}
+```
+
+It may only shrink the pinned profile, needs at least 1024 MiB memory, 256 MiB
+storage and 64 processes, and must leave 512 MiB of memory above its storage.
+The containment preflight proves the declared ceilings from inside the
+container, exactly as it proves the pinned ones.
+
 `memory_mib` bounds process memory and the writable `/sandbox` tmpfs together,
 because tmpfs pages are charged to the container memory cgroup.
 `writable_storage_mib` is the separate hard sub-ceiling on files.

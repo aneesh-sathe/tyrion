@@ -4,11 +4,12 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -105,6 +106,70 @@ struct EgressDestination {
     port: u16,
 }
 
+/// The ceilings one Worker container runs under. The runtime pins the largest
+/// profile any Worker may have; a Worker Configuration may declare a smaller
+/// one, because a planning Worker needs far less than a build Worker.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceProfile {
+    pub vcpus: u32,
+    /// Bounds process memory and the writable tmpfs together, because tmpfs
+    /// pages are charged to the container memory cgroup.
+    pub memory_mib: u64,
+    pub writable_storage_mib: u64,
+    pub max_processes: u32,
+}
+
+impl ResourceProfile {
+    /// A declared profile may only shrink the pinned one. Memory must leave
+    /// room above the writable tmpfs, or file writes alone cause OOM kills.
+    pub(crate) fn validate_within(&self, ceiling: &Self) -> Result<(), TyrionError> {
+        let fits = (1..=ceiling.vcpus).contains(&self.vcpus)
+            && (1024..=ceiling.memory_mib).contains(&self.memory_mib)
+            && (256..=ceiling.writable_storage_mib).contains(&self.writable_storage_mib)
+            && self.writable_storage_mib.saturating_add(512) <= self.memory_mib
+            && (64..=ceiling.max_processes).contains(&self.max_processes);
+        if fits {
+            Ok(())
+        } else {
+            Err(TyrionError::InvalidRequest(format!(
+                "a Worker resource profile must stay within the pinned {} vCPUs, {} MiB memory, {} MiB writable storage, and {} processes, with at least 1024 MiB memory, 256 MiB storage, 64 processes, and 512 MiB of memory above storage",
+                ceiling.vcpus, ceiling.memory_mib, ceiling.writable_storage_mib, ceiling.max_processes
+            )))
+        }
+    }
+}
+
+/// What the container runtime can run at once. Every running Worker holds
+/// its whole profile against this, across all Commissions.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct HostCapacity {
+    pub cpus: u64,
+    pub memory_mib: u64,
+    /// Kept back for the container engine itself and the egress relays.
+    pub reserve_mib: u64,
+    pub source: HostCapacitySource,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostCapacitySource {
+    ContainerRuntime,
+    Principal,
+}
+
+/// Memory kept back from admission for the engine and relays.
+pub(crate) const HOST_MEMORY_RESERVE_MIB: u64 = 1024;
+
+/// Capacity the Principal declares instead of, or on top of, what the
+/// container runtime reports. It is the explicit override to exceed the
+/// derived ceiling; nothing else can raise it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HostCapacityOverride {
+    pub cpus: Option<u64>,
+    pub memory_mib: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PinnedBinary {
@@ -134,6 +199,11 @@ pub(super) struct ContainedCodexRuntime {
     config: RuntimeConfig,
     data_dir: PathBuf,
     fingerprint: String,
+    host: HostCapacity,
+    /// Containers currently pinned to each host CPU. Admission keeps the sum of
+    /// running profiles within the host, so each container can be given its
+    /// own CPUs; only an explicit Principal override makes them share.
+    cpu_load: Mutex<Vec<u32>>,
 }
 
 pub(super) struct GitCandidate {
@@ -290,7 +360,11 @@ pub(super) struct GitIntegratedState {
 }
 
 impl ContainedCodexRuntime {
-    pub(super) fn load(config_path: &Path, data_dir: &Path) -> Result<Self, TyrionError> {
+    pub(super) fn load(
+        config_path: &Path,
+        data_dir: &Path,
+        host_override: HostCapacityOverride,
+    ) -> Result<Self, TyrionError> {
         let encoded = fs::read(config_path)?;
         let config: RuntimeConfig = serde_json::from_slice(&encoded)?;
         validate_config(&config)?;
@@ -298,12 +372,73 @@ impl ContainedCodexRuntime {
         create_private_dir(&docker_config)?;
         fs::write(docker_config.join("config.json"), b"{}")?;
         validate_worker_image(&config, data_dir)?;
+        let host = probe_host_capacity(&config, data_dir, host_override)?;
         let fingerprint = format!("{:x}", Sha256::digest(&encoded));
         Ok(Self {
+            cpu_load: Mutex::new(vec![
+                0;
+                usize::try_from(host.cpus)
+                    .unwrap_or(usize::MAX)
+                    .min(4096)
+            ]),
             config,
             data_dir: data_dir.to_owned(),
             fingerprint,
+            host,
         })
+    }
+
+    pub(super) fn host_capacity(&self) -> HostCapacity {
+        self.host
+    }
+
+    /// The largest profile any Worker may run under.
+    pub(super) fn resource_profile(&self) -> ResourceProfile {
+        ResourceProfile {
+            vcpus: self.config.vcpus,
+            memory_mib: self.config.memory_mib,
+            writable_storage_mib: self.config.writable_storage_mib,
+            max_processes: self.config.max_processes,
+        }
+    }
+
+    /// The profile the routed Worker Configuration declared, which routing
+    /// already resolved and validated against the pinned one.
+    fn assignment_profile(&self, assignment: &AssignmentContext) -> ResourceProfile {
+        assignment
+            .selected_configuration
+            .get("containment_resources")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_else(|| self.resource_profile())
+    }
+
+    /// Pin a container to the least loaded CPUs. Under admission they are
+    /// always free; under an explicit override they are shared evenly.
+    fn allocate_cpus(&self, count: u32) -> Vec<usize> {
+        let Ok(mut load) = self.cpu_load.lock() else {
+            return (0..count as usize).collect();
+        };
+        if load.is_empty() {
+            return (0..count as usize).collect();
+        }
+        let mut order: Vec<usize> = (0..load.len()).collect();
+        order.sort_by_key(|&cpu| (load[cpu], cpu));
+        let mut chosen: Vec<usize> = order.into_iter().take(count as usize).collect();
+        chosen.sort_unstable();
+        for &cpu in &chosen {
+            load[cpu] += 1;
+        }
+        chosen
+    }
+
+    fn release_cpus(&self, cpus: &[usize]) {
+        if let Ok(mut load) = self.cpu_load.lock() {
+            for &cpu in cpus {
+                if let Some(count) = load.get_mut(cpu) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
     }
 
     pub(super) fn routing_descriptor(&self) -> super::routing::ContainedCodexDescriptor {
@@ -365,6 +500,7 @@ impl ContainedCodexRuntime {
             supports_pi: self.config.pi.is_some(),
             pi_model_provider: self.config.pi.as_ref().map(|pi| pi.model_provider.clone()),
             pi_model: self.config.pi.as_ref().map(|pi| pi.model.clone()),
+            resources: self.resource_profile(),
         }
     }
 
@@ -392,6 +528,9 @@ impl ContainedCodexRuntime {
             &sandbox_name,
             &assignment.attempt_id,
             NetworkPolicy::Brokered,
+            configuration
+                .containment_resources
+                .unwrap_or_else(|| self.resource_profile()),
             assignment.lease_expires_at,
         )?;
         let host_scope = match &assignment.execution {
@@ -707,6 +846,7 @@ impl ContainedCodexRuntime {
             &sandbox_name,
             &assignment.attempt_id,
             NetworkPolicy::Brokered,
+            self.assignment_profile(assignment),
             assignment.lease_expires_at,
         )?;
         sandbox.preflight(&repository, &self.data_dir, assignment.lease_expires_at)?;
@@ -1088,6 +1228,7 @@ impl ContainedCodexRuntime {
                 &sandbox_name,
                 &assignment.attempt_id,
                 NetworkPolicy::Denied,
+                self.assignment_profile(assignment),
                 assignment.lease_expires_at,
             )?;
             sandbox.preflight(
@@ -1143,6 +1284,8 @@ struct Sandbox<'a> {
     runtime: &'a ContainedCodexRuntime,
     name: String,
     network: Option<AttemptNetwork<'a>>,
+    resources: ResourceProfile,
+    cpus: Vec<usize>,
     deleted: bool,
 }
 
@@ -1160,6 +1303,7 @@ impl<'a> Sandbox<'a> {
         name: &str,
         attempt_id: &str,
         policy: NetworkPolicy,
+        resources: ResourceProfile,
         deadline: i64,
     ) -> Result<Self, TyrionError> {
         let network = match (policy, runtime.config.egress.as_ref()) {
@@ -1172,6 +1316,8 @@ impl<'a> Sandbox<'a> {
             runtime,
             name: name.to_owned(),
             network,
+            resources,
+            cpus: runtime.allocate_cpus(resources.vcpus),
             deleted: false,
         };
         if let Err(error) = sandbox.start(attempt_id, deadline) {
@@ -1182,11 +1328,18 @@ impl<'a> Sandbox<'a> {
     }
 
     fn start(&mut self, attempt_id: &str, deadline: i64) -> Result<(), TyrionError> {
-        let config = &self.runtime.config;
+        let config = &self.resources;
         let label = format!("{ATTEMPT_LABEL}={attempt_id}");
         let memory = format!("{}m", config.memory_mib);
         let cpus = config.vcpus.to_string();
-        let cpuset = format!("0-{}", config.vcpus.saturating_sub(1));
+        // Each running container gets its own CPUs, so concurrent Workers do
+        // not all contend for the first two.
+        let cpuset = self
+            .cpus
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let pids = config.max_processes.to_string();
         // Docker defaults a tmpfs to noexec, but /sandbox is the only writable
         // mount and holds every artifact Tyrion streams in, including the
@@ -1267,17 +1420,18 @@ impl<'a> Sandbox<'a> {
         for alias in &aliases {
             arguments.extend(["--add-host", alias]);
         }
-        arguments.extend([config.worker_image.as_str(), "sleep", &lifetime]);
+        let image = &self.runtime.config;
+        arguments.extend([image.worker_image.as_str(), "sleep", &lifetime]);
         self.runtime.docker_checked(&arguments, deadline)?;
         // The image that actually launched, not the one that was requested.
         let launched = self
             .runtime
             .docker_checked(&["inspect", "--format", "{{.Image}}", &self.name], deadline)?;
         let launched = String::from_utf8_lossy(&launched.stdout).trim().to_owned();
-        if launched != config.worker_image_id {
+        if launched != image.worker_image_id {
             return Err(TyrionError::SecurityInvariantViolation(format!(
                 "sandbox launched image {launched}, not the pinned Worker image {}",
-                config.worker_image_id
+                image.worker_image_id
             )));
         }
         Ok(())
@@ -1406,7 +1560,7 @@ impl<'a> Sandbox<'a> {
         data_dir: &Path,
         deadline: i64,
     ) -> Result<(), TyrionError> {
-        let config = &self.runtime.config;
+        let config = &self.resources;
         let host_repository = shell_quote(path_text(repository)?);
         let host_repository_parent = repository.parent().ok_or_else(|| {
             TyrionError::InvalidRequest("repository must have a parent directory".into())
@@ -1544,6 +1698,7 @@ impl<'a> Sandbox<'a> {
 
     fn delete(mut self) -> Result<(), TyrionError> {
         self.runtime.delete_container(&self.name)?;
+        self.runtime.release_cpus(&std::mem::take(&mut self.cpus));
         if let Some(network) = self.network.take() {
             network.delete()?;
         }
@@ -1557,6 +1712,7 @@ impl<'a> Sandbox<'a> {
             return;
         }
         let _ = self.runtime.delete_container(&self.name);
+        self.runtime.release_cpus(&std::mem::take(&mut self.cpus));
         if let Some(network) = self.network.take() {
             let _ = network.delete();
         }
@@ -1948,6 +2104,58 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
 
 /// The Worker image must be present locally and must be exactly the pinned
 /// one. Tyrion never pulls, so provisioning stays an explicit operator step.
+/// Read what the container runtime can actually run. On macOS that is the
+/// Docker VM, not the Mac. A Principal override replaces either figure and
+/// is the only way to admit more than the runtime reports.
+fn probe_host_capacity(
+    config: &RuntimeConfig,
+    data_dir: &Path,
+    host_override: HostCapacityOverride,
+) -> Result<HostCapacity, TyrionError> {
+    let (cpus, memory_mib) = match (host_override.cpus, host_override.memory_mib) {
+        (Some(cpus), Some(memory_mib)) => (cpus, memory_mib),
+        (declared_cpus, declared_memory) => {
+            let output = Command::new(&config.docker_binary)
+                .args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"])
+                .env_clear()
+                .env("PATH", DOCKER_PATH)
+                .env("DOCKER_HOST", &config.docker_host)
+                .env("DOCKER_CONFIG", data_dir.join("docker"))
+                .output()?;
+            let output = require_success("Docker host capacity probe", output)?;
+            let reported = String::from_utf8_lossy(&output.stdout);
+            let mut fields = reported.split_whitespace().map(str::parse::<u64>);
+            let (Some(Ok(reported_cpus)), Some(Ok(reported_bytes))) =
+                (fields.next(), fields.next())
+            else {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "Docker reported unreadable host capacity: {}",
+                    reported.trim()
+                )));
+            };
+            (
+                declared_cpus.unwrap_or(reported_cpus),
+                declared_memory.unwrap_or(reported_bytes / (1024 * 1024)),
+            )
+        }
+    };
+    if cpus == 0 || memory_mib == 0 {
+        return Err(TyrionError::InvalidRequest(
+            "host capacity must have at least one CPU and some memory".into(),
+        ));
+    }
+    Ok(HostCapacity {
+        cpus,
+        memory_mib,
+        reserve_mib: HOST_MEMORY_RESERVE_MIB,
+        source: if host_override.cpus.is_some() || host_override.memory_mib.is_some() {
+            HostCapacitySource::Principal
+        } else {
+            HostCapacitySource::ContainerRuntime
+        },
+    })
+}
+
 fn validate_worker_image(config: &RuntimeConfig, data_dir: &Path) -> Result<(), TyrionError> {
     let resolved = Command::new(&config.docker_binary)
         .args([

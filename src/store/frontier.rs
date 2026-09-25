@@ -7,6 +7,10 @@
 pub(super) struct Resources {
     pub concurrency: u64,
     pub storage: u64,
+    /// Host dimensions. Unlike the two above, these are summed across every
+    /// Commission, because all Workers share one container runtime.
+    pub vcpus: u64,
+    pub memory_mib: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -32,6 +36,7 @@ pub(super) struct OccupiedWork {
 pub(super) enum HoldReason {
     DeclaredWriteOverlap,
     CompleteResourceBudgetUnavailable,
+    HostCapacityUnavailable,
 }
 
 impl HoldReason {
@@ -39,6 +44,7 @@ impl HoldReason {
         match self {
             Self::DeclaredWriteOverlap => "declared_write_overlap",
             Self::CompleteResourceBudgetUnavailable => "complete_resource_budget_unavailable",
+            Self::HostCapacityUnavailable => "host_capacity_unavailable",
         }
     }
 }
@@ -72,6 +78,10 @@ pub(super) fn select<T>(
             ));
             continue;
         }
+        if !host_fits(used, candidate.resources, ceilings) {
+            held.push((candidate.item, HoldReason::HostCapacityUnavailable));
+            continue;
+        }
         reserve(&mut used, candidate.resources);
         occupied.push(OccupiedWork {
             write_scopes: candidate.write_scopes,
@@ -92,6 +102,16 @@ pub(super) fn resources_fit(used: Resources, requested: Resources, ceilings: Res
             .is_some_and(|total| total <= ceilings.storage)
 }
 
+pub(super) fn host_fits(used: Resources, requested: Resources, ceilings: Resources) -> bool {
+    used.vcpus
+        .checked_add(requested.vcpus)
+        .is_some_and(|total| total <= ceilings.vcpus)
+        && used
+            .memory_mib
+            .checked_add(requested.memory_mib)
+            .is_some_and(|total| total <= ceilings.memory_mib)
+}
+
 pub(super) fn scopes_overlap(left: &[String], right: &[String]) -> bool {
     left.iter().any(|left_scope| {
         right.iter().any(|right_scope| {
@@ -108,6 +128,8 @@ fn competitions_match(left: Option<&Competition>, right: Option<&Competition>) -
 fn reserve(used: &mut Resources, requested: Resources) {
     used.concurrency += requested.concurrency;
     used.storage += requested.storage;
+    used.vcpus += requested.vcpus;
+    used.memory_mib += requested.memory_mib;
 }
 
 fn path_is_within_scope(path: &str, scope: &str) -> bool {
@@ -129,10 +151,12 @@ mod tests {
         let used = Resources {
             concurrency: 1,
             storage: 5,
+            ..Resources::default()
         };
         let ceilings = Resources {
             concurrency: 2,
             storage: 10,
+            ..Resources::default()
         };
         // Exactly at both ceilings still fits.
         assert!(resources_fit(
@@ -140,6 +164,7 @@ mod tests {
             Resources {
                 concurrency: 1,
                 storage: 5,
+                ..Resources::default()
             },
             ceilings,
         ));
@@ -149,6 +174,7 @@ mod tests {
             Resources {
                 concurrency: 2,
                 storage: 5,
+                ..Resources::default()
             },
             ceilings,
         ));
@@ -157,6 +183,7 @@ mod tests {
             Resources {
                 concurrency: 1,
                 storage: 6,
+                ..Resources::default()
             },
             ceilings,
         ));
@@ -173,6 +200,7 @@ mod tests {
                     resources: Resources {
                         concurrency: 1,
                         storage: 5,
+                        ..Resources::default()
                     },
                 },
                 Work {
@@ -188,6 +216,7 @@ mod tests {
                     resources: Resources {
                         concurrency: 2,
                         storage: 0,
+                        ..Resources::default()
                     },
                 },
             ],
@@ -196,6 +225,7 @@ mod tests {
             Resources {
                 concurrency: 2,
                 storage: 10,
+                ..Resources::default()
             },
         );
         assert_eq!(frontier.selected, vec!["first"]);
@@ -205,6 +235,40 @@ mod tests {
                 ("overlap", HoldReason::DeclaredWriteOverlap),
                 ("budget", HoldReason::CompleteResourceBudgetUnavailable),
             ]
+        );
+    }
+
+    #[test]
+    fn host_capacity_holds_work_that_fits_its_commission() {
+        let commission = Resources {
+            concurrency: 4,
+            storage: 100,
+            vcpus: 4,
+            memory_mib: 7168,
+        };
+        let worker = |item: &'static str| Work {
+            item,
+            write_scopes: vec![item.into()],
+            competition: None,
+            resources: Resources {
+                concurrency: 1,
+                storage: 10,
+                vcpus: 2,
+                memory_mib: 3072,
+            },
+        };
+        let frontier = select(
+            vec![worker("a"), worker("b"), worker("c")],
+            Vec::new(),
+            Resources::default(),
+            commission,
+        );
+        // Two 2-vCPU, 3 GiB Workers fill a 4-CPU, 7 GiB host; the third fits
+        // the Commission's own ceilings but not the machine.
+        assert_eq!(frontier.selected, vec!["a", "b"]);
+        assert_eq!(
+            frontier.held,
+            vec![("c", HoldReason::HostCapacityUnavailable)]
         );
     }
 }

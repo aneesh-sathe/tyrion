@@ -24,7 +24,7 @@ ceiling from outside the container:
 | Memory and files | `--memory 6144m --memory-swap 6144m` | One hard ceiling over process memory and the writable tmpfs together. |
 | Writable storage | `--mount type=tmpfs,destination=/sandbox,tmpfs-size=4GiB` | The only writable mount. |
 | Root filesystem | `--read-only` | Nothing outside `/sandbox` can be modified. |
-| CPU | `--cpus 2 --cpuset-cpus 0-1` | A two-core quota that the guest also observes. |
+| CPU | `--cpus 2 --cpuset-cpus <its own CPUs>` | A two-core quota that the guest also observes. Each running container is pinned to CPUs no other running Worker holds. |
 | Privilege | `--cap-drop ALL --security-opt no-new-privileges --user 65534:65534` | No capabilities, no privilege escalation, not root. |
 | Syscalls | `--security-opt seccomp=builtin` | Required: Docker Desktop leaves seccomp **unconfined** by default. |
 | Network | `--network none`, or a per-Attempt `--internal` bridge | No route off the bridge except through a brokered relay. |

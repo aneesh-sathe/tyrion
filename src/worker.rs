@@ -19,7 +19,10 @@ mod contained_codex;
 mod routing;
 mod structured_process;
 
-pub(crate) use contained_codex::CODEX_VERSION;
+pub(crate) use contained_codex::{
+    HostCapacity, HostCapacityOverride, HostCapacitySource, ResourceProfile, CODEX_VERSION,
+    HOST_MEMORY_RESERVE_MIB,
+};
 
 pub const DETERMINISTIC_ACTION: &str = "deterministic.echo";
 pub const CODEX_GIT_ACTION: &str = "codex.git_change";
@@ -46,6 +49,7 @@ pub(crate) struct WorkerRuntimeOptions {
     pub(crate) hold_before_integration: bool,
     pub(crate) hold_after_integration: bool,
     pub(crate) hold_after_external_integration: bool,
+    pub(crate) host_capacity: HostCapacityOverride,
 }
 
 pub(crate) struct AttemptControlScope<'a> {
@@ -521,7 +525,9 @@ impl WorkerRuntime {
         options: WorkerRuntimeOptions,
     ) -> Result<Self, TyrionError> {
         let contained_codex = codex_worker_config
-            .map(|path| contained_codex::ContainedCodexRuntime::load(path, data_dir))
+            .map(|path| {
+                contained_codex::ContainedCodexRuntime::load(path, data_dir, options.host_capacity)
+            })
             .transpose()?;
         let mut catalog = routing::WorkerCatalog::load(
             worker_catalog,
@@ -549,6 +555,15 @@ impl WorkerRuntime {
             hold_after_integration: options.hold_after_integration,
             hold_after_external_integration: options.hold_after_external_integration,
         })
+    }
+
+    /// The host a contained runtime runs Workers on, and the largest profile a
+    /// Worker may hold against it. None when no contained runtime is
+    /// configured, in which case no Worker touches the container runtime.
+    pub(crate) fn host_capacity(&self) -> Option<(HostCapacity, ResourceProfile)> {
+        self.contained_codex
+            .as_ref()
+            .map(|runtime| (runtime.host_capacity(), runtime.resource_profile()))
     }
 
     pub(crate) fn begin_attempt(
