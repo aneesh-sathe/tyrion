@@ -1065,9 +1065,11 @@ mod tests {
     fn pinned_profile() -> super::super::contained_codex::ResourceProfile {
         super::super::contained_codex::ResourceProfile {
             vcpus: 2,
-            memory_mib: 6144,
-            writable_storage_mib: 4096,
+            memory_mib: 3072,
+            writable_storage_mib: 2048,
             max_processes: 256,
+            memory_request_mib: 640,
+            cpu_request_millis: 250,
         }
     }
 
@@ -1117,6 +1119,8 @@ mod tests {
             memory_mib: 2048,
             writable_storage_mib: 1024,
             max_processes: 128,
+            memory_request_mib: 384,
+            cpu_request_millis: 100,
         };
         let (mut declared, descriptor) = structured_catalog(Some(smaller));
         declared.bind_structured_containment(&descriptor).unwrap();
@@ -1137,7 +1141,15 @@ mod tests {
             // Storage without memory headroom above it would OOM on file writes.
             super::super::contained_codex::ResourceProfile {
                 memory_mib: 2048,
-                writable_storage_mib: 2048,
+                ..pinned_profile()
+            },
+            // A request can never exceed its own ceiling.
+            super::super::contained_codex::ResourceProfile {
+                memory_request_mib: 4096,
+                ..pinned_profile()
+            },
+            super::super::contained_codex::ResourceProfile {
+                cpu_request_millis: 2500,
                 ..pinned_profile()
             },
         ] {

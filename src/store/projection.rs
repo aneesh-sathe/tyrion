@@ -1104,7 +1104,7 @@ pub(super) fn inspect_commission(
         })
         .map(|assignment| {
             let resources = &assignment["resources"];
-            let (vcpus, memory_mib) =
+            let (cpu_millis, memory_mib) =
                 super::host_demand(&assignment["route"]["selected_configuration"]);
             Work {
                 item: assignment,
@@ -1113,7 +1113,7 @@ pub(super) fn inspect_commission(
                 resources: Resources {
                     concurrency: resources["concurrency_slots"].as_u64().unwrap_or(u64::MAX),
                     storage: resources["max_storage_bytes"].as_u64().unwrap_or(u64::MAX),
-                    vcpus,
+                    cpu_millis,
                     memory_mib,
                 },
             }
@@ -1159,9 +1159,9 @@ pub(super) fn inspect_commission(
                 "reason": reason.as_str(),
             });
             if reason == super::frontier::HoldReason::HostCapacityUnavailable {
-                let (vcpus, memory_mib) =
+                let (cpu_millis, memory_mib) =
                     super::host_demand(&assignment["route"]["selected_configuration"]);
-                hold["detail"] = json!(host.hold_detail(vcpus, memory_mib));
+                hold["detail"] = json!(host.hold_detail(cpu_millis, memory_mib));
             }
             hold
         })

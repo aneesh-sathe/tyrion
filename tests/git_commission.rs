@@ -269,13 +269,13 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     for hardening in [
         "--read-only",
         "--pids-limit 256",
-        "--memory 6144m --memory-swap 6144m",
+        "--memory 3072m --memory-swap 3072m",
         "--cpus 2 --cpuset-cpus 0,1",
         "--cap-drop ALL",
         "--security-opt no-new-privileges",
         "--security-opt seccomp=builtin",
         "--user 65534:65534",
-        "/sandbox:rw,exec,nosuid,nodev,size=4096m,mode=1777",
+        "/sandbox:rw,exec,nosuid,nodev,size=2048m,mode=1777",
         "--network none",
     ] {
         assert!(
@@ -742,10 +742,13 @@ fn concurrent_workers_are_pinned_to_disjoint_cpus_and_capacity_is_inspectable() 
     assert_eq!(host["source"], "container_runtime");
     assert_eq!(host["cpus"], 16);
     assert_eq!(host["usable_memory_mib"], 32768 - 1024);
-    assert_eq!(host["default_worker_profile"]["vcpus"], 2);
-    // min(16 / 2 CPUs, 31744 / 6144 MiB) = 5 Workers at the pinned profile.
-    assert_eq!(host["derived_worker_ceiling"], 5);
-    assert_eq!(host["in_use"]["vcpus"], 0, "finished Workers hold nothing");
+    assert_eq!(host["default_worker_request"]["memory_mib"], 640);
+    // min(16000 / 250 millicores, 31744 / 640 MiB) Workers at the pinned request.
+    assert_eq!(host["derived_worker_ceiling"], 49);
+    assert_eq!(
+        host["reserved"]["memory_mib"], 0,
+        "finished Workers hold nothing"
+    );
 
     // The two Workers overlapped, so the second was given its own CPUs
     // rather than contending for the first two.
@@ -767,8 +770,9 @@ fn host_capacity_holds_workers_the_machine_cannot_run_together() {
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
     // The Commission allows two concurrent Workers, but the declared host has
-    // room for exactly one 2-vCPU Worker.
-    let (daemon, _fake_state) = fixture_daemon(&temp, &["--host-cpus", "3"]);
+    // room for exactly one: 2000 MiB less the 1024 MiB reserve holds one
+    // 640 MiB request, not two.
+    let (daemon, _fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "2000"]);
     let attachment_token = connect_full_entry(&daemon);
     let proposal_path = temp.path().join("parallel-proposal.json");
     write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
@@ -804,10 +808,11 @@ fn host_capacity_holds_workers_the_machine_cannot_run_together() {
     let (inspected, hold) = held;
     assert_eq!(inspected["host_capacity"]["source"], "principal");
     assert_eq!(inspected["host_capacity"]["derived_worker_ceiling"], 1);
-    assert_eq!(inspected["host_capacity"]["in_use"]["vcpus"], 2);
+    assert_eq!(inspected["host_capacity"]["reserved"]["memory_mib"], 640);
     let detail = hold["detail"].as_str().unwrap();
     assert!(
-        detail.contains("Needs 2 vCPUs") && detail.contains("3 CPUs"),
+        detail.contains("Expected to use 0.25 CPUs and 640 MiB")
+            && detail.contains("976 MiB for Workers"),
         "{detail}"
     );
 
@@ -826,8 +831,8 @@ fn a_worker_profile_the_host_can_never_run_blocks_with_the_exact_requirement() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    // 4096 MiB less the 1024 MiB reserve cannot hold one 6144 MiB Worker.
-    let (daemon, fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "4096"]);
+    // 1500 MiB less the 1024 MiB reserve cannot hold one 640 MiB request.
+    let (daemon, fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "1500"]);
     let attachment_token = connect_full_entry(&daemon);
     let proposal_path = temp.path().join("proposal.json");
     write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
@@ -851,13 +856,10 @@ fn a_worker_profile_the_host_can_never_run_blocks_with_the_exact_requirement() {
     };
     let requirement = blocker["requirement"].as_str().unwrap();
     assert!(
-        requirement.contains("needs 2 vCPUs and 6144 MiB"),
+        requirement.contains("expected to use 0.25 CPUs and 640 MiB"),
         "{requirement}"
     );
-    assert!(
-        requirement.contains("3072 MiB for Workers"),
-        "{requirement}"
-    );
+    assert!(requirement.contains("476 MiB for Workers"), "{requirement}");
     assert!(requirement.contains("--host-memory-mib"), "{requirement}");
     // Nothing was started only to be killed.
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap_or_default();
@@ -1581,6 +1583,29 @@ fn unauthorized_changed_path_is_rejected_before_verification() {
     assert!(!fixture.principal_checkout.join("outside.txt").exists());
 }
 
+#[test]
+fn test_run_byproducts_do_not_fail_a_correct_worker() {
+    // The repository has no .gitignore, and the Worker ran its tests. Before
+    // this, staging swept the interpreter's caches into the Result and the
+    // correct work was rejected as an unauthorized change.
+    let fixture = FailedFixture::new("runtime-byproducts");
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &fixture.proposal_path);
+
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    assert_eq!(completed["blockers"], json!([]));
+    let changed = completed["results"][0]["changed_paths"].to_string();
+    assert!(changed.contains("issue-4.txt"), "{changed}");
+    for byproduct in ["__pycache__", "node_modules", ".pytest_cache"] {
+        assert!(
+            !changed.contains(byproduct),
+            "{byproduct} leaked: {changed}"
+        );
+    }
+}
+
 /// A byte-level fingerprint of the Principal checkout: every path, its mode,
 /// and its content or symlink target. Used to prove a Commission leaves the
 /// Principal's own directory exactly as it found it.
@@ -2273,9 +2298,11 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path) -> PathBuf {
             "codex_sha256": sha256_file(codex),
             "model": "fixture-model",
             "lease_ttl_seconds": 30,
+            "memory_request_mib": 640,
+            "cpu_request_millis": 250,
             "vcpus": 2,
-            "memory_mib": 6144,
-            "writable_storage_mib": 4096,
+            "memory_mib": 3072,
+            "writable_storage_mib": 2048,
             "max_processes": 256
         }))
         .unwrap(),

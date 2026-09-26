@@ -9,7 +9,7 @@ pub(super) struct Resources {
     pub storage: u64,
     /// Host dimensions. Unlike the two above, these are summed across every
     /// Commission, because all Workers share one container runtime.
-    pub vcpus: u64,
+    pub cpu_millis: u64,
     pub memory_mib: u64,
 }
 
@@ -103,9 +103,9 @@ pub(super) fn resources_fit(used: Resources, requested: Resources, ceilings: Res
 }
 
 pub(super) fn host_fits(used: Resources, requested: Resources, ceilings: Resources) -> bool {
-    used.vcpus
-        .checked_add(requested.vcpus)
-        .is_some_and(|total| total <= ceilings.vcpus)
+    used.cpu_millis
+        .checked_add(requested.cpu_millis)
+        .is_some_and(|total| total <= ceilings.cpu_millis)
         && used
             .memory_mib
             .checked_add(requested.memory_mib)
@@ -128,7 +128,7 @@ fn competitions_match(left: Option<&Competition>, right: Option<&Competition>) -
 fn reserve(used: &mut Resources, requested: Resources) {
     used.concurrency += requested.concurrency;
     used.storage += requested.storage;
-    used.vcpus += requested.vcpus;
+    used.cpu_millis += requested.cpu_millis;
     used.memory_mib += requested.memory_mib;
 }
 
@@ -243,8 +243,8 @@ mod tests {
         let commission = Resources {
             concurrency: 4,
             storage: 100,
-            vcpus: 4,
-            memory_mib: 7168,
+            cpu_millis: 1000,
+            memory_mib: 1500,
         };
         let worker = |item: &'static str| Work {
             item,
@@ -253,8 +253,8 @@ mod tests {
             resources: Resources {
                 concurrency: 1,
                 storage: 10,
-                vcpus: 2,
-                memory_mib: 3072,
+                cpu_millis: 250,
+                memory_mib: 640,
             },
         };
         let frontier = select(
@@ -263,8 +263,8 @@ mod tests {
             Resources::default(),
             commission,
         );
-        // Two 2-vCPU, 3 GiB Workers fill a 4-CPU, 7 GiB host; the third fits
-        // the Commission's own ceilings but not the machine.
+        // Two Workers expected to use 640 MiB each fit a 1500 MiB host; the
+        // third fits the Commission's own ceilings but not the machine.
         assert_eq!(frontier.selected, vec!["a", "b"]);
         assert_eq!(
             frontier.held,

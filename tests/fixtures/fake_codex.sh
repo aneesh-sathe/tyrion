@@ -80,6 +80,14 @@ fi
 if [ -n "$fixture_delete" ]; then
     rm "$repo/$fixture_delete"
 fi
+if [ -e "$fake_state/runtime-byproducts" ]; then
+    # What running a test suite leaves behind in a repository with no
+    # .gitignore. None of it is Worker output.
+    mkdir -p "$repo/__pycache__" "$repo/node_modules/left-pad" "$repo/.pytest_cache"
+    printf 'bytecode' >"$repo/__pycache__/issue.cpython-311.pyc"
+    printf 'module.exports = 1' >"$repo/node_modules/left-pad/index.js"
+    printf '{}' >"$repo/.pytest_cache/state"
+fi
 if [ -e "$fake_state/unauthorized-change" ]; then
     printf '%s\n' 'outside authority' >"$repo/outside.txt"
 fi

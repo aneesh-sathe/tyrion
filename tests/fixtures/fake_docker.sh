@@ -47,7 +47,18 @@ case "$operation" in
                 --network) network=$2; shift 2 ;;
                 --add-host) aliases+=("$2"); shift 2 ;;
                 --detach) detach=1; shift ;;
-                --read-only|--cap-drop|--security-opt|--user|--tmpfs|--workdir|--env|--pids-limit|--memory|--memory-swap|--cpus|--cpuset-cpus)
+                --cpuset-cpus)
+                    # Real Docker refuses a CPU the engine does not have.
+                    for cpu in ${2//,/ }; do
+                        if ((cpu >= 16)); then
+                            printf 'docker: Error response from daemon: Requested CPUs are not available - requested %s, available: 0-15\n' "$2" >&2
+                            exit 125
+                        fi
+                    done
+                    seen+=("$1")
+                    shift 2
+                    ;;
+                --read-only|--cap-drop|--security-opt|--user|--tmpfs|--workdir|--env|--pids-limit|--memory|--memory-swap|--cpus)
                     seen+=("$1")
                     [[ $1 == --read-only ]] || shift
                     shift

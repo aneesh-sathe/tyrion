@@ -10,12 +10,19 @@
   "codex_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "model": "gpt-5-codex",
   "egress": {
-    "destinations": [{ "host": "api.openai.com", "port": 443 }]
+    "destinations": [
+      {
+        "host": "api.openai.com",
+        "port": 443
+      }
+    ]
   },
   "worker_credentials": [],
   "lease_ttl_seconds": 900,
+  "memory_request_mib": 640,
+  "cpu_request_millis": 250,
   "vcpus": 2,
-  "memory_mib": 6144,
-  "writable_storage_mib": 4096,
+  "memory_mib": 3072,
+  "writable_storage_mib": 2048,
   "max_processes": 256
 }

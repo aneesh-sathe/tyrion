@@ -46,42 +46,58 @@ launched anything else.
 | `docker_host` | Explicit daemon address. Tyrion never resolves an ambient Docker context. |
 | `egress` | Omit for no network at all. Otherwise exactly the destinations a Worker may reach, each behind its own destination-pinned relay on a per-Attempt internal bridge. |
 | `worker_credentials` | Names of environment variables `tyriond` was started with that may be forwarded into a Worker execution. Empty by default: availability on the host is not permission to use it. |
-| `vcpus`, `memory_mib`, `writable_storage_mib`, `max_processes` | The containment ceilings. Only `2 / 6144 / 4096 / 256` is accepted. |
+| `vcpus`, `memory_mib`, `writable_storage_mib`, `max_processes` | The containment ceilings. Only `2 / 3072 / 2048 / 256` is accepted. |
+| `memory_request_mib`, `cpu_request_millis` | What a Worker is expected to use, which admission reserves. Only `640 / 250` is accepted. |
 
 ## Host capacity
+
+Every Worker has two sets of numbers. Its **ceilings** (2 vCPUs, 3072 MiB,
+2048 MiB of files, 256 processes) are enforced by the container runtime and
+contain a runaway. Its **requests** (0.25 CPU, 640 MiB) are what it is expected
+to use, and are what admission reserves. They come from measurement: ten real
+Codex Workers running at once each peaked near 570 MiB and 0.14 cores. See
+[`docs/worker-capacity.md`](../../docs/worker-capacity.md).
 
 At startup the daemon asks the container runtime how many CPUs and how much
 memory it has (on macOS that is the Docker VM, not the Mac), keeps 1024 MiB back
 for the engine and the egress relays, and admits a Worker only while the sum of
-every running Worker's profile fits, across all Commissions. Each running
-container is pinned to CPUs no other running Worker holds.
+every running Worker's requests fits, across all Commissions. A 12-CPU Docker VM
+with 7.7 GiB admits 10; one with 16 GiB admits 24. Each running container is
+pinned to the least loaded CPUs the runtime really has.
+
+If several Workers exceed their requests at once and the container runtime
+runs out of memory, it kills a container, not the host. Tyrion sees a failed
+Attempt and recovers it like any other.
 
 `tyrion commission inspect` shows the result as `host_capacity`: the figures,
-where they came from, the derived Worker ceiling at the pinned profile, and
-what is in use. Work that fits its Commission but not the machine appears in
+where they came from, the derived Worker ceiling at the pinned request, and
+what is reserved. Work that fits its Commission but not the machine appears in
 `frontier_holds` as `host_capacity_unavailable`, with the numbers, and
-dispatches when running Workers finish. A profile the machine could never run
+dispatches when running Workers finish. A request the machine could never meet
 blocks its Assignment with the exact requirement instead of waiting forever.
 
 `tyriond --host-cpus N --host-memory-mib M` declares capacity instead. It is
-the only way to admit more than the runtime reports; declaring more CPUs than
-exist makes Workers share them, and declaring more memory risks OOM kills.
+the only way to admit more than the runtime reports. Declaring more CPUs than
+exist makes Workers share the real ones; declaring more memory risks OOM kills.
 
-## Smaller Workers
+## Smaller or heavier Workers
 
-A Worker Configuration in the catalog may declare a smaller profile, since a
-planning Worker needs far less than a build Worker:
+A Worker Configuration in the catalog may declare its own profile. A planning
+Worker needs far less than a build Worker, and a harness that has not been
+measured should reserve more:
 
 ```json
 "containment_resources": {
-  "vcpus": 1, "memory_mib": 2048, "writable_storage_mib": 1024, "max_processes": 128
+  "vcpus": 1, "memory_mib": 2048, "writable_storage_mib": 1024, "max_processes": 128,
+  "memory_request_mib": 384, "cpu_request_millis": 100
 }
 ```
 
-It may only shrink the pinned profile, needs at least 1024 MiB memory, 256 MiB
-storage and 64 processes, and must leave 512 MiB of memory above its storage.
-The containment preflight proves the declared ceilings from inside the
-container, exactly as it proves the pinned ones.
+Its ceilings may only shrink the pinned ones: at least 1024 MiB memory, 256 MiB
+storage and 64 processes, with 512 MiB of memory above storage. Its requests
+may be anything from 256 MiB and 50 millicores up to its own ceilings. The
+containment preflight proves the declared ceilings from inside the container,
+exactly as it proves the pinned ones.
 
 `memory_mib` bounds process memory and the writable `/sandbox` tmpfs together,
 because tmpfs pages are charged to the container memory cgroup.

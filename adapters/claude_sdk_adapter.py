@@ -10,7 +10,11 @@ import sys
 import tempfile
 import threading
 
-from native_skill import RequiredSkillFailure, skill_content_digest
+from native_skill import (
+    RequiredSkillFailure,
+    exclude_runtime_byproducts,
+    skill_content_digest,
+)
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -42,6 +46,7 @@ def prepare_workspace():
     )
     repository = os.path.join(root, "repository")
     git("clone", "-q", "-b", "tyrion-base", base, repository)
+    exclude_runtime_byproducts(repository)
     return repository, root
 
 

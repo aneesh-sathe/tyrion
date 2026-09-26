@@ -120,7 +120,7 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     let mut configurations = Vec::new();
     if !claude_credentials.is_empty() {
         destinations.push(json!({"host": "api.anthropic.com", "port": 443}));
-        configurations.push(configuration(
+        let mut claude = configuration(
             "claude-default",
             "claude",
             "claude_agent_sdk",
@@ -128,7 +128,18 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
             &options.claude_model,
             json!({}),
             2,
-        )?);
+        )?;
+        // Claude Workers have not been measured yet, so admission reserves
+        // more for them than for the measured Codex Workers.
+        claude["containment_resources"] = json!({
+            "vcpus": WORKER_VCPUS,
+            "memory_mib": WORKER_MEMORY_MIB,
+            "writable_storage_mib": WORKER_STORAGE_MIB,
+            "max_processes": 256,
+            "memory_request_mib": 1024,
+            "cpu_request_millis": WORKER_CPU_REQUEST_MILLIS,
+        });
+        configurations.push(claude);
     }
     if codex_auth.is_some() {
         destinations.push(json!({"host": "chatgpt.com", "port": 443}));
@@ -169,9 +180,11 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         "egress": {"destinations": destinations},
         "worker_credentials": claude_credentials,
         "lease_ttl_seconds": 900,
+        "memory_request_mib": WORKER_MEMORY_REQUEST_MIB,
+        "cpu_request_millis": WORKER_CPU_REQUEST_MILLIS,
         "vcpus": WORKER_VCPUS,
         "memory_mib": WORKER_MEMORY_MIB,
-        "writable_storage_mib": 4096,
+        "writable_storage_mib": WORKER_STORAGE_MIB,
         "max_processes": 256,
     });
     if let Some(auth) = &codex_auth {
@@ -203,12 +216,12 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     println!();
     let ceiling = worker_ceiling(docker.cpus, docker.memory_mib);
     println!(
-        "  capacity        {ceiling} Worker{} at once at {WORKER_VCPUS} vCPUs and {} GiB each{}",
+        "  capacity        {ceiling} Codex Worker{} at once ({WORKER_MEMORY_REQUEST_MIB} MiB expected each, {} GiB ceiling){}",
         if ceiling == 1 { "" } else { "s" },
         WORKER_MEMORY_MIB / 1024,
         match ceiling {
-            0 => "\n                  Workers will be blocked: give Docker at least 8 GB of memory",
-            1 => "\n                  give Docker more memory to run Workers in parallel",
+            0 => "\n                  Workers will be blocked: give Docker more memory",
+            1..=3 => "\n                  give Docker more memory to run more Workers in parallel",
             _ => "",
         }
     );
@@ -235,13 +248,20 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
 
 /// The pinned Worker profile. The daemon accepts only this runtime profile;
 /// a Worker Configuration may declare a smaller one.
+///
+/// Decided from measurement: ten concurrent Codex Workers each peaked near
+/// 570 MiB and 0.14 cores. The ceilings contain a runaway; the requests are
+/// what admission reserves. See docs/worker-capacity.md.
 const WORKER_VCPUS: u64 = 2;
-const WORKER_MEMORY_MIB: u64 = 6144;
+const WORKER_MEMORY_MIB: u64 = 3072;
+const WORKER_STORAGE_MIB: u64 = 2048;
+const WORKER_MEMORY_REQUEST_MIB: u64 = 640;
+const WORKER_CPU_REQUEST_MILLIS: u64 = 250;
 
 /// The same derivation the daemon uses to admit Workers.
 fn worker_ceiling(cpus: u64, memory_mib: u64) -> u64 {
-    (cpus / WORKER_VCPUS)
-        .min(memory_mib.saturating_sub(HOST_MEMORY_RESERVE_MIB) / WORKER_MEMORY_MIB)
+    (cpus * 1000 / WORKER_CPU_REQUEST_MILLIS)
+        .min(memory_mib.saturating_sub(HOST_MEMORY_RESERVE_MIB) / WORKER_MEMORY_REQUEST_MIB)
 }
 
 fn report(step: u8, name: &str, detail: &str) {
@@ -983,10 +1003,12 @@ mod tests {
 
     #[test]
     fn worker_ceiling_is_bounded_by_the_scarcer_resource() {
-        // This development machine: 12 CPUs, but 7837 MiB of Docker memory.
-        assert_eq!(worker_ceiling(12, 7837), 1);
-        assert_eq!(worker_ceiling(12, 16384), 2);
-        assert_eq!(worker_ceiling(4, 65536), 2);
-        assert_eq!(worker_ceiling(12, 4096), 0);
+        // This development machine: 12 CPUs, 7837 MiB of Docker memory, where
+        // ten real Codex Workers ran at once.
+        assert_eq!(worker_ceiling(12, 7837), 10);
+        assert_eq!(worker_ceiling(12, 16384), 24);
+        // CPU binds when memory is plentiful.
+        assert_eq!(worker_ceiling(2, 65536), 8);
+        assert_eq!(worker_ceiling(12, 1500), 0);
     }
 }

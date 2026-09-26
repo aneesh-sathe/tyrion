@@ -21,7 +21,7 @@ ceiling from outside the container:
 | Control | Flag | Effect |
 | --- | --- | --- |
 | Processes | `--pids-limit 256` | `fork` fails at 256. `/sys/fs/cgroup` is read-only, so guest root cannot raise it. |
-| Memory and files | `--memory 6144m --memory-swap 6144m` | One hard ceiling over process memory and the writable tmpfs together. |
+| Memory and files | `--memory 3072m --memory-swap 3072m` | One hard ceiling over process memory and the writable tmpfs together. |
 | Writable storage | `--mount type=tmpfs,destination=/sandbox,tmpfs-size=4GiB` | The only writable mount. |
 | Root filesystem | `--read-only` | Nothing outside `/sandbox` can be modified. |
 | CPU | `--cpus 2 --cpuset-cpus <its own CPUs>` | A two-core quota that the guest also observes. Each running container is pinned to CPUs no other running Worker holds. |

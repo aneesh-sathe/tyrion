@@ -288,8 +288,8 @@ CREATE TABLE IF NOT EXISTS host_capacity (
     memory_mib INTEGER NOT NULL CHECK (memory_mib > 0),
     reserve_mib INTEGER NOT NULL CHECK (reserve_mib >= 0),
     source TEXT NOT NULL CHECK (source IN ('container_runtime', 'principal')),
-    worker_vcpus INTEGER NOT NULL CHECK (worker_vcpus > 0),
-    worker_memory_mib INTEGER NOT NULL CHECK (worker_memory_mib > 0),
+    worker_cpu_request_millis INTEGER NOT NULL CHECK (worker_cpu_request_millis > 0),
+    worker_memory_request_mib INTEGER NOT NULL CHECK (worker_memory_request_mib > 0),
     observed_at INTEGER NOT NULL
 );
 

@@ -2781,9 +2781,11 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
                 "sha256": sha256_file(claude)
             },
             "lease_ttl_seconds": 30,
+            "memory_request_mib": 640,
+            "cpu_request_millis": 250,
             "vcpus": 2,
-            "memory_mib": 6144,
-            "writable_storage_mib": 4096,
+            "memory_mib": 3072,
+            "writable_storage_mib": 2048,
             "max_processes": 256
         }))
         .unwrap(),

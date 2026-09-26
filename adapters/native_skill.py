@@ -4,6 +4,30 @@ import hashlib
 import os
 
 
+# Byproducts of running code, never Worker output: the caches a language writes
+# when tests run. A Worker that runs its tests must not fail its Assignment
+# because the interpreter left files behind in a repository with no
+# .gitignore yet. Excluding them in the clone covers the adapter's staging and
+# the model's own git commands, and never hides a tracked file or a real
+# out-of-scope change. Tyrion's built-in Codex path repeats this list.
+RUNTIME_BYPRODUCTS = (
+    "__pycache__/",
+    "*.py[cod]",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    "node_modules/",
+    ".DS_Store",
+)
+
+
+def exclude_runtime_byproducts(repository):
+    path = os.path.join(repository, ".git", "info", "exclude")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as exclude:
+        exclude.write("\n".join(RUNTIME_BYPRODUCTS) + "\n")
+
+
 class RequiredSkillFailure(RuntimeError):
     def __init__(self, skill, message):
         super().__init__(message)

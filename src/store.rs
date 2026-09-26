@@ -367,8 +367,8 @@ impl Store {
         if let Some((capacity, profile)) = host {
             transaction.execute(
                 "INSERT INTO host_capacity (
-                    id, cpus, memory_mib, reserve_mib, source, worker_vcpus,
-                    worker_memory_mib, observed_at
+                    id, cpus, memory_mib, reserve_mib, source, worker_cpu_request_millis,
+                    worker_memory_request_mib, observed_at
                  ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     capacity.cpus,
@@ -378,8 +378,8 @@ impl Store {
                         worker::HostCapacitySource::ContainerRuntime => "container_runtime",
                         worker::HostCapacitySource::Principal => "principal",
                     },
-                    profile.vcpus,
-                    profile.memory_mib,
+                    profile.cpu_request_millis,
+                    profile.memory_request_mib,
                     unix_timestamp()?,
                 ],
             )?;
@@ -7173,12 +7173,12 @@ impl Store {
         };
         let mut candidates = Vec::with_capacity(ready_candidates.len());
         for candidate in ready_candidates {
-            let (vcpus, memory_mib) =
+            let (cpu_millis, memory_mib) =
                 assignment_host_demand(&transaction, &candidate.assignment_id)?;
             // A Worker profile this host could never run is an actionable
             // Blocker, not a hold that would wait forever.
-            if vcpus > ceilings.vcpus || memory_mib > ceilings.memory_mib {
-                let requirement = host.never_fits_requirement(vcpus, memory_mib);
+            if cpu_millis > ceilings.cpu_millis || memory_mib > ceilings.memory_mib {
+                let requirement = host.never_fits_requirement(cpu_millis, memory_mib);
                 return block_ready_assignment(
                     transaction,
                     commission_id,
@@ -7198,7 +7198,7 @@ impl Store {
                 resources: Resources {
                     concurrency: candidate.reserved_concurrency_slots.into(),
                     storage: candidate.reserved_storage_bytes,
-                    vcpus,
+                    cpu_millis,
                     memory_mib,
                 },
                 item: candidate,
@@ -12628,8 +12628,8 @@ struct HostRecord {
     memory_mib: u64,
     reserve_mib: u64,
     source: String,
-    worker_vcpus: u64,
-    worker_memory_mib: u64,
+    worker_cpu_request_millis: u64,
+    worker_memory_request_mib: u64,
     observed_at: i64,
 }
 
@@ -12639,12 +12639,12 @@ impl HostLoad {
     fn ceilings(&self) -> Resources {
         match &self.capacity {
             Some(host) => Resources {
-                vcpus: host.cpus,
+                cpu_millis: host.cpus.saturating_mul(1000),
                 memory_mib: host.memory_mib.saturating_sub(host.reserve_mib),
                 ..Resources::default()
             },
             None => Resources {
-                vcpus: u64::MAX,
+                cpu_millis: u64::MAX,
                 memory_mib: u64::MAX,
                 ..Resources::default()
             },
@@ -12654,21 +12654,26 @@ impl HostLoad {
     fn describe(&self) -> String {
         let ceilings = self.ceilings();
         format!(
-            "this host provides {} CPUs and {} MiB for Workers, with {} vCPUs and {} MiB in use",
-            ceilings.vcpus, ceilings.memory_mib, self.used.vcpus, self.used.memory_mib
+            "this host provides {} CPUs and {} MiB for Workers, with {} and {} MiB already reserved",
+            ceilings.cpu_millis / 1000,
+            ceilings.memory_mib,
+            cores(self.used.cpu_millis),
+            self.used.memory_mib
         )
     }
 
-    fn hold_detail(&self, vcpus: u64, memory_mib: u64) -> String {
+    fn hold_detail(&self, cpu_millis: u64, memory_mib: u64) -> String {
         format!(
-            "Needs {vcpus} vCPUs and {memory_mib} MiB; {}. It dispatches when running Workers finish.",
+            "Expected to use {} and {memory_mib} MiB; {}. It dispatches when running Workers finish.",
+            cores(cpu_millis),
             self.describe()
         )
     }
 
-    fn never_fits_requirement(&self, vcpus: u64, memory_mib: u64) -> String {
+    fn never_fits_requirement(&self, cpu_millis: u64, memory_mib: u64) -> String {
         format!(
-            "The Worker profile needs {vcpus} vCPUs and {memory_mib} MiB, but {}. Give the container runtime more CPUs or memory, route to a Worker Configuration with a smaller containment_resources profile, or start tyriond with --host-cpus and --host-memory-mib to declare more.",
+            "The Worker profile is expected to use {} and {memory_mib} MiB, but {}. Give the container runtime more CPUs or memory, route to a Worker Configuration with a smaller containment_resources profile, or start tyriond with --host-cpus and --host-memory-mib to declare more.",
+            cores(cpu_millis),
             self.describe()
         )
     }
@@ -12686,14 +12691,15 @@ impl HostLoad {
             "usable_memory_mib": usable_memory_mib,
             "source": host.source,
             "observed_at": host.observed_at,
-            "default_worker_profile": {
-                "vcpus": host.worker_vcpus,
-                "memory_mib": host.worker_memory_mib,
+            "default_worker_request": {
+                "cpu_millis": host.worker_cpu_request_millis,
+                "memory_mib": host.worker_memory_request_mib,
             },
-            "derived_worker_ceiling": (host.cpus / host.worker_vcpus)
-                .min(usable_memory_mib / host.worker_memory_mib),
-            "in_use": {
-                "vcpus": self.used.vcpus,
+            "derived_worker_ceiling": (host.cpus.saturating_mul(1000)
+                / host.worker_cpu_request_millis)
+                .min(usable_memory_mib / host.worker_memory_request_mib),
+            "reserved": {
+                "cpu_millis": self.used.cpu_millis,
                 "memory_mib": self.used.memory_mib,
             },
         })
@@ -12703,8 +12709,8 @@ impl HostLoad {
 fn host_load(connection: &Connection) -> Result<HostLoad, TyrionError> {
     let capacity = connection
         .query_row(
-            "SELECT cpus, memory_mib, reserve_mib, source, worker_vcpus, worker_memory_mib,
-                    observed_at
+            "SELECT cpus, memory_mib, reserve_mib, source, worker_cpu_request_millis,
+                    worker_memory_request_mib, observed_at
              FROM host_capacity WHERE id = 1",
             [],
             |row| {
@@ -12713,18 +12719,18 @@ fn host_load(connection: &Connection) -> Result<HostLoad, TyrionError> {
                     memory_mib: row.get(1)?,
                     reserve_mib: row.get(2)?,
                     source: row.get(3)?,
-                    worker_vcpus: row.get(4)?,
-                    worker_memory_mib: row.get(5)?,
+                    worker_cpu_request_millis: row.get(4)?,
+                    worker_memory_request_mib: row.get(5)?,
                     observed_at: row.get(6)?,
                 })
             },
         )
         .optional()?;
-    let (vcpus, memory_mib) = connection.query_row(
+    let (cpu_millis, memory_mib) = connection.query_row(
         "SELECT COALESCE(SUM(json_extract(assignment_routes.selected_configuration_json,
-                                          '$.containment_resources.vcpus')), 0),
+                                          '$.containment_resources.cpu_request_millis')), 0),
                 COALESCE(SUM(json_extract(assignment_routes.selected_configuration_json,
-                                          '$.containment_resources.memory_mib')), 0)
+                                          '$.containment_resources.memory_request_mib')), 0)
          FROM resource_reservations
          JOIN attempts ON attempts.id = resource_reservations.attempt_id
          JOIN assignment_routes ON assignment_routes.assignment_id = attempts.assignment_id
@@ -12735,21 +12741,26 @@ fn host_load(connection: &Connection) -> Result<HostLoad, TyrionError> {
     Ok(HostLoad {
         capacity,
         used: Resources {
-            vcpus,
+            cpu_millis,
             memory_mib,
             ..Resources::default()
         },
     })
 }
 
-/// The host share an Assignment's routed Worker Configuration would hold.
-/// Zero for a Worker that never touches the container runtime.
+/// What an Assignment's routed Worker Configuration is expected to use, which
+/// admission reserves. Zero for a Worker that never touches the container
+/// runtime.
 fn host_demand(configuration: &Value) -> (u64, u64) {
     let resources = &configuration["containment_resources"];
     (
-        resources["vcpus"].as_u64().unwrap_or(0),
-        resources["memory_mib"].as_u64().unwrap_or(0),
+        resources["cpu_request_millis"].as_u64().unwrap_or(0),
+        resources["memory_request_mib"].as_u64().unwrap_or(0),
     )
+}
+
+fn cores(millis: u64) -> String {
+    format!("{}.{:02} CPUs", millis / 1000, millis % 1000 / 10)
 }
 
 fn assignment_host_demand(
