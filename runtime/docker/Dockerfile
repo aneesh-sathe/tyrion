@@ -18,6 +18,8 @@
 # covered by a hash it verifies.
 FROM debian:bookworm-slim
 
+# `python` as well as `python3`: host models write acceptance checks the way
+# developers type them, and a verifier that cannot start blocks its Assignment.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -25,6 +27,7 @@ RUN apt-get update \
       git \
       python3 \
       python3-pip \
+      python-is-python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # This image exists only to be a throwaway sandbox, so there is no system

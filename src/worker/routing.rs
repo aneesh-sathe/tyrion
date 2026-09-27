@@ -795,10 +795,11 @@ fn failed_gates(
     }
     let limits = &configuration.resource_limits;
     let resources = request.resources;
+    // Spend is declared, never gated: no harness gives Tyrion a hard monetary
+    // ceiling, so comparing a guess against a guess only refused real work.
+    // A budget a harness can honour is a setting on its configuration.
     if resources.concurrency_slots > limits.max_concurrency_slots
         || resources.max_storage_bytes > limits.max_storage_bytes
-        || resources.max_model_spend_cents > limits.max_model_spend_cents
-        || resources.max_paid_service_spend_cents > limits.max_paid_service_spend_cents
     {
         failures.push("resource_limits");
     }
@@ -1160,5 +1161,40 @@ mod tests {
                 .to_string();
             assert!(error.contains("must stay within the pinned"), "{error}");
         }
+    }
+
+    #[test]
+    fn declared_spend_never_blocks_a_route_but_storage_does() {
+        let mut configuration = deterministic_configuration();
+        configuration.resource_limits.max_storage_bytes = 10;
+        configuration.resource_limits.max_model_spend_cents = 0;
+        configuration.resource_limits.max_paid_service_spend_cents = 0;
+        let requirements = WorkerRequirements::default();
+        let request = |resources: &AssignmentResources| {
+            failed_gates(
+                &configuration,
+                &RouteRequest {
+                    requirements: &requirements,
+                    resources,
+                    required_authority_action: super::super::DETERMINISTIC_ACTION,
+                    required_authority_scope_types: &[],
+                    entry_harness: "codex",
+                },
+            )
+        };
+        // A host model asked for a 20-cent budget on a configuration that
+        // declares none. Before this, every such Assignment was unroutable.
+        let spending = AssignmentResources {
+            concurrency_slots: 1,
+            max_storage_bytes: 1,
+            max_model_spend_cents: 20,
+            max_paid_service_spend_cents: 5,
+        };
+        assert!(!request(&spending).contains(&"resource_limits"));
+        let oversized = AssignmentResources {
+            max_storage_bytes: 11,
+            ..spending
+        };
+        assert!(request(&oversized).contains(&"resource_limits"));
     }
 }

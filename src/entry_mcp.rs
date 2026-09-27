@@ -16,7 +16,7 @@ const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_NATIVE_ELAPSED_SECONDS: u64 = 900;
 const MAX_NATIVE_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_NATIVE_MODEL_SPEND_CENTS: u64 = 100;
-pub(crate) const NATIVE_ENTRY_INSTRUCTIONS: &str = "This is a Tyrion Entry Session. For each substantial new user task, call tyrion_start_commission exactly once with a complete proposal. Tyrion Workers execute the accepted Commission, so do not independently perform that commissioned work in this host Entry Session. Use tyrion_status to inspect progress. If blocked work is abandoned, call tyrion_cancel_commission before starting another task. Construct proposals yourself and never ask the user to author Tyrion JSON or configure sockets, tokens, catalogs, or setup commands. One harness session may host multiple sequential Commissions.";
+pub(crate) const NATIVE_ENTRY_INSTRUCTIONS: &str = "This is a Tyrion Entry Session. For each substantial new user task, call tyrion_start_commission exactly once with a complete proposal. When the task splits into independent parts touching different files, include a plan so Tyrion runs them in parallel. Tyrion Workers execute the accepted Commission, so do not independently perform that commissioned work in this host Entry Session. Use tyrion_status to inspect progress. If blocked work is abandoned, call tyrion_cancel_commission before starting another task. Construct proposals yourself and never ask the user to author Tyrion JSON or configure sockets, tokens, catalogs, or setup commands. One harness session may host multiple sequential Commissions. Accepted work is integrated into a Tyrion-owned repository, never the user's checkout: when reporting back, say whether the Commission reached verified_complete, and give the review commands from tyrion_status rather than presenting files as already present in the checkout.";
 const ENTRY_CAPABILITIES: [&str; 3] = [
     "proposal_creation",
     "commission_acceptance",
@@ -287,20 +287,19 @@ fn ensure_previous_commission_is_terminal(state: &mut EntryState<'_>) -> Result<
     )))
 }
 
+/// How many Workers run at once is not bounded here: the daemon admits them
+/// against the machine's measured capacity, across every Commission. What an
+/// Entry Session may not do is reach outside the repository or ask for work
+/// that needs a human or a model to judge.
 fn validate_native_entry_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
-    if proposal.plan.is_some() {
+    if proposal.plan.as_ref().is_some_and(|plan| {
+        plan.assignments
+            .iter()
+            .any(|assignment| assignment.competition.is_some())
+    }) {
         return Err(TyrionError::InvalidRequest(
-            "native Entry MVP permits one Assignment and no explicit plan".into(),
-        ));
-    }
-    if proposal.resource_ceilings.max_attempts != 1 {
-        return Err(TyrionError::InvalidRequest(
-            "native Entry MVP requires max_attempts to equal 1".into(),
-        ));
-    }
-    if proposal.resource_ceilings.max_worker_concurrency != 1 {
-        return Err(TyrionError::InvalidRequest(
-            "native Entry MVP requires max_worker_concurrency to equal 1".into(),
+            "native Entry does not run competing Attempts; give each Assignment its own work"
+                .into(),
         ));
     }
     if proposal.resource_ceilings.max_elapsed_seconds > MAX_NATIVE_ELAPSED_SECONDS {
@@ -325,7 +324,7 @@ fn validate_native_entry_proposal(proposal: &CommissionProposal) -> Result<(), T
     }
     if !proposal.authority.destinations.is_empty() || !proposal.authority.effects.is_empty() {
         return Err(TyrionError::InvalidRequest(
-            "native Entry MVP does not permit external destinations or effects".into(),
+            "an Entry Session grants no external destinations or effects: leave authority.destinations and authority.effects out. Repository changes are already authorized by authority.paths and codex.git_change, so do not describe the work there".into(),
         ));
     }
     if proposal
@@ -481,7 +480,7 @@ fn tools() -> Value {
         {
             "name": "tyrion_start_commission",
             "title": "Start Tyrion Commission",
-            "description": "Create and accept one durable Tyrion Commission for the user's current substantial task. Construct the proposal yourself; never ask the user to author JSON or perform Tyrion setup. For repository work, use codex_git with the absolute current Git root, full HEAD object id, narrowly authorized relative paths, codex.git_change, and deterministic command verifiers. This MVP is limited to one Assignment and Attempt, one Worker, 15 minutes, 100 MiB, $1 model spend, no paid services, and no external effects.",
+            "description": "Create and accept one durable Tyrion Commission for the user's current substantial task. Construct the proposal yourself; never ask the user to author JSON or perform Tyrion setup. For repository work, use codex_git with the absolute current Git root, full HEAD object id, narrowly authorized relative paths, codex.git_change, and deterministic command verifiers. When the task has independent parts that touch different files, include a plan with one Assignment per part so Workers run them in parallel; Tyrion runs as many at once as the machine can hold. Limited to 15 minutes, 100 MiB, $1 model spend, no paid services, and no external effects.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -543,6 +542,7 @@ fn proposal_schema() -> Value {
                 "default": []
             },
             "goal": {"type": "string", "minLength": 1},
+            "plan": plan_schema(),
             "execution": {
                 "oneOf": [
                     {
@@ -637,7 +637,7 @@ fn proposal_schema() -> Value {
             },
             "authority": {
                 "type": "object",
-                "description": "Exact authority granted to this Commission. codex_git requires its repository, at least one normalized relative path, and codex.git_change.",
+                "description": "Exact authority granted to this Commission. codex_git requires its repository, at least one normalized relative path, and codex.git_change. An Entry Session never grants network destinations or external effects, so there are no fields for them.",
                 "properties": {
                     "repositories": {"type": "array", "items": {"type": "string"}},
                     "paths": {"type": "array", "items": {"type": "string"}},
@@ -646,22 +646,28 @@ fn proposal_schema() -> Value {
                         "items": {"enum": ["deterministic.echo", "codex.git_change"]},
                         "uniqueItems": true
                     },
-                    "destinations": {"type": "array", "maxItems": 0},
-                    "effects": {"type": "array", "maxItems": 0}
                 },
-                "required": ["repositories", "paths", "actions", "destinations", "effects"],
+                "required": ["repositories", "paths", "actions"],
                 "additionalProperties": false
             },
             "resource_ceilings": {
                 "type": "object",
                 "properties": {
-                    "max_attempts": {"const": 1},
+                    "max_attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Attempts across every Assignment, including retries. Allow at least one per Assignment plus one retry each."
+                    },
                     "max_elapsed_seconds": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_NATIVE_ELAPSED_SECONDS
                     },
-                    "max_worker_concurrency": {"const": 1},
+                    "max_worker_concurrency": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many Assignments may run at once: the number of plan Assignments that do not depend on each other, or 1 without a plan. Tyrion further limits this to what the machine can hold."
+                    },
                     "max_storage_bytes": {
                         "type": "integer",
                         "minimum": 1,
@@ -701,6 +707,82 @@ fn proposal_schema() -> Value {
     })
 }
 
+/// A parallel plan, in exactly the shape the daemon validates.
+fn plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Split the task into Assignments that Workers run in parallel. Use a plan when the work has at least two independent parts touching different files; omit it for one focused change. Every criterion is owned by exactly one Assignment. Assignments that can run at the same time must have non-overlapping write_scopes; one that needs another's output lists it in dependencies.",
+        "properties": {
+            "assignments": {
+                "type": "array",
+                "minItems": 2,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "minLength": 1},
+                        "goal": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Complete instructions for one Worker, which sees only this goal and the repository."
+                        },
+                        "dependencies": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Ids of Assignments whose integrated result this one needs first."
+                        },
+                        "criterion_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string"}
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "enum": ["critical_path", "uncertainty_reduction", "independent_verification"]
+                        },
+                        "read_scopes": {"type": "array", "items": {"type": "string"}},
+                        "write_scopes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Relative paths this Assignment may change, each also listed in authority.paths. Empty for a read-only Assignment, such as one that verifies the others' integrated result."
+                        },
+                        "resources": {
+                            "type": "object",
+                            "properties": {
+                                "concurrency_slots": {"const": 1},
+                                "max_storage_bytes": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "Room for this Assignment's Result. 5242880 suits most code changes."
+                                },
+                                "max_model_spend_cents": {"type": "integer", "minimum": 0},
+                                "max_paid_service_spend_cents": {"const": 0}
+                            },
+                            "required": [
+                                "concurrency_slots",
+                                "max_storage_bytes",
+                                "max_model_spend_cents",
+                                "max_paid_service_spend_cents"
+                            ],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "goal",
+                        "criterion_ids",
+                        "purpose",
+                        "write_scopes",
+                        "resources"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["assignments"],
+        "additionalProperties": false
+    })
+}
+
 fn negotiated_protocol_version(params: &Value) -> String {
     match params["protocolVersion"].as_str() {
         Some(version @ ("2025-06-18" | "2025-03-26" | "2024-11-05")) => version.to_owned(),
@@ -717,4 +799,43 @@ fn write_message(output: &mut impl Write, message: &Value) -> Result<(), TyrionE
     output.write_all(b"\n")?;
     output.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an instance from every property the plan schema offers. The
+    /// daemon's types reject unknown fields, so a schema that names anything
+    /// the daemon does not accept fails here rather than in a host model.
+    #[test]
+    fn plan_schema_offers_only_fields_the_daemon_accepts() {
+        let schema = plan_schema();
+        let assignment = &schema["properties"]["assignments"]["items"];
+        let mut instance = serde_json::Map::new();
+        for (name, property) in assignment["properties"].as_object().unwrap() {
+            let value = match name.as_str() {
+                "purpose" => json!("critical_path"),
+                "resources" => json!({
+                    "concurrency_slots": 1,
+                    "max_storage_bytes": 5_242_880,
+                    "max_model_spend_cents": 0,
+                    "max_paid_service_spend_cents": 0
+                }),
+                _ if property["type"] == "array" => json!(["src/lib.rs"]),
+                _ => json!("value"),
+            };
+            instance.insert(name.clone(), value);
+        }
+        let plan: crate::protocol::CommissionPlan = serde_json::from_value(json!({
+            "assignments": [Value::Object(instance)]
+        }))
+        .expect("every schema property is a daemon field");
+        assert_eq!(plan.assignments[0].write_scopes, ["src/lib.rs"]);
+        for required in assignment["required"].as_array().unwrap() {
+            assert!(assignment["properties"]
+                .get(required.as_str().unwrap())
+                .is_some());
+        }
+    }
 }

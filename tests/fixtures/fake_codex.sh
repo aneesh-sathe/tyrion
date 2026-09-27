@@ -80,6 +80,13 @@ fi
 if [ -n "$fixture_delete" ]; then
     rm "$repo/$fixture_delete"
 fi
+if [ -e "$fake_state/worker-commits-itself" ] && [ -z "$fixture_read_only" ]; then
+    # Real models sometimes commit their own work, and may leave an empty
+    # commit behind. Neither is a conflict.
+    git -C "$repo" add -A
+    git -C "$repo" -c user.name=Model -c user.email=model@fixture.invalid commit -qm 'model commit'
+    git -C "$repo" -c user.name=Model -c user.email=model@fixture.invalid commit -q --allow-empty -m 'model empty commit'
+fi
 if [ -e "$fake_state/runtime-byproducts" ]; then
     # What running a test suite leaves behind in a repository with no
     # .gitignore. None of it is Worker output.

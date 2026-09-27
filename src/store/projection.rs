@@ -1259,6 +1259,14 @@ pub(super) fn inspect_commission(
             "next_action": if principal_pending { "escalate" } else { "retry" },
             "reason": format!("Current Evidence is insufficient for {unresolved_criteria} Acceptance Criterion."),
         })
+    } else if commission["status"] != "verified_complete" && !blockers.is_empty() {
+        // Passing criteria are not completion while planned work is blocked;
+        // saying "complete" here let a host report unfinished work as done.
+        json!({
+            "verdict": "passed",
+            "next_action": "resolve_blocker",
+            "reason": "Every current Acceptance Criterion passes, but the Commission is not complete: an Assignment is blocked.",
+        })
     } else {
         json!({
             "verdict": "passed",

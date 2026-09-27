@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -866,6 +866,212 @@ fn a_worker_profile_the_host_can_never_run_blocks_with_the_exact_requirement() {
     assert!(!log.contains("run --detach"), "{log}");
 }
 
+/// One JSON-RPC exchange with an Entry MCP server, as a native harness does it.
+fn mcp_call(input: &mut impl Write, output: &mut impl BufRead, request: Value) -> Value {
+    writeln!(input, "{request}").unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn an_entry_session_runs_a_parallel_plan_concurrently() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, _fake_state) = fixture_daemon(&temp, &[]);
+    let proposal_path = temp.path().join("parallel-proposal.json");
+    write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+
+    // The same process Claude Code or Codex holds open for a session.
+    let mut entry = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args([
+            "entry-mcp",
+            "--socket",
+            path_text(&daemon.socket_path),
+            "--harness",
+            "codex",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Entry MCP server should launch");
+    let mut input = entry.stdin.take().unwrap();
+    let mut output = BufReader::new(entry.stdout.take().unwrap());
+    mcp_call(
+        &mut input,
+        &mut output,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "plan-test", "version": "1.0.0"}
+            }
+        }),
+    );
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+
+    let started = mcp_call(
+        &mut input,
+        &mut output,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "tyrion_start_commission", "arguments": {"proposal": proposal}}
+        }),
+    );
+    assert_eq!(started["result"]["isError"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut id = 3;
+    let completed = loop {
+        let status = mcp_call(
+            &mut input,
+            &mut output,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "tyrion_status", "arguments": {}}
+            }),
+        );
+        id += 1;
+        let inspected = status["result"]["structuredContent"].clone();
+        if inspected["commission"]["status"] == "verified_complete" {
+            break inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plan did not complete: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert_eq!(completed["assignments"].as_array().unwrap().len(), 2);
+    assert!(completed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["status"] == "accepted"));
+    let concurrency = &completed["activity_journal"]["useful_concurrency"];
+    assert!(
+        concurrency["overlap_millis"].as_u64().unwrap() > 0,
+        "the Workers did not run at the same time: {concurrency}"
+    );
+    assert!(
+        concurrency["elapsed_time_reduction_millis"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "running in parallel saved no time: {concurrency}"
+    );
+
+    // The host is told where the work is and how to take it, and following
+    // those commands from the Principal's checkout really does fetch it.
+    let review = &completed["review"];
+    assert_eq!(review["verified_complete"], true);
+    assert_eq!(review["principal_checkout_changed"], false);
+    assert!(!principal_checkout.join("backend.txt").exists());
+    let fetch = review["commands"][0].as_str().unwrap();
+    let fetched = Command::new("sh")
+        .args(["-c", fetch])
+        .current_dir(&principal_checkout)
+        .output()
+        .unwrap();
+    assert!(fetched.status.success(), "{fetched:?}");
+    let files = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "FETCH_HEAD"])
+        .current_dir(&principal_checkout)
+        .output()
+        .unwrap();
+    let files = String::from_utf8_lossy(&files.stdout);
+    assert!(
+        files.contains("backend.txt") && files.contains("frontend.txt"),
+        "{files}"
+    );
+
+    drop(input);
+    assert!(entry.wait().unwrap().success());
+}
+
+#[test]
+fn an_entry_session_still_refuses_competition_and_external_effects() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, fake_state) = fixture_daemon(&temp, &[]);
+    let proposal_path = temp.path().join("parallel-proposal.json");
+    write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+
+    let mut competing = proposal.clone();
+    for assignment in competing["plan"]["assignments"].as_array_mut().unwrap() {
+        assignment["competition"] = json!({
+            "group": "g", "uncertainty": "which is better", "comparison_rule": "fewest lines"
+        });
+    }
+    let mut external = proposal.clone();
+    external["authority"]["destinations"] = json!(["https://api.example.com"]);
+    let mut judged = proposal;
+    judged["criteria"][0]["verifier_type"] = json!("model");
+
+    let mut entry = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args([
+            "entry-mcp",
+            "--socket",
+            path_text(&daemon.socket_path),
+            "--harness",
+            "claude",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Entry MCP server should launch");
+    let mut input = entry.stdin.take().unwrap();
+    let mut output = BufReader::new(entry.stdout.take().unwrap());
+    mcp_call(
+        &mut input,
+        &mut output,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "refusal-test", "version": "1.0.0"}}
+        }),
+    );
+    for (id, (proposal, reason)) in [
+        (competing, "competing Attempts"),
+        (external, "external destinations"),
+        (judged, "deterministic verifiers"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = mcp_call(
+            &mut input,
+            &mut output,
+            json!({
+                "jsonrpc": "2.0", "id": id + 2, "method": "tools/call",
+                "params": {"name": "tyrion_start_commission", "arguments": {"proposal": proposal}}
+            }),
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(text.contains(reason), "{text}");
+    }
+    // Nothing was started for any refused proposal.
+    let log = fs::read_to_string(fake_state.join("commands.log")).unwrap_or_default();
+    assert!(!log.contains("run --detach"), "{log}");
+    drop(input);
+    assert!(entry.wait().unwrap().success());
+}
+
 #[test]
 fn concurrent_read_only_assignments_verify_without_mutating_the_artifact() {
     let fixture = ParallelFixture::new();
@@ -1581,6 +1787,84 @@ fn unauthorized_changed_path_is_rejected_before_verification() {
         .contains("unauthorized path outside.txt"));
     assert!(!fixture.data_dir.join("integrations").exists());
     assert!(!fixture.principal_checkout.join("outside.txt").exists());
+}
+
+#[test]
+fn a_verifier_that_cannot_run_blocks_once_instead_of_rerunning_the_worker() {
+    // A host model wrote `python`, which the Worker image lacked. Rerunning the
+    // Worker can never make a missing verifier appear, so it must block once,
+    // keep the Worker's Result, and say exactly what is wrong.
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, _fake_state) = fixture_daemon(&temp, &[]);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["criteria"][0]["verifier"]["argv"] = json!(["tyrion-missing-verifier", "--check"]);
+    proposal["resource_ceilings"]["max_attempts"] = json!(3);
+    fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let blocked = loop {
+        let inspected = inspect_commission(&daemon, &attachment_token, &commission_id);
+        if inspected["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker["code"] == "verifier_unrunnable")
+        {
+            break inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no verifier blocker: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    // Settle, then prove no second Attempt was spent.
+    thread::sleep(Duration::from_millis(500));
+    let settled = inspect_commission(&daemon, &attachment_token, &commission_id);
+    assert_eq!(
+        settled["attempts"].as_array().unwrap().len(),
+        1,
+        "{settled}"
+    );
+    assert_eq!(settled["results"][0]["status"], "candidate");
+    let requirement = blocked["blockers"][0]["requirement"].as_str().unwrap();
+    assert!(
+        requirement.contains("verifier executable unavailable: tyrion-missing-verifier"),
+        "{requirement}"
+    );
+    assert!(requirement.contains("Result is retained"), "{requirement}");
+}
+
+#[test]
+fn workers_that_commit_their_own_work_integrate_without_reconciliation() {
+    // Two parallel writers each commit their own change and then leave an
+    // empty commit. The second integrates by cherry-pick, where git reports
+    // an empty commit exactly like a conflict.
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, fake_state) = fixture_daemon(&temp, &[]);
+    fs::write(fake_state.join("worker-commits-itself"), "").unwrap();
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("parallel-proposal.json");
+    write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    let assignments = completed["assignments"].as_array().unwrap();
+    assert_eq!(
+        assignments.len(),
+        2,
+        "no reconciliation was opened: {assignments:?}"
+    );
+    assert!(completed["blockers"].as_array().unwrap().is_empty());
 }
 
 #[test]

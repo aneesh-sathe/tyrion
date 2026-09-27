@@ -1,6 +1,6 @@
 # Tyrion as a software factory manager
 
-Status: in progress. Slices are issues #22 to #28. Slices 1, 5 and 6 are done.
+Status: in progress. Slices are issues #22 to #28. Slices 1, 2, 5 and 6 are done.
 
 ## Objective
 
@@ -42,7 +42,10 @@ proposes the breakdown.
 Today the Principal supplies the plan Assignment by Assignment, or gets a
 single legacy Assignment. This is the central gap.
 
-### 2. The Entry Session is capped at one Worker
+### 2. The Entry Session is capped at one Worker (done)
+
+Resolved by #23. A host model now builds the plan itself from one sentence.
+
 
 `src/entry_mcp.rs` rejects `max_attempts != 1` and
 `max_worker_concurrency != 1`. Two lines. The cap was correct for a walking

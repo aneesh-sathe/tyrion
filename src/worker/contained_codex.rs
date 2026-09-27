@@ -1140,6 +1140,24 @@ impl ContainedCodexRuntime {
                 )?;
             } else {
                 for commit in &candidate.candidate_commits {
+                    // A commit that changes nothing carries no work, and git
+                    // reports cherry-picking one as an error indistinguishable
+                    // from a conflict. Skip it rather than open a
+                    // reconciliation for nothing.
+                    let changes_nothing = git_output(
+                        Some(&repository),
+                        &[
+                            os("diff-tree"),
+                            os("--quiet"),
+                            os(&format!("{commit}^")),
+                            os(commit),
+                        ],
+                    )?
+                    .status
+                    .success();
+                    if changes_nothing {
+                        continue;
+                    }
                     let cherry_pick = git_output(
                         Some(&repository),
                         &[os("cherry-pick"), os("--no-edit"), os(commit)],
@@ -2496,8 +2514,12 @@ env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/hom
   --output-last-message "$root/codex-result.json" - \
   <"$root/prompt.txt" >"$root/codex-events.jsonl"
 git -C "$root/repository" add -A
+# A Worker may commit its own work. Only a Worker that changed nothing at all
+# takes the empty-change path; never stack a commit on top of its own.
 if git -C "$root/repository" diff --cached --quiet; then
-  {empty_change_action}
+  if git -C "$root/repository" diff --quiet {base} HEAD; then
+    {empty_change_action}
+  fi
 else
   env -i PATH=/usr/local/bin:/usr/bin:/bin \
     GIT_AUTHOR_NAME=Tyrion GIT_AUTHOR_EMAIL=worker@tyrion.invalid \

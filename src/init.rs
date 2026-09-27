@@ -786,7 +786,9 @@ fn configuration(
         "context": {"strategy": "fresh", "capacity_tokens": 200000},
         "resource_limits": {
             "max_concurrency_slots": 2,
-            "max_storage_bytes": 10485760,
+            // What a Worker can actually write, as for the built-in
+            // configuration. A smaller figure only refuses reasonable plans.
+            "max_storage_bytes": WORKER_STORAGE_MIB * 1024 * 1024,
             "max_model_spend_cents": 0,
             "max_paid_service_spend_cents": 0,
         },

@@ -566,6 +566,15 @@ impl WorkerRuntime {
             .map(|runtime| (runtime.host_capacity(), runtime.resource_profile()))
     }
 
+    /// Where a Commission's accepted work lives: a Tyrion-owned repository,
+    /// never the Principal's checkout.
+    pub(crate) fn integration_repository(&self, commission_id: &str) -> Option<PathBuf> {
+        self.contained_codex
+            .as_ref()
+            .map(|runtime| runtime.integration_repository(commission_id))
+            .filter(|repository| repository.is_dir())
+    }
+
     pub(crate) fn begin_attempt(
         &self,
         attempt_id: &str,

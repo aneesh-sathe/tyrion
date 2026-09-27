@@ -106,8 +106,12 @@ fn native_harness_arguments(
             ),
             "-c".into(),
             "mcp_servers.tyrion.required=true".into(),
+            // `auto` still prompts for any tool not marked read-only, so every
+            // Commission would wait on a click, and `codex exec` refuses the
+            // call outright. Approving a Tyrion call only starts contained
+            // work; the Principal's checkout changes only when they merge.
             "-c".into(),
-            "mcp_servers.tyrion.default_tools_approval_mode=\"auto\"".into(),
+            "mcp_servers.tyrion.default_tools_approval_mode=\"approve\"".into(),
             "-c".into(),
             format!(
                 "developer_instructions={}",

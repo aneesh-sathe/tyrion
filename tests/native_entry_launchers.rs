@@ -150,7 +150,7 @@ done
             "-c",
             "mcp_servers.tyrion.required=true",
             "-c",
-            "mcp_servers.tyrion.default_tools_approval_mode=\"auto\""
+            "mcp_servers.tyrion.default_tools_approval_mode=\"approve\""
         ]
     );
     assert_eq!(arguments[8], "-c");

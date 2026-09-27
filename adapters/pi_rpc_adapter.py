@@ -47,20 +47,28 @@ def finish_workspace(repository):
     git("add", "-A", cwd=repository)
     staged = subprocess.run(
         ["git", "diff", "--cached", "--quiet"], cwd=repository, check=False
-    )
-    if staged.returncode == 1:
+    ).returncode == 1
+    worker_committed = subprocess.run(
+        ["git", "diff", "--quiet", "origin/tyrion-base", "HEAD"],
+        cwd=repository,
+        check=False,
+    ).returncode == 1
+    # Commit uncommitted work. When the Worker changed nothing at all, record
+    # one empty commit: that is what a read-only Assignment returns, as
+    # Tyrion's built-in path does. Never stack an empty commit on top of
+    # commits the Worker already made.
+    if staged or not worker_committed:
         git(
             "-c",
             "user.name=Tyrion Worker",
             "-c",
             "user.email=worker@tyrion.invalid",
             "commit",
+            "--allow-empty",
             "-qm",
             "feat: save worker result",
             cwd=repository,
         )
-    elif staged.returncode != 0:
-        raise RuntimeError("could not inspect staged Pi workspace changes")
     git("branch", "-f", "tyrion-result", "HEAD", cwd=repository)
     git("bundle", "create", destination, "refs/heads/tyrion-result", cwd=repository)
 

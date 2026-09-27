@@ -5499,6 +5499,7 @@ impl Store {
             &mut projection,
             runtime,
         )?;
+        projection["review"] = review_instructions(&projection, runtime, commission_id);
         Ok(projection)
     }
 
@@ -7841,14 +7842,33 @@ impl Store {
                 "failed",
                 &candidate.usage,
             )?;
-            recover_failed_verification(
-                &transaction,
-                commission_id,
-                &ready,
-                &attempt_id,
-                &lease_id,
-                &result_id,
-            )?;
+            // Rerunning the Worker cannot fix a verifier that cannot run, so
+            // only a defect in the Result itself earns another Attempt.
+            if let Some(unrunnable) = candidate_verification.iter().find(|record| {
+                !record.passed()
+                    && record
+                        .defect
+                        .is_some_and(|defect| defect != VerificationDefect::Result)
+            }) {
+                block_on_unrunnable_verifier(
+                    &transaction,
+                    commission_id,
+                    &ready,
+                    &attempt_id,
+                    &lease_id,
+                    &result_id,
+                    unrunnable,
+                )?;
+            } else {
+                recover_failed_verification(
+                    &transaction,
+                    commission_id,
+                    &ready,
+                    &attempt_id,
+                    &lease_id,
+                    &result_id,
+                )?;
+            }
             transaction.commit()?;
             return Ok(());
         }
@@ -12302,6 +12322,103 @@ fn retain_noncurrent_result(
         }
     }
     Ok(())
+}
+
+/// How the Principal reviews and takes accepted work. It is integrated into a
+/// Tyrion-owned repository and the Principal's checkout is untouched until
+/// they merge, which a host reporting back must not blur.
+fn review_instructions(
+    projection: &Value,
+    runtime: &worker::WorkerRuntime,
+    commission_id: &str,
+) -> Value {
+    let (Some(revision), Some(repository)) = (
+        projection["commission"]["artifact_revision"].as_str(),
+        runtime.integration_repository(commission_id),
+    ) else {
+        return Value::Null;
+    };
+    let quoted = format!(
+        "'{}'",
+        repository.display().to_string().replace('\'', "'\\''")
+    );
+    let complete = projection["commission"]["status"] == "verified_complete";
+    serde_json::json!({
+        "repository": repository,
+        "branch": "tyrion-integration",
+        "revision": revision,
+        "verified_complete": complete,
+        "principal_checkout_changed": false,
+        "commands": [
+            format!("git fetch {quoted} tyrion-integration"),
+            "git diff HEAD FETCH_HEAD",
+            "git merge --ff-only FETCH_HEAD",
+        ],
+        "note": if complete {
+            "Verified work is in Tyrion's integration repository. The user's checkout is unchanged until they run these commands from it."
+        } else {
+            "Integrated so far, but the Commission is not complete. The user's checkout is unchanged."
+        },
+    })
+}
+
+/// The Worker's Result stands and is retained; the check could not run. That
+/// is a defect in the criterion, not the work, so the Assignment blocks with
+/// exactly what is wrong instead of spending Attempts that would all fail the
+/// same way.
+fn block_on_unrunnable_verifier(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    ready: &ReadyAssignmentDispatch,
+    attempt_id: &str,
+    lease_id: &str,
+    result_id: &str,
+    record: &worker::VerificationRecord,
+) -> Result<(), TyrionError> {
+    release_successful_attempt(
+        transaction,
+        SuccessfulAttemptRelease {
+            attempt_id,
+            lease_id,
+        },
+    )?;
+    transaction.execute(
+        "UPDATE attempts SET revision_disposition = 'retained' WHERE id = ?1",
+        [attempt_id],
+    )?;
+    transaction.execute(
+        "UPDATE results SET status = 'candidate', revision_disposition = 'retained'
+         WHERE id = ?1",
+        [result_id],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET status = ?2 WHERE id = ?1",
+        params![
+            ready.assignment_id,
+            AssignmentStatus::VerificationFailed.as_str()
+        ],
+    )?;
+    let requirement = format!(
+        "Criterion {} could not be checked ({}); the Worker's Result is retained. Fix the criterion's verifier so it runs in the Worker image, which provides sh, git, python3 (also as python) and curl, then amend the verification or start a new Commission.",
+        record.criterion_id, record.observed
+    );
+    transaction.execute(
+        "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
+         VALUES (?1, ?2, ?3, 'verifier_unrunnable', ?4, ?5)",
+        params![
+            Uuid::new_v4().to_string(),
+            commission_id,
+            ready.assignment_id,
+            requirement,
+            unix_timestamp()?,
+        ],
+    )?;
+    record_event(
+        transaction,
+        commission_id,
+        EventKind::AssignmentBlocked,
+        ready.mandate_revision,
+    )
 }
 
 fn recover_failed_verification(
