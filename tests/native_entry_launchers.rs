@@ -79,7 +79,8 @@ done
     );
     assert_eq!(arguments[2], "--append-system-prompt");
     assert!(arguments[3].contains("tyrion_start_commission"));
-    assert_eq!(&arguments[4..], ["--model", "opus"]);
+    assert_eq!(&arguments[4..6], ["--allowedTools", "mcp__tyrion"]);
+    assert_eq!(&arguments[6..], ["--model", "opus"]);
     assert!(data_dir.join("state.sqlite3").is_file());
     assert_eq!(
         fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,

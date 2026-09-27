@@ -8180,7 +8180,18 @@ impl Store {
         usage: &Value,
     ) -> Result<(), TyrionError> {
         let mut assembled_assignment = assignment.clone();
-        assembled_assignment.criteria = assembled_criteria;
+        // Check the assembled result against the criteria whose work is in it:
+        // this Assignment's and every Assignment already integrated, whatever
+        // its status now. A criterion whose work has not landed yet cannot
+        // pass, so running it only records a failure that never happened.
+        // Later work is still checked against everything before it, so a
+        // regression is still caught.
+        let present =
+            criteria_with_integrated_work(&self.connection, commission_id, &ready.logical_id)?;
+        assembled_assignment.criteria = assembled_criteria
+            .into_iter()
+            .filter(|criterion| present.contains(&criterion.id))
+            .collect();
         let integrated_verification =
             match worker.verify_integrated(&assembled_assignment, &integrated) {
                 Ok(verification) => verification,
@@ -12322,6 +12333,33 @@ fn retain_noncurrent_result(
         }
     }
     Ok(())
+}
+
+/// Criteria owned by the Assignment being integrated, or by any Assignment
+/// whose Result is already integrated into the Commission's artifact.
+fn criteria_with_integrated_work(
+    connection: &Connection,
+    commission_id: &str,
+    integrating_logical_id: &str,
+) -> Result<HashSet<String>, TyrionError> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT owned.criterion_id
+         FROM planned_assignment_criteria AS owned
+         WHERE owned.commission_id = ?1
+           AND (owned.assignment_logical_id = ?2 OR EXISTS (
+               SELECT 1 FROM assignment_metadata
+               JOIN assignments ON assignments.id = assignment_metadata.assignment_id
+               JOIN attempts ON attempts.assignment_id = assignments.id
+               JOIN results ON results.attempt_id = attempts.id
+               WHERE assignments.commission_id = owned.commission_id
+                 AND assignment_metadata.logical_id = owned.assignment_logical_id
+                 AND results.integrated_artifact_revision IS NOT NULL
+           ))",
+    )?;
+    let rows = statement.query_map(params![commission_id, integrating_logical_id], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.collect::<Result<HashSet<_>, _>>()?)
 }
 
 /// How the Principal reviews and takes accepted work. It is integrated into a

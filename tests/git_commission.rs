@@ -687,6 +687,19 @@ fn disjoint_useful_assignments_run_concurrently_and_complete_the_assembled_artif
     assert!(reservations
         .iter()
         .all(|event| event["payload"]["reserved_atomically"] == true));
+    // Issue #20: a clean run records no failure. A criterion is checked only
+    // once its own work is in the assembled result.
+    let failed = completed["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["outcome"] != "passed")
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "spurious failed Evidence: {failed:?}");
+    assert_eq!(
+        completed["briefing"]["run_report"]["failures"]["failed_evidence"],
+        0
+    );
 }
 
 /// A disposable fixture runtime plus a daemon started with extra arguments.

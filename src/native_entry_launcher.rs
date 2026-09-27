@@ -91,6 +91,11 @@ fn native_harness_arguments(
                 config,
                 "--append-system-prompt".into(),
                 NATIVE_ENTRY_INSTRUCTIONS.into(),
+                // Without this every Tyrion call waits on a permission prompt,
+                // and print mode refuses it outright. A call only starts
+                // contained work; the checkout changes only when the user merges.
+                "--allowedTools".into(),
+                "mcp__tyrion".into(),
             ]
         }
         NativeHarness::Codex => vec![

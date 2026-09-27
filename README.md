@@ -59,8 +59,10 @@ Every claim below was measured against real models, with a checked-in record in
   features became a four-Assignment plan built by Codex itself: three Workers in
   parallel, then a verification step. Verified complete on the first attempt,
   137 seconds faster than serial, with the user's checkout untouched until
-  merge. Record in
-  [`docs/dogfood-records/2026-09-27-natural-language-plan.json`](docs/dogfood-records/2026-09-27-natural-language-plan.json).
+  merge. The same sentence typed into Claude Code did the same, 96 seconds
+  faster than serial. Records:
+  [Codex host](docs/dogfood-records/2026-09-27-natural-language-plan.json),
+  [Claude host](docs/dogfood-records/2026-09-27-claude-host-plan.json).
 - Codex and Claude running **concurrently** on disjoint work, producing one
   verified integrated artifact and beating serial execution by 20.1 seconds.
 - **Ten** real Codex Workers at once on one Mac, admitted by Tyrion from the
