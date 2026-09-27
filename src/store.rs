@@ -37,6 +37,7 @@ use crate::TyrionError;
 use crate::{attachment, worker};
 
 mod frontier;
+mod planning;
 mod projection;
 mod schema;
 
@@ -410,8 +411,8 @@ impl Store {
             "INSERT INTO commissions (
                 id, goal, status, revision, created_at, execution_json,
                 worker_requirements_json, plan_json, project_id,
-                commission_constraints_json
-             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9)",
+                commission_constraints_json, planning
+             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 commission_id,
                 proposal.goal,
@@ -426,6 +427,7 @@ impl Store {
                     .transpose()?,
                 proposal.project_id,
                 serde_json::to_string(&proposal.commission_constraints)?,
+                proposal.planning.map(|_| "worker"),
             ],
         )?;
 
@@ -6545,9 +6547,9 @@ impl Store {
             attachment::COMMISSION_ACCEPTANCE,
         )?;
 
-        let (status, current_revision, execution_json, plan_json) = transaction
+        let (status, current_revision, execution_json, plan_json, planning) = transaction
             .query_row(
-                "SELECT status, revision, execution_json, plan_json
+                "SELECT status, revision, execution_json, plan_json, planning
                  FROM commissions WHERE id = ?1",
                 [commission_id],
                 |row| {
@@ -6556,6 +6558,7 @@ impl Store {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -6625,20 +6628,49 @@ impl Store {
             mandate_revision,
         )?;
 
-        let plan = plan_json
-            .as_deref()
-            .map(serde_json::from_str::<CommissionPlan>)
-            .transpose()?;
-        let legacy = plan.is_none();
-        let plan = proposal_plan_or_legacy(plan, commission_id, &transaction)?;
-        initialize_commission_plan(
-            &transaction,
-            commission_id,
-            mandate_revision,
-            &plan,
-            legacy,
-            accepted_at,
-        )?;
+        if planning.is_some() {
+            // The first frontier is the planning Worker alone. Nothing that
+            // writes is dispatched until its plan is validated.
+            let goal = load_planning_goal(&transaction, commission_id, None)?;
+            let plan = planning::planning_plan(
+                1,
+                goal,
+                &load_resource_ceilings(&transaction, commission_id)?,
+                load_principal_requirements(&transaction, commission_id)?,
+            );
+            record_plan_revision(
+                &transaction,
+                commission_id,
+                mandate_revision,
+                &plan,
+                PlanRecord {
+                    revision: 1,
+                    source: "control_plane",
+                    reason: "a planning Worker will propose the decomposition",
+                    provenance: serde_json::json!({
+                        "source": "control_plane",
+                        "reason": "planning_requested",
+                    }),
+                    legacy: false,
+                },
+                accepted_at,
+            )?;
+        } else {
+            let plan = plan_json
+                .as_deref()
+                .map(serde_json::from_str::<CommissionPlan>)
+                .transpose()?;
+            let legacy = plan.is_none();
+            let plan = proposal_plan_or_legacy(plan, commission_id, &transaction)?;
+            initialize_commission_plan(
+                &transaction,
+                commission_id,
+                mandate_revision,
+                &plan,
+                legacy,
+                accepted_at,
+            )?;
+        }
         route_ready_assignments(&transaction, commission_id, worker)?;
 
         let result = project_commission(&transaction, commission_id)?;
@@ -7035,6 +7067,166 @@ impl Store {
         save_idempotent_result(&transaction, idempotency_key, &request_hash, &result)?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// Commit a planning Worker's proposal, or ask once more with the exact
+    /// rejection, or block. Planning failure never wedges the Commission: it
+    /// ends in a plan or in an actionable Blocker.
+    fn complete_planning(
+        &mut self,
+        commission_id: &str,
+        ready: &ReadyAssignmentDispatch,
+        attempt_id: &str,
+        lease_id: &str,
+        result_id: &str,
+        output: &str,
+    ) -> Result<(), TyrionError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuation = attempt_continuation(&transaction, commission_id, ready, attempt_id)?;
+        if !matches!(continuation, AttemptContinuation::Current) {
+            retain_noncurrent_result(
+                &transaction,
+                continuation,
+                attempt_id,
+                lease_id,
+                result_id,
+                false,
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        let (handle, configuration) = transaction.query_row(
+            "SELECT workers.handle, attempts.worker_configuration
+             FROM attempts JOIN workers ON workers.attempt_id = attempts.id
+             WHERE attempts.id = ?1",
+            [attempt_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let now = unix_timestamp()?;
+        let next_revision = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM commission_plans WHERE commission_id = ?1",
+            [commission_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        match validate_proposed_plan(&transaction, commission_id, output) {
+            Ok(plan) => {
+                finish_verification(
+                    &transaction,
+                    &ready.assignment_id,
+                    attempt_id,
+                    lease_id,
+                    AssignmentStatus::Accepted,
+                )?;
+                transaction.execute(
+                    "UPDATE results SET status = ?2 WHERE id = ?1",
+                    params![result_id, ResultStatus::Accepted.as_str()],
+                )?;
+                let reason = format!(
+                    "planning Worker {handle} ({configuration}) proposed {} Assignments; the Control Plane validated them",
+                    plan.assignments.len()
+                );
+                record_plan_revision(
+                    &transaction,
+                    commission_id,
+                    ready.mandate_revision,
+                    &plan,
+                    PlanRecord {
+                        revision: next_revision,
+                        source: "control_plane",
+                        reason: &reason,
+                        provenance: serde_json::json!({
+                            "source": "planning_worker",
+                            "planning_assignment": ready.logical_id,
+                            "worker_handle": handle,
+                            "worker_configuration": configuration,
+                            "attempt_id": attempt_id,
+                            "assignments": plan.assignments.len(),
+                        }),
+                        legacy: false,
+                    },
+                    now,
+                )?;
+            }
+            Err(rejection) => {
+                transaction.execute(
+                    "UPDATE results SET status = ?2 WHERE id = ?1",
+                    params![result_id, ResultStatus::Superseded.as_str()],
+                )?;
+                let rounds = transaction.query_row(
+                    "SELECT COUNT(*) FROM planned_assignments
+                     WHERE commission_id = ?1 AND logical_id LIKE ?2",
+                    params![commission_id, format!("{}%", planning::PLANNING_PREFIX)],
+                    |row| row.get::<_, u32>(0),
+                )?;
+                if rounds < planning::MAX_PLANNING_ROUNDS {
+                    finish_verification(
+                        &transaction,
+                        &ready.assignment_id,
+                        attempt_id,
+                        lease_id,
+                        AssignmentStatus::Superseded,
+                    )?;
+                    let goal = load_planning_goal(&transaction, commission_id, Some(&rejection))?;
+                    let plan = planning::planning_plan(
+                        rounds + 1,
+                        goal,
+                        &load_resource_ceilings(&transaction, commission_id)?,
+                        load_principal_requirements(&transaction, commission_id)?,
+                    );
+                    record_plan_revision(
+                        &transaction,
+                        commission_id,
+                        ready.mandate_revision,
+                        &plan,
+                        PlanRecord {
+                            revision: next_revision,
+                            source: "control_plane",
+                            reason:
+                                "the proposed plan was rejected; planning again with the rejection",
+                            provenance: serde_json::json!({
+                                "source": "control_plane",
+                                "reason": "planning_rejected",
+                                "rejection": rejection,
+                            }),
+                            legacy: false,
+                        },
+                        now,
+                    )?;
+                } else {
+                    finish_verification(
+                        &transaction,
+                        &ready.assignment_id,
+                        attempt_id,
+                        lease_id,
+                        AssignmentStatus::VerificationFailed,
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO blockers (id, commission_id, assignment_id, code, requirement, created_at)
+                         VALUES (?1, ?2, ?3, 'planning_failed', ?4, ?5)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            commission_id,
+                            ready.assignment_id,
+                            format!(
+                                "The planning Worker did not produce a valid plan in {} tries. Last rejection: {rejection}. Cancel and start again with a plan, or with a clearer goal.",
+                                planning::MAX_PLANNING_ROUNDS
+                            ),
+                            now,
+                        ],
+                    )?;
+                    record_event(
+                        &transaction,
+                        commission_id,
+                        EventKind::AssignmentBlocked,
+                        ready.mandate_revision,
+                    )?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn run_ready_assignment(
@@ -7760,6 +7952,19 @@ impl Store {
             }),
         )?;
         transaction.commit()?;
+
+        // A planning Worker's Result is a proposed plan, not an artifact: it is
+        // validated and committed, never verified or integrated.
+        if planning::is_planning(&ready.logical_id) {
+            return self.complete_planning(
+                commission_id,
+                &ready,
+                &attempt_id,
+                &lease_id,
+                &result_id,
+                &candidate.output,
+            );
+        }
 
         if !ready.legacy
             && candidate.changed_paths.iter().any(|path| {
@@ -10016,7 +10221,52 @@ fn initialize_commission_plan(
     legacy: bool,
     created_at: i64,
 ) -> Result<(), TyrionError> {
-    let plan_revision = 1_i64;
+    let source = if legacy {
+        "control_plane"
+    } else {
+        "entry_model"
+    };
+    record_plan_revision(
+        transaction,
+        commission_id,
+        mandate_revision,
+        plan,
+        PlanRecord {
+            revision: 1,
+            source,
+            reason: "initial decomposition exposed the first safe Execution Frontier",
+            provenance: serde_json::json!({
+                "source": source,
+                "reason": "initial_decomposition",
+            }),
+            legacy,
+        },
+        created_at,
+    )
+}
+
+/// One committed plan revision: who authored it, why, and how its
+/// Assignments enter the frontier.
+struct PlanRecord<'a> {
+    revision: i64,
+    /// Who committed it. A planning Worker's plan is committed by the Control
+    /// Plane after validation; its author is in `provenance`.
+    source: &'a str,
+    reason: &'a str,
+    provenance: Value,
+    legacy: bool,
+}
+
+fn record_plan_revision(
+    transaction: &Transaction<'_>,
+    commission_id: &str,
+    mandate_revision: i64,
+    plan: &CommissionPlan,
+    record: PlanRecord<'_>,
+    created_at: i64,
+) -> Result<(), TyrionError> {
+    let plan_revision = record.revision;
+    let legacy = record.legacy;
     transaction.execute(
         "INSERT INTO commission_plans (
             commission_id, revision, source, reason, snapshot_json, created_at
@@ -10024,29 +10274,29 @@ fn initialize_commission_plan(
         params![
             commission_id,
             plan_revision,
-            if legacy {
-                "control_plane"
-            } else {
-                "entry_model"
-            },
-            "initial decomposition exposed the first safe Execution Frontier",
+            record.source,
+            record.reason,
             serde_json::to_string(plan)?,
             created_at,
         ],
     )?;
+    let mut payload = record.provenance;
+    payload["plan_revision"] = serde_json::json!(plan_revision);
     record_event_with_payload(
         transaction,
         commission_id,
         EventKind::PlanRevised,
         mandate_revision,
-        &serde_json::json!({
-            "plan_revision": plan_revision,
-            "source": if legacy { "control_plane" } else { "entry_model" },
-            "reason": "initial_decomposition",
-        }),
+        &payload,
+    )?;
+    let first_position = transaction.query_row(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM planned_assignments WHERE commission_id = ?1",
+        [commission_id],
+        |row| row.get::<_, i64>(0),
     )?;
 
-    for (position, assignment) in plan.assignments.iter().enumerate() {
+    for (offset, assignment) in plan.assignments.iter().enumerate() {
+        let position = first_position + offset as i64;
         let competition = assignment.competition.as_ref();
         transaction.execute(
             "INSERT INTO planned_assignments (
@@ -10061,7 +10311,7 @@ fn initialize_commission_plan(
             params![
                 commission_id,
                 assignment.id,
-                position as i64,
+                position,
                 assignment.goal,
                 assignment.purpose.as_str(),
                 serde_json::to_string(&assignment.read_scopes)?,
@@ -10121,6 +10371,115 @@ fn initialize_commission_plan(
         )?;
     }
     Ok(())
+}
+
+fn load_principal_requirements(
+    connection: &Connection,
+    commission_id: &str,
+) -> Result<WorkerRequirements, TyrionError> {
+    let encoded = connection.query_row(
+        "SELECT worker_requirements_json FROM commissions WHERE id = ?1",
+        [commission_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(serde_json::from_str(&encoded)?)
+}
+
+/// Everything the planning Worker is told, from the accepted mandate.
+fn load_planning_goal(
+    connection: &Connection,
+    commission_id: &str,
+    rejection: Option<&str>,
+) -> Result<String, TyrionError> {
+    let (goal, constraints_json) = connection.query_row(
+        "SELECT goal, commission_constraints_json FROM commissions WHERE id = ?1",
+        [commission_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let constraints: Vec<String> = serde_json::from_str(&constraints_json)?;
+    let criteria = {
+        let mut statement = connection.prepare(
+            "SELECT criterion_id, description, verifier_kind, expected
+             FROM criteria WHERE commission_id = ?1 ORDER BY position",
+        )?;
+        let rows = statement.query_map([commission_id], |row| {
+            let kind = row.get::<_, String>(2)?;
+            let expected = row.get::<_, String>(3)?;
+            Ok(planning::CriterionBrief {
+                id: row.get(0)?,
+                description: row.get(1)?,
+                check: match kind.as_str() {
+                    "command" => serde_json::from_str::<Vec<String>>(&expected)
+                        .map(|argv| argv.join(" "))
+                        .unwrap_or(expected),
+                    _ => format!("{kind}: {expected}"),
+                },
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let authority = load_authority(connection, commission_id)?;
+    let ceilings = load_resource_ceilings(connection, commission_id)?;
+    Ok(planning::planning_goal(&planning::PlanningBrief {
+        goal: &goal,
+        constraints: &constraints,
+        criteria: &criteria,
+        authorized_paths: &authority.paths,
+        max_worker_concurrency: ceilings.max_worker_concurrency,
+        rejection,
+    }))
+}
+
+/// Validate a planning Worker's proposal against the accepted mandate. The
+/// same checks as a Principal's plan, plus: overlapping writers must be
+/// ordered, and the plan must fit the Attempts that remain.
+fn validate_proposed_plan(
+    connection: &Connection,
+    commission_id: &str,
+    output: &str,
+) -> Result<CommissionPlan, String> {
+    let proposed = planning::parse_proposed_plan(output)?;
+    let mandate_error = |error: TyrionError| error.to_string();
+    let ceilings = load_resource_ceilings(connection, commission_id).map_err(mandate_error)?;
+    let authority = load_authority(connection, commission_id).map_err(mandate_error)?;
+    let principal =
+        load_principal_requirements(connection, commission_id).map_err(mandate_error)?;
+    let criteria = {
+        let mut statement = connection
+            .prepare("SELECT criterion_id, verifier_type FROM criteria WHERE commission_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([commission_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let attempts_used = connection
+        .query_row(
+            "SELECT COUNT(*) FROM attempts
+             JOIN assignments ON assignments.id = attempts.assignment_id
+             WHERE assignments.commission_id = ?1",
+            [commission_id],
+            |row| row.get::<_, u32>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let plan = planning::complete_plan(proposed, &ceilings);
+    validate_plan_against(
+        &PlanMandate {
+            criterion_ids: criteria.iter().map(|(id, _)| id.as_str()).collect(),
+            all_deterministic: criteria.iter().all(|(_, kind)| kind == "deterministic"),
+            authority: &authority,
+            resource_ceilings: &ceilings,
+            worker_requirements: &principal,
+            attempts_available: ceilings.max_attempts.saturating_sub(attempts_used),
+        },
+        &plan,
+    )
+    .map_err(|error| error.to_string())?;
+    planning::ensure_overlaps_are_ordered(&plan)?;
+    Ok(plan)
 }
 
 fn insert_ready_assignment(
@@ -15099,6 +15458,33 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
     if let Some(plan) = &proposal.plan {
         validate_commission_plan(proposal, plan)?;
     }
+    if proposal.planning.is_some() {
+        if proposal.plan.is_some() {
+            return Err(TyrionError::InvalidRequest(
+                "ask Tyrion to plan or supply a plan, not both".into(),
+            ));
+        }
+        if !matches!(proposal.execution, ExecutionSpec::CodexGit { .. }) {
+            return Err(TyrionError::InvalidRequest(
+                "planning needs a codex_git repository for the planning Worker to read".into(),
+            ));
+        }
+        if proposal
+            .criteria
+            .iter()
+            .any(|criterion| criterion.verifier_type != VerifierType::Deterministic)
+        {
+            return Err(TyrionError::InvalidRequest(
+                "a planned Commission requires deterministic criterion Evidence".into(),
+            ));
+        }
+        if proposal.resource_ceilings.max_attempts < 2 {
+            return Err(TyrionError::InvalidRequest(
+                "planning needs max_attempts of at least 2: one to plan and one per Assignment it proposes"
+                    .into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -15193,6 +15579,17 @@ fn bind_project_identity(
     Ok(())
 }
 
+/// The accepted mandate a plan must fit, whoever wrote the plan.
+struct PlanMandate<'a> {
+    criterion_ids: HashSet<&'a str>,
+    all_deterministic: bool,
+    authority: &'a AuthorityEnvelope,
+    resource_ceilings: &'a ResourceCeilings,
+    worker_requirements: &'a WorkerRequirements,
+    /// Attempts still available for the plan's Assignments.
+    attempts_available: u32,
+}
+
 fn validate_commission_plan(
     proposal: &CommissionProposal,
     plan: &CommissionPlan,
@@ -15202,29 +15599,45 @@ fn validate_commission_plan(
             "an explicit Commission Plan must contain at least two Assignments".into(),
         ));
     }
-    if plan.assignments.len() as u32 > proposal.resource_ceilings.max_attempts {
+    validate_plan_against(
+        &PlanMandate {
+            criterion_ids: proposal
+                .criteria
+                .iter()
+                .map(|criterion| criterion.id.as_str())
+                .collect(),
+            all_deterministic: proposal
+                .criteria
+                .iter()
+                .all(|criterion| criterion.verifier_type == VerifierType::Deterministic),
+            authority: &proposal.authority,
+            resource_ceilings: &proposal.resource_ceilings,
+            worker_requirements: &proposal.worker_requirements,
+            attempts_available: proposal.resource_ceilings.max_attempts,
+        },
+        plan,
+    )
+}
+
+fn validate_plan_against(
+    mandate: &PlanMandate<'_>,
+    plan: &CommissionPlan,
+) -> Result<(), TyrionError> {
+    if plan.assignments.len() as u32 > mandate.attempts_available {
         let assignments = plan.assignments.len();
         return Err(TyrionError::InvalidRequest(format!(
-            "max_attempts must cover every Assignment in the initial Commission Plan: it is {}, but the plan has {assignments} Assignments. Set it to at least {assignments}, or {} to allow one retry each",
-            proposal.resource_ceilings.max_attempts,
+            "max_attempts must cover every Assignment in the Commission Plan: {} Attempts are available, but the plan has {assignments} Assignments. Set max_attempts to at least {assignments}, or {} to allow one retry each",
+            mandate.attempts_available,
             assignments * 2
         )));
     }
-    if proposal
-        .criteria
-        .iter()
-        .any(|criterion| criterion.verifier_type != VerifierType::Deterministic)
-    {
+    if !mandate.all_deterministic {
         return Err(TyrionError::InvalidRequest(
             "multi-Assignment plans currently require deterministic criterion Evidence".into(),
         ));
     }
 
-    let criterion_ids = proposal
-        .criteria
-        .iter()
-        .map(|criterion| criterion.id.as_str())
-        .collect::<HashSet<_>>();
+    let criterion_ids = &mandate.criterion_ids;
     let mut assignment_ids = HashSet::new();
     let mut owned_criteria = HashSet::new();
     let mut competitions: HashMap<&str, (&str, &str, Vec<Resources>)> = HashMap::new();
@@ -15251,10 +15664,7 @@ fn validate_commission_plan(
             &assignment.worker_requirements,
             SkillSelectionProvenance::Plan,
         )?;
-        merge_worker_requirements(
-            &proposal.worker_requirements,
-            &assignment.worker_requirements,
-        )?;
+        merge_worker_requirements(mandate.worker_requirements, &assignment.worker_requirements)?;
         for criterion_id in &assignment.criterion_ids {
             if !criterion_ids.contains(criterion_id.as_str()) {
                 return Err(TyrionError::InvalidRequest(format!(
@@ -15271,7 +15681,7 @@ fn validate_commission_plan(
         validate_assignment_resources(
             &assignment.id,
             &assignment.resources,
-            &proposal.resource_ceilings,
+            mandate.resource_ceilings,
         )?;
         for scope in assignment
             .read_scopes
@@ -15281,7 +15691,7 @@ fn validate_commission_plan(
             validate_relative_scope(scope)?;
         }
         for scope in &assignment.write_scopes {
-            if !proposal
+            if !mandate
                 .authority
                 .paths
                 .iter()
@@ -15337,7 +15747,7 @@ fn validate_commission_plan(
     let competition_attempts = comparison_requirements.len() as u32;
     if (plan.assignments.len() as u32)
         .checked_add(competition_attempts)
-        .is_none_or(|required| required > proposal.resource_ceilings.max_attempts)
+        .is_none_or(|required| required > mandate.attempts_available)
     {
         return Err(TyrionError::InvalidRequest(
             "max_attempts must include one comparison Assignment per competition group".into(),
@@ -15345,14 +15755,14 @@ fn validate_commission_plan(
     }
     if comparison_requirements
         .iter()
-        .any(|(_, _, resources)| resources.storage > proposal.resource_ceilings.max_storage_bytes)
+        .any(|(_, _, resources)| resources.storage > mandate.resource_ceilings.max_storage_bytes)
     {
         return Err(TyrionError::InvalidRequest(
             "each competition comparison working set must fit the Commission storage ceiling"
                 .into(),
         ));
     }
-    if owned_criteria != criterion_ids {
+    if owned_criteria != *criterion_ids {
         return Err(TyrionError::InvalidRequest(
             "every Acceptance Criterion must be owned by exactly one planned Assignment".into(),
         ));

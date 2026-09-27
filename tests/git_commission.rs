@@ -1907,6 +1907,179 @@ fn workers_that_commit_their_own_work_integrate_without_reconciliation() {
     assert!(completed["blockers"].as_array().unwrap().is_empty());
 }
 
+/// The parallel proposal with its plan removed: Tyrion's planning Worker is
+/// asked for the decomposition instead.
+fn write_planning_proposal(path: &Path, principal_checkout: &Path, base_revision: &str) {
+    write_parallel_git_proposal(path, principal_checkout, base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    proposal.as_object_mut().unwrap().remove("plan");
+    proposal["planning"] = json!("worker");
+    proposal["resource_ceilings"]["max_attempts"] = json!(5);
+    proposal["resource_ceilings"]["max_elapsed_seconds"] = json!(60);
+    fs::write(path, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+}
+
+fn place_planner_output(fake_state: &Path, round: u32, assignments: Value) {
+    fs::write(
+        fake_state.join(format!("plan-{round}.json")),
+        json!({"assignments": assignments}).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_planning_worker_decomposes_the_goal_and_its_plan_runs_in_parallel() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, fake_state) = fixture_daemon(&temp, &[]);
+    place_planner_output(
+        &fake_state,
+        1,
+        json!([
+            {"id": "backend", "goal": "TYRION_FIXTURE_WRITE=backend.txt TYRION_FIXTURE_CONTENT=backend TYRION_FIXTURE_DELAY=1",
+             "criterion_ids": ["backend-file"], "write_scopes": ["backend.txt"],
+             "purpose": "ignored: Tyrion sets it"},
+            {"id": "frontend", "goal": "TYRION_FIXTURE_WRITE=frontend.txt TYRION_FIXTURE_CONTENT=frontend TYRION_FIXTURE_DELAY=1",
+             "criterion_ids": ["frontend-file"], "write_scopes": ["frontend.txt"]}
+        ]),
+    );
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("planning-proposal.json");
+    write_planning_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    // The planner was told the mandate it had to plan within.
+    let prompt = fs::read_to_string(fake_state.join("planning-prompt-1.txt")).unwrap();
+    for expected in [
+        "backend-file",
+        "frontend-file",
+        "- backend.txt",
+        "- frontend.txt",
+    ] {
+        assert!(
+            prompt.contains(expected),
+            "planning prompt lacks {expected}"
+        );
+    }
+    // Revision 1 is the planning step; revision 2 is the Worker's validated
+    // plan. Integration records further revisions as work lands.
+    let plans = completed["plans"].as_array().unwrap();
+    assert!(plans[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("planning Worker will propose"));
+    assert_eq!(plans[1]["revision"], 2);
+    assert!(plans[1]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("proposed 2 Assignments; the Control Plane validated them"));
+    assert!(completed["events"].as_array().unwrap().iter().any(|event| {
+        event["type"] == "plan_revised" && event["payload"]["source"] == "planning_worker"
+    }));
+    let logical: Vec<&str> = completed["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|assignment| assignment["logical_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(logical, ["tyrion-plan-1", "backend", "frontend"]);
+    // The planned work ran in parallel, and the comparison with serial
+    // execution is recorded either way.
+    let concurrency = &completed["activity_journal"]["useful_concurrency"];
+    assert!(concurrency["serial_execution_millis"].as_u64().unwrap() > 0);
+    assert!(
+        concurrency["overlap_millis"].as_u64().unwrap() > 0,
+        "{concurrency}"
+    );
+}
+
+#[test]
+fn a_rejected_plan_is_proposed_again_with_the_reason_and_then_blocks() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let (daemon, fake_state) = fixture_daemon(&temp, &[]);
+    // First: authority outside the accepted envelope.
+    place_planner_output(
+        &fake_state,
+        1,
+        json!([
+            {"id": "backend", "goal": "g", "criterion_ids": ["backend-file"], "write_scopes": ["outside.txt"]},
+            {"id": "frontend", "goal": "g", "criterion_ids": ["frontend-file"], "write_scopes": ["frontend.txt"]}
+        ]),
+    );
+    // Then: two writers of one file with no order between them.
+    place_planner_output(
+        &fake_state,
+        2,
+        json!([
+            {"id": "backend", "goal": "g", "criterion_ids": ["backend-file"], "write_scopes": ["backend.txt"]},
+            {"id": "frontend", "goal": "g", "criterion_ids": ["frontend-file"], "write_scopes": ["backend.txt"]}
+        ]),
+    );
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("planning-proposal.json");
+    write_planning_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let blocked = loop {
+        let inspected = inspect_commission(&daemon, &attachment_token, &commission_id);
+        if inspected["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker["code"] == "planning_failed")
+        {
+            break inspected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no planning blocker: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    // The second round was told exactly why the first was rejected.
+    let second = fs::read_to_string(fake_state.join("planning-prompt-2.txt")).unwrap();
+    assert!(second.contains("previous plan was rejected"), "{second}");
+    assert!(
+        second.contains("unauthorized write scope outside.txt"),
+        "{second}"
+    );
+    let requirement = blocked["blockers"][0]["requirement"].as_str().unwrap();
+    assert!(
+        requirement.contains("both write backend.txt but neither depends on the other"),
+        "{requirement}"
+    );
+    // Only the planners ran: nothing that writes was dispatched.
+    assert_eq!(blocked["attempts"].as_array().unwrap().len(), 2);
+    assert!(!principal_checkout.join("outside.txt").exists());
+
+    // Planning failure does not wedge the Commission.
+    let revision = blocked["commission"]["revision"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let cancelled = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "commission",
+            "cancel",
+            &commission_id,
+            "--expected-revision",
+            &revision,
+            "--idempotency-key",
+            "cancel-after-planning-failure",
+        ],
+    );
+    assert_eq!(cancelled["commission"]["status"], "cancelled");
+}
+
 #[test]
 fn test_run_byproducts_do_not_fail_a_correct_worker() {
     // The repository has no .gitignore, and the Worker ran its tests. Before

@@ -65,6 +65,10 @@ Every claim below was measured against real models, with a checked-in record in
   [Claude host](docs/dogfood-records/2026-09-27-claude-host-plan.json).
 - Codex and Claude running **concurrently** on disjoint work, producing one
   verified integrated artifact and beating serial execution by 20.1 seconds.
+- **Tyrion plans on request.** Asked for four ledger features with no plan, a
+  contained planning Worker read the project and proposed four disjoint
+  Assignments; Tyrion validated the plan and ran them in parallel, verified on
+  the first attempt. [Record](docs/dogfood-records/2026-09-27-planning-worker.json).
 - **Ten** real Codex Workers at once on one Mac, admitted by Tyrion from the
   machine's own capacity: 10/10 verified, 7 times faster than serial, 1.8 GiB
   at peak. The same Mac admits 21. See [Worker capacity](docs/worker-capacity.md).

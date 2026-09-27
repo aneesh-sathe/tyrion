@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS commissions (
     worker_requirements_json TEXT NOT NULL DEFAULT '{}',
     plan_json TEXT,
     project_id TEXT,
-    commission_constraints_json TEXT NOT NULL DEFAULT '[]'
+    commission_constraints_json TEXT NOT NULL DEFAULT '[]',
+    planning TEXT CHECK (planning IS NULL OR planning = 'worker')
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -844,6 +845,12 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), TyrionError> {
             [],
         )?;
     }
+    if !column_exists(connection, "commissions", "planning")? {
+        connection.execute(
+            "ALTER TABLE commissions ADD COLUMN planning TEXT CHECK (planning IS NULL OR planning = 'worker')",
+            [],
+        )?;
+    }
     upgrade_profile_claims_for_inference(connection)?;
     if !column_exists(
         connection,
@@ -1283,6 +1290,7 @@ pub(super) fn migration_required(connection: &Connection) -> Result<bool, Tyrion
     let workers_schema = table_schema(connection, "workers")?;
     Ok(user_version < 18
         || !table_exists(connection, "host_capacity")?
+        || !column_exists(connection, "commissions", "planning")?
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?
@@ -1446,6 +1454,7 @@ pub(super) fn verify(connection: &Connection) -> Result<(), TyrionError> {
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     if user_version != 18
         || !table_exists(connection, "host_capacity")?
+        || !column_exists(connection, "commissions", "planning")?
         || !column_exists(connection, "commissions", "control_revision")?
         || !column_exists(connection, "commissions", "execution_json")?
         || !column_exists(connection, "commissions", "plan_json")?

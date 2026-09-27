@@ -20,11 +20,22 @@ pub struct CommissionProposal {
     pub worker_requirements: WorkerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<CommissionPlan>,
+    /// Ask Tyrion to plan instead of supplying a plan: a contained, read-only
+    /// planning Worker proposes the Assignments and the Control Plane validates
+    /// them before anything that writes is dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<PlanningMode>,
     pub criteria: Vec<AcceptanceCriterion>,
     pub authority: AuthorityEnvelope,
     pub resource_ceilings: ResourceCeilings,
     #[serde(default)]
     pub known_uncertainties: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningMode {
+    Worker,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

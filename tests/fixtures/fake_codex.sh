@@ -56,6 +56,18 @@ fake_state=$(dirname "$(dirname "$(dirname "$repo")")")
 if [ -e "$fake_state/slow-codex" ]; then
     sleep 5
 fi
+if printf '%s\n' "$prompt" | grep -q 'planning Worker for a Tyrion Commission'; then
+    # The planning Worker returns the plan a test placed for this round and
+    # changes nothing, as a real planner is told to.
+    round=$(( $(cat "$fake_state/planning-rounds" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$round" >"$fake_state/planning-rounds"
+    printf '%s\n' "$prompt" >"$fake_state/planning-prompt-$round.txt"
+    plan="$fake_state/plan-$round.json"
+    [ -f "$plan" ] || plan="$fake_state/plan-1.json"
+    python3 -c 'import json, sys; print(json.dumps({"summary": open(sys.argv[1]).read(), "known_effects": []}))' "$plan" >"$output"
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+    exit 0
+fi
 fixture_path=$(printf '%s\n' "$prompt" | sed -n 's/.*TYRION_FIXTURE_WRITE=\([^ ]*\).*/\1/p' | head -n 1)
 fixture_content=$(printf '%s\n' "$prompt" | sed -n 's/.*TYRION_FIXTURE_CONTENT=\([^ ]*\).*/\1/p' | head -n 1)
 fixture_delay=$(printf '%s\n' "$prompt" | sed -n 's/.*TYRION_FIXTURE_DELAY=\([^ ]*\).*/\1/p' | head -n 1)

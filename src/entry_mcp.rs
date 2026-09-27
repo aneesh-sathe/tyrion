@@ -556,6 +556,11 @@ fn proposal_schema() -> Value {
             },
             "goal": {"type": "string", "minLength": 1},
             "plan": plan_schema(),
+            "planning": {
+                "type": "string",
+                "enum": ["worker"],
+                "description": "Ask Tyrion to plan instead of writing a plan: a contained, read-only planning Worker reads the repository and proposes the Assignments, and Tyrion validates them before any Worker writes. Use it when you cannot see the codebase well enough to split the work yourself. Omit plan when you use this, and allow max_attempts for the planning Attempt plus the Assignments."
+            },
             "execution": {
                 "oneOf": [
                     {

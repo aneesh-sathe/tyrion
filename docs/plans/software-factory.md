@@ -1,6 +1,6 @@
 # Tyrion as a software factory manager
 
-Status: in progress. Slices are issues #22 to #28. Slices 1, 2, 5 and 6 are done.
+Status: in progress. Slices are issues #22 to #28. Slices 1 to 6 are done.
 
 ## Objective
 
