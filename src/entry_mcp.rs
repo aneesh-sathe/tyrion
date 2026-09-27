@@ -255,7 +255,13 @@ fn start_commission(state: &mut EntryState<'_>, arguments: &Value) -> Result<Val
         Some(revision),
     )?;
     state.current_commission_id = Some(commission_id);
-    let result = tool_result(accepted);
+    // The acceptance response is the full projection; answer with the same
+    // digest status uses, so starting a large plan does not flood the host.
+    let result = tool_result(if accepted["assignments"].is_array() {
+        crate::digest::commission_digest(&accepted)
+    } else {
+        accepted
+    });
     state.last_started = Some(CachedStart {
         proposal,
         result: result.clone(),
@@ -364,7 +370,10 @@ fn commission_status(state: &EntryState<'_>, arguments: &Value) -> Result<Value,
         None,
         None,
     )?;
-    Ok(tool_result(inspected))
+    if arguments.get("detail").and_then(Value::as_bool) == Some(true) {
+        return Ok(tool_result(inspected));
+    }
+    Ok(tool_result(crate::digest::commission_digest(&inspected)))
 }
 
 /// The record is the artifact that says what actually happened. Requiring the
@@ -493,11 +502,15 @@ fn tools() -> Value {
         {
             "name": "tyrion_status",
             "title": "Inspect Tyrion Commission",
-            "description": "Inspect the current Commission or a specified Commission id.",
+            "description": "A compact digest of the current Commission or a specified Commission id: a one-line headline, anything that needs the user first, one line per Assignment (state, Worker, elapsed time, activity, reported cost), verification, and review commands once work is integrated. Relay anything under needs_you to the user. Poll this while Workers run; pass detail: true only when you need the full record of Evidence, plans, and events.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "commission_id": {"type": "string"}
+                    "commission_id": {"type": "string"},
+                    "detail": {
+                        "type": "boolean",
+                        "description": "Return the full record instead of the digest. Large: avoid polling with it."
+                    }
                 },
                 "additionalProperties": false
             },

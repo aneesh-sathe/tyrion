@@ -15203,9 +15203,12 @@ fn validate_commission_plan(
         ));
     }
     if plan.assignments.len() as u32 > proposal.resource_ceilings.max_attempts {
-        return Err(TyrionError::InvalidRequest(
-            "max_attempts must cover every Assignment in the initial Commission Plan".into(),
-        ));
+        let assignments = plan.assignments.len();
+        return Err(TyrionError::InvalidRequest(format!(
+            "max_attempts must cover every Assignment in the initial Commission Plan: it is {}, but the plan has {assignments} Assignments. Set it to at least {assignments}, or {} to allow one retry each",
+            proposal.resource_ceilings.max_attempts,
+            assignments * 2
+        )));
     }
     if proposal
         .criteria

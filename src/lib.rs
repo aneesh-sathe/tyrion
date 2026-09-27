@@ -6,6 +6,7 @@ mod client;
 mod containment;
 mod credential;
 mod daemon;
+mod digest;
 mod domain;
 mod entry_mcp;
 mod error;

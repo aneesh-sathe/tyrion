@@ -944,7 +944,7 @@ fn an_entry_session_runs_a_parallel_plan_concurrently() {
 
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut id = 3;
-    let completed = loop {
+    loop {
         let status = mcp_call(
             &mut input,
             &mut output,
@@ -954,16 +954,36 @@ fn an_entry_session_runs_a_parallel_plan_concurrently() {
             }),
         );
         id += 1;
-        let inspected = status["result"]["structuredContent"].clone();
-        if inspected["commission"]["status"] == "verified_complete" {
-            break inspected;
-        }
+        let digest = status["result"]["structuredContent"].clone();
+        // A host polls the digest: small, and it never carries Evidence.
         assert!(
-            Instant::now() < deadline,
-            "plan did not complete: {inspected}"
+            digest["evidence"].is_null(),
+            "status returned the full record"
         );
+        if digest["commission"]["status"] == "verified_complete" {
+            assert_eq!(
+                digest["headline"],
+                "2 of 2 done, 0 running, 0 queued, 0 held, 0 blocked; 0¢ reported"
+            );
+            assert!(digest["needs_you"].as_array().unwrap().is_empty());
+            assert!(digest["review"]["commands"].is_array());
+            assert!(digest["parallel_speedup"]["serial_s"].is_u64());
+            break;
+        }
+        assert!(Instant::now() < deadline, "plan did not complete: {digest}");
         thread::sleep(Duration::from_millis(50));
-    };
+    }
+    // The full record is one request away.
+    let detailed = mcp_call(
+        &mut input,
+        &mut output,
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "tyrion_status", "arguments": {"detail": true}}
+        }),
+    );
+    let completed = detailed["result"]["structuredContent"].clone();
+    assert!(completed["evidence"].is_array());
 
     assert_eq!(completed["assignments"].as_array().unwrap().len(), 2);
     assert!(completed["results"]
