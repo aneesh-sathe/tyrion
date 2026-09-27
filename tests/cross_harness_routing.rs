@@ -1125,7 +1125,17 @@ fn selected_claude_adapter_drives_lifecycle_result_usage_and_session_identity() 
     }));
     let log = fs::read_to_string(temp.path().join("fake-docker/commands.log")).unwrap();
     assert!(log.contains("--security-opt seccomp=builtin"));
-    assert!(log.contains("/sandbox/claude --version"));
+    assert!(log.contains("/opt/tyrion/harness/claude --version"));
+    // The adapter is still uploaded, which proves the pattern; the harness is not.
+    let log_plain = log.replace('\\', "");
+    assert!(
+        log_plain.contains("cat > '/sandbox/worker-adapter'"),
+        "{log_plain}"
+    );
+    assert!(
+        !log_plain.contains("cat > '/sandbox/claude'"),
+        "{log_plain}"
+    );
 }
 
 #[test]
@@ -2754,6 +2764,10 @@ fn connect_full_entry(daemon: &RunningDaemon, harness: &str, native_session_id: 
 }
 
 fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path) -> PathBuf {
+    install_in_image(root, "codex", codex);
+    install_in_image(root, "claude", claude);
+    // The Pi fixture answers the Claude fixture's version probe.
+    install_in_image(root, "pi", claude);
     let config = root.join("codex-worker.json");
     fs::write(
         &config,
@@ -2764,24 +2778,16 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
             "docker_host": "unix:///fixture/docker.sock",
             "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
             "worker_image_id": format!("sha256:{}", "1".repeat(64)),
-            "codex_binary": codex,
             "codex_version": "codex-cli 0.156.1",
-            "codex_sha256": sha256_file(codex),
             "model": "fixture-model",
-            "claude": {
-                "binary": claude,
-                "version": "2.1.204 (Claude Code)",
-                "sha256": sha256_file(claude)
-            },
+            "claude": {"version": "2.1.204 (Claude Code)"},
             "pi": {
                 "model_provider": "openai",
                 "model": "openai/fixture-pi",
-                "binary": claude,
-                "version": "2.1.204 (Claude Code)",
-                "sha256": sha256_file(claude)
+                "version": "2.1.204 (Claude Code)"
             },
             "lease_ttl_seconds": 30,
-            "memory_request_mib": 640,
+            "memory_request_mib": 320,
             "cpu_request_millis": 250,
             "vcpus": 2,
             "memory_mib": 3072,
@@ -2792,6 +2798,15 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
     )
     .unwrap();
     config
+}
+
+/// Put a harness binary where the Worker image carries it: the fake Docker
+/// runs `/opt/tyrion/harness/<name>` from this directory.
+fn install_in_image(root: &Path, name: &str, binary: &Path) {
+    let harness = root.join("fake-docker").join("image").join("harness");
+    fs::create_dir_all(&harness).unwrap();
+    fs::copy(binary, harness.join(name)).unwrap();
+    fs::set_permissions(harness.join(name), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn write_executable(path: &Path, contents: &str) -> PathBuf {

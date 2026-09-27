@@ -66,31 +66,40 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         ),
     );
 
-    let (image_id, built) = docker.worker_image()?;
-    report(
-        2,
-        "worker image",
-        &format!(
-            "{} ({})",
-            short(&image_id),
-            if built { "built" } else { "reused" }
-        ),
-    );
-
     let harness_dir = runtime_dir.join("harnesses");
     private_dir(&harness_dir)?;
     let claude = fetch_claude(&harness_dir, docker.platform, &options.claude_version)?;
     let codex = fetch_codex(&harness_dir, docker.platform)?;
 
+    // The harnesses are built into the image, so every Worker shares one
+    // read-only copy and the image ID pins them.
+    let (image_id, built) = docker.worker_image(
+        &runtime_dir,
+        &[
+            ("codex", &codex.binary),
+            ("codex-code-mode-host", &codex.code_mode_host),
+            ("claude", &claude.binary),
+        ],
+    )?;
+    report(
+        2,
+        "worker image",
+        &format!(
+            "{} ({}, harnesses built in)",
+            short(&image_id),
+            if built { "built" } else { "reused" }
+        ),
+    );
+
     let probe = Probe::start(&docker, &image_id)?;
     probe.check_adapter_runtime()?;
-    let claude_version = probe.version(&claude.binary, "claude")?;
+    let claude_version = probe.version("claude")?;
     report(
         3,
         "claude code",
         &format!("{claude_version} {}", claude.note),
     );
-    let codex_version = probe.version(&codex.binary, "codex")?;
+    let codex_version = probe.version("codex")?;
     if codex_version != CODEX_VERSION {
         return Err(next_action(
             &format!("the downloaded Codex reports {codex_version}, but this Tyrion pins {CODEX_VERSION}"),
@@ -164,18 +173,8 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         // content addressed; a tag is not, and Tyrion rejects one.
         "worker_image": image_id,
         "worker_image_id": image_id,
-        "codex_binary": codex.binary,
-        "codex_sha256": sha256_file(&codex.binary)?,
         "codex_version": codex_version,
-        "codex_code_mode_host": {
-            "path": codex.code_mode_host,
-            "sha256": sha256_file(&codex.code_mode_host)?,
-        },
-        "claude": {
-            "binary": claude.binary,
-            "version": claude_version,
-            "sha256": sha256_file(&claude.binary)?,
-        },
+        "claude": {"version": claude_version},
         "model": options.codex_model,
         "egress": {"destinations": destinations},
         "worker_credentials": claude_credentials,
@@ -255,7 +254,7 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
 const WORKER_VCPUS: u64 = 2;
 const WORKER_MEMORY_MIB: u64 = 3072;
 const WORKER_STORAGE_MIB: u64 = 2048;
-const WORKER_MEMORY_REQUEST_MIB: u64 = 640;
+const WORKER_MEMORY_REQUEST_MIB: u64 = 320;
 const WORKER_CPU_REQUEST_MILLIS: u64 = 250;
 
 /// The same derivation the daemon uses to admit Workers.
@@ -388,19 +387,42 @@ impl Docker {
         command
     }
 
-    /// The image tag is derived from its build inputs, so a Tyrion upgrade that
-    /// changes them builds a new image rather than silently reusing a stale one.
-    fn worker_image(&self) -> Result<(String, bool), TyrionError> {
-        let digest = Sha256::digest([DOCKERFILE, NATIVE_SKILL].concat());
-        let tag = format!("tyrion-worker:{}", &format!("{digest:x}")[..12]);
+    /// The image tag is derived from every build input, including each
+    /// harness binary's digest, so an upgrade to any of them builds a new image
+    /// rather than silently reusing a stale one.
+    fn worker_image(
+        &self,
+        runtime_dir: &Path,
+        harnesses: &[(&str, &Path)],
+    ) -> Result<(String, bool), TyrionError> {
+        let mut inputs = Sha256::new();
+        inputs.update(DOCKERFILE);
+        inputs.update(NATIVE_SKILL);
+        for (name, binary) in harnesses {
+            inputs.update(name.as_bytes());
+            inputs.update(sha256_file(binary)?.as_bytes());
+        }
+        let tag = format!(
+            "tyrion-worker:{}",
+            &format!("{:x}", inputs.finalize())[..12]
+        );
         if let Some(id) = self.image_id(&tag) {
             return Ok((id, false));
         }
         println!("       building the Worker image, a few minutes the first time");
-        let context = std::env::temp_dir().join(format!("tyrion-image-{}", Uuid::new_v4()));
+        // Beside the downloads, so the harnesses can be hard-linked rather
+        // than copied into the build context.
+        let context = runtime_dir.join(format!("image-context-{}", Uuid::new_v4()));
         fs::create_dir_all(context.join("adapters"))?;
+        fs::create_dir_all(context.join("harness"))?;
         fs::write(context.join("Dockerfile"), DOCKERFILE)?;
         fs::write(context.join("adapters/native_skill.py"), NATIVE_SKILL)?;
+        for (name, binary) in harnesses {
+            let target = context.join("harness").join(name);
+            if fs::hard_link(binary, &target).is_err() {
+                fs::copy(binary, &target)?;
+            }
+        }
         let built = self
             .command()
             .args(["build", "--quiet", "--tag", &tag])
@@ -609,10 +631,9 @@ fn download_verified(url: &str, destination: &Path, expected: &str) -> Result<()
     Ok(())
 }
 
-/// One disposable container under the exact Worker profile. Each harness is
-/// streamed in and asked its version there, which is also the first proof it
-/// runs under the boundary Tyrion will hold it to. A guest-only Linux binary
-/// cannot report its version on the host.
+/// One disposable container under the exact Worker profile, used to prove the
+/// image can run its harnesses and import the adapters' runtime before any
+/// Worker depends on it.
 struct Probe<'a> {
     docker: &'a Docker,
     name: String,
@@ -691,28 +712,17 @@ impl<'a> Probe<'a> {
         })
     }
 
-    fn version(&self, binary: &Path, label: &str) -> Result<String, TyrionError> {
-        let target = format!("/sandbox/{label}");
-        // `docker cp` writes beneath a tmpfs mount on Docker Desktop, so stream.
-        let mut upload = self
+    /// Run a harness from the image under the exact Worker profile. The Linux
+    /// build cannot report its version on the host, and this is also the proof
+    /// it runs where Workers will run it.
+    fn version(&self, label: &str) -> Result<String, TyrionError> {
+        let upload = self
             .docker
             .command()
-            .args(["exec", "--interactive", &self.name, "sh", "-c"])
-            .arg(format!("cat > {target} && chmod 700 {target}"))
-            .stdin(File::open(binary)?)
+            .args(["exec", &self.name])
+            .arg(format!("/opt/tyrion/harness/{label}"))
+            .arg("--version")
             .output()?;
-        if upload.status.success() {
-            upload = self
-                .docker
-                .command()
-                .args(["exec", &self.name, &target, "--version"])
-                .output()?;
-        }
-        let _ = self
-            .docker
-            .command()
-            .args(["exec", &self.name, "rm", "-f", &target])
-            .output();
         if !upload.status.success() {
             return Err(next_action(
                 &format!(
@@ -1005,12 +1015,11 @@ mod tests {
 
     #[test]
     fn worker_ceiling_is_bounded_by_the_scarcer_resource() {
-        // This development machine: 12 CPUs, 7837 MiB of Docker memory, where
-        // ten real Codex Workers ran at once.
-        assert_eq!(worker_ceiling(12, 7837), 10);
-        assert_eq!(worker_ceiling(12, 16384), 24);
+        // This development machine: 12 CPUs and 7837 MiB of Docker memory.
+        assert_eq!(worker_ceiling(12, 7837), 21);
         // CPU binds when memory is plentiful.
+        assert_eq!(worker_ceiling(12, 16384), 48);
         assert_eq!(worker_ceiling(2, 65536), 8);
-        assert_eq!(worker_ceiling(12, 1500), 0);
+        assert_eq!(worker_ceiling(12, 1300), 0);
     }
 }

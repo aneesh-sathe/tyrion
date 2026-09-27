@@ -57,11 +57,12 @@ reports that the container launched anything other than the pinned image ID.
 It also pins the Docker CLI by SHA-256 and version, and takes an explicit
 `docker_host` rather than resolving an ambient Docker context.
 
-Copy [`runtime/docker/codex-worker.example.json`](../runtime/docker/codex-worker.example.json),
-fill in the absolute paths and digests, and record the actual SHA-256 of the
-Linux aarch64 Codex binary. It must report `codex-cli 0.156.1`, and Tyrion
-probes that version only after uploading it into the container, because it is
-a guest-only Linux binary.
+`tyrion init` writes this file. The Codex binary is built into the Worker
+image at `/opt/tyrion/harness/codex`, so the image ID pins it; it must report
+`codex-cli 0.156.1`, and Tyrion checks that inside every sandbox, because a
+Linux guest binary cannot report its version on the host.
+[`runtime/docker/codex-worker.example.json`](../runtime/docker/codex-worker.example.json)
+shows the shape.
 
 ```sh
 target/debug/tyriond \

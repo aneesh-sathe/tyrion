@@ -190,8 +190,12 @@ case "$operation" in
             printf '%s\n' 'not a Git bundle'
             exit 0
         fi
+        # The Worker image carries the harness binaries; the fixture keeps them
+        # in the image directory a test populates.
+        harness="$state/image/harness"
         mapped=()
         for argument in "$@"; do
+            argument="${argument//\/opt\/tyrion\/harness/$harness}"
             mapped+=("${argument///sandbox/$root}")
         done
         if [[ -n $workdir ]]; then
@@ -208,6 +212,7 @@ case "$operation" in
         fi
         exec env \
             TYRION_WORKSPACE_ROOT="$root" \
+            TYRION_HARNESS_ROOT="$harness" \
             TYRION_FAKE_STATE="$state" \
             HOME="$root" \
             "${mapped[@]}"

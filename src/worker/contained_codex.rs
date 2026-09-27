@@ -54,14 +54,11 @@ struct RuntimeConfig {
     worker_image: String,
     /// The locally resolved image identity that `worker_image` must launch.
     worker_image_id: String,
-    codex_binary: PathBuf,
+    /// The harness binaries are part of the Worker image, under
+    /// `/opt/tyrion/harness`, so the image ID pins them and every Worker shares
+    /// one read-only copy instead of streaming its own into its tmpfs. Each version is still
+    /// checked by running the binary inside every sandbox.
     codex_version: String,
-    codex_sha256: String,
-    /// Codex delegates file edits and shell work to a companion host binary
-    /// and fails the Assignment without it. It is pinned and transferred
-    /// exactly like the harness itself.
-    #[serde(default)]
-    codex_code_mode_host: Option<PinnedBinary>,
     model: String,
     /// Absent means every sandbox runs with no network at all.
     #[serde(default)]
@@ -199,17 +196,8 @@ pub(crate) struct HostCapacityOverride {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PinnedBinary {
-    path: PathBuf,
-    sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ClaudeRuntimeConfig {
-    binary: PathBuf,
     version: String,
-    sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,9 +205,7 @@ struct ClaudeRuntimeConfig {
 struct PiRuntimeConfig {
     model_provider: String,
     model: String,
-    binary: PathBuf,
     version: String,
-    sha256: String,
 }
 
 pub(super) struct ContainedCodexRuntime {
@@ -302,7 +288,6 @@ pub(super) struct StructuredAdapterSandbox<'a> {
 }
 
 struct StructuredRuntimeProfile<'a> {
-    binary: &'a Path,
     remote_binary: &'static str,
     binary_environment: &'static str,
     version: &'a str,
@@ -357,12 +342,14 @@ impl StructuredAdapterSandbox<'_> {
             .arg("TMPDIR=/sandbox/tmp")
             .arg(match configuration.adapter.kind {
                 super::routing::WorkerAdapterKind::CodexAppServer => {
-                    "TYRION_CODEX_BINARY=/sandbox/codex"
+                    "TYRION_CODEX_BINARY=/opt/tyrion/harness/codex"
                 }
                 super::routing::WorkerAdapterKind::ClaudeAgentSdk => {
-                    "TYRION_CLAUDE_BINARY=/sandbox/claude"
+                    "TYRION_CLAUDE_BINARY=/opt/tyrion/harness/claude"
                 }
-                super::routing::WorkerAdapterKind::PiRpc => "TYRION_PI_BINARY=/sandbox/pi",
+                super::routing::WorkerAdapterKind::PiRpc => {
+                    "TYRION_PI_BINARY=/opt/tyrion/harness/pi"
+                }
                 _ => unreachable!("structured sandbox command uses a structured adapter"),
             })
             .args(git_attempt.into_iter().flat_map(|attempt| {
@@ -592,18 +579,8 @@ impl ContainedCodexRuntime {
             "/sandbox/worker-adapter",
             assignment.lease_expires_at,
         )?;
-        sandbox.upload(
-            profile.binary,
-            profile.remote_binary,
-            assignment.lease_expires_at,
-        )?;
         sandbox.exec_checked(
-            &[
-                "chmod",
-                "700",
-                "/sandbox/worker-adapter",
-                profile.remote_binary,
-            ],
+            &["chmod", "700", "/sandbox/worker-adapter"],
             None,
             assignment.lease_expires_at,
         )?;
@@ -619,18 +596,6 @@ impl ContainedCodexRuntime {
             )));
         }
         if configuration.adapter.kind == super::routing::WorkerAdapterKind::CodexAppServer {
-            if let Some(host) = self.config.codex_code_mode_host.as_ref() {
-                sandbox.upload(
-                    &host.path,
-                    "/sandbox/codex-code-mode-host",
-                    assignment.lease_expires_at,
-                )?;
-                sandbox.exec_checked(
-                    &["chmod", "700", "/sandbox/codex-code-mode-host"],
-                    None,
-                    assignment.lease_expires_at,
-                )?;
-            }
             self.deliver_codex_login(&sandbox, assignment.lease_expires_at)?;
         }
         if let Some(git_attempt) = git_attempt {
@@ -693,8 +658,7 @@ impl ContainedCodexRuntime {
     ) -> Result<StructuredRuntimeProfile<'_>, TyrionError> {
         match kind {
             super::routing::WorkerAdapterKind::CodexAppServer => Ok(StructuredRuntimeProfile {
-                binary: &self.config.codex_binary,
-                remote_binary: "/sandbox/codex",
+                remote_binary: "/opt/tyrion/harness/codex",
                 binary_environment: "Codex",
                 version: &self.config.codex_version,
             }),
@@ -705,8 +669,7 @@ impl ContainedCodexRuntime {
                     )
                 })?;
                 Ok(StructuredRuntimeProfile {
-                    binary: &claude.binary,
-                    remote_binary: "/sandbox/claude",
+                    remote_binary: "/opt/tyrion/harness/claude",
                     binary_environment: "Claude",
                     version: &claude.version,
                 })
@@ -718,8 +681,7 @@ impl ContainedCodexRuntime {
                     )
                 })?;
                 Ok(StructuredRuntimeProfile {
-                    binary: &pi.binary,
-                    remote_binary: "/sandbox/pi",
+                    remote_binary: "/opt/tyrion/harness/pi",
                     binary_environment: "Pi",
                     version: &pi.version,
                 })
@@ -911,18 +873,8 @@ impl ContainedCodexRuntime {
                 assignment.lease_expires_at,
             )?;
         }
-        sandbox.upload(
-            &self.config.codex_binary,
-            "/sandbox/codex",
-            assignment.lease_expires_at,
-        )?;
-        sandbox.exec_checked(
-            &["chmod", "700", "/sandbox/codex"],
-            None,
-            assignment.lease_expires_at,
-        )?;
         let codex = sandbox.exec_checked(
-            &["/sandbox/codex", "--version"],
+            &["/opt/tyrion/harness/codex", "--version"],
             None,
             assignment.lease_expires_at,
         )?;
@@ -2057,18 +2009,19 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
             "Codex Worker configuration does not match the pinned Codex version".into(),
         ));
     }
-    // Decided 2026-09-25 from real measurements: ten concurrent Codex Workers
-    // each peaked near 570 MiB and 0.14 cores. The ceilings contain a runaway;
-    // the requests are what admission reserves. See docs/worker-capacity.md.
+    // Decided from real measurements: with the harnesses built into the image,
+    // ten concurrent Codex Workers each peaked at 255-293 MiB and 0.1 cores.
+    // The ceilings contain a runaway; the requests are what admission
+    // reserves. See docs/worker-capacity.md.
     if config.vcpus != 2
         || config.memory_mib != 3072
         || config.writable_storage_mib != 2048
         || config.max_processes != 256
-        || config.memory_request_mib != 640
+        || config.memory_request_mib != 320
         || config.cpu_request_millis != 250
     {
         return Err(TyrionError::InvalidRequest(
-            "Worker containment must use ceilings of 2 vCPUs, 3072 MiB combined memory, 2048 MiB writable storage, and 256 processes, with requests of 640 MiB and 250 millicores; rerun `tyrion init`".into(),
+            "Worker containment must use ceilings of 2 vCPUs, 3072 MiB combined memory, 2048 MiB writable storage, and 256 processes, with requests of 320 MiB and 250 millicores; rerun `tyrion init`".into(),
         ));
     }
     if config.writable_storage_mib >= config.memory_mib {
@@ -2135,17 +2088,12 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
         }
     }
     verify_hash(&config.docker_binary, &config.docker_sha256)?;
-    verify_hash(&config.codex_binary, &config.codex_sha256)?;
-    if let Some(host) = &config.codex_code_mode_host {
-        verify_hash(&host.path, &host.sha256)?;
-    }
     if let Some(claude) = &config.claude {
         if claude.version.trim().is_empty() {
             return Err(TyrionError::InvalidRequest(
                 "the Claude runtime profile requires a pinned version".into(),
             ));
         }
-        verify_hash(&claude.binary, &claude.sha256)?;
     }
     if let Some(pi) = &config.pi {
         if pi.model_provider != "openai"
@@ -2157,7 +2105,6 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
                 "the Pi runtime profile requires the qualified OpenAI provider and model".into(),
             ));
         }
-        verify_hash(&pi.binary, &pi.sha256)?;
     }
     let version = Command::new(&config.docker_binary)
         .arg("--version")
@@ -2508,7 +2455,7 @@ git -C "$root/repository" checkout -q --detach {base}
 {auth_setup}
 env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/home/.codex" \
   TMPDIR="$root/tmp" $codex_credential_env \
-  "$root/codex" exec --json --ephemeral --ignore-user-config \
+  "${{TYRION_HARNESS_ROOT:-/opt/tyrion/harness}}/codex" exec --json --ephemeral --ignore-user-config \
   --dangerously-bypass-approvals-and-sandbox -C "$root/repository" \
   --model {model} --output-schema "$root/result-schema.json" \
   --output-last-message "$root/codex-result.json" - \

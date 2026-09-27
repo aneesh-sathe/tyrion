@@ -1,7 +1,7 @@
 # Worker capacity
 
 How many Workers Tyrion runs at once, and why the numbers are what they are.
-Decided 2026-09-26 from measurement.
+Decided 2026-09-26 from measurement, and revised 2026-09-27 after the harnesses moved into the image.
 
 ## The decision
 
@@ -10,14 +10,14 @@ Every Worker has two sets of numbers.
 | | CPU | Memory | Files | Processes |
 | --- | --- | --- | --- | --- |
 | **Ceiling**, enforced by the container runtime | 2 vCPUs | 3072 MiB | 2048 MiB | 256 |
-| **Request**, reserved by admission | 0.25 CPU | 640 MiB | | |
+| **Request**, reserved by admission | 0.25 CPU | 320 MiB | | |
 
 Admission sums the requests of every running Worker, across all Commissions,
 against what the container runtime reports, less 1024 MiB kept back for the
 engine and the egress relays. The ceilings contain a Worker that runs away.
 
-On a 12-CPU Docker VM with 7.7 GiB that admits **10 Workers at once**. With
-16 GiB it admits 24. Memory binds long before CPU.
+On a 12-CPU Docker VM with 7.7 GiB that admits **21 Workers at once**. With
+16 GiB, CPU binds first at 48.
 
 The previous profile was 2 vCPUs and 6144 MiB, reserved in full. It came from
 the retired OpenShell MicroVM and was never measured. On the same machine it
@@ -36,20 +36,26 @@ second.
 | Serial | 1 | measured | 576-604 MiB | | 0.05 avg, 0.32 max |
 | Concurrent | 6 | 6/6 accepted | 568-582 MiB | 3233 MiB | 0.04 avg, 0.17 max |
 | Concurrent | 10 | 10/10 accepted | 537-570 MiB | 5127 MiB | 0.04 avg, 0.14 max |
-| **Default admission** | **10** | **10/10 accepted** | **554-581 MiB** | **5144 MiB** | **0.04 avg, 0.11 max** |
+| Default admission | 10 | 10/10 accepted | 554-581 MiB | 5144 MiB | 0.04 avg, 0.11 max |
+| **Harnesses in the image** | **10** | **10/10 accepted, 0 failed Evidence** | **255-293 MiB** | **1794 MiB** | **0.02 avg, 0.10 max** |
 
-The last run used no capacity override: the daemon admitted all ten from
-Docker's own figures. 565 seconds of Worker execution finished in a 64-second
-parallel window, 8.8 times faster than serial, and every result passed both
-candidate and integrated verification. The Commission record is
+The first four runs streamed the Codex and code-mode-host binaries into each
+Worker's tmpfs: 328 MiB of memory-charged files per Worker, identical in every
+one. The default-admission run used no capacity override (the daemon admitted
+all ten from Docker's own figures) and finished 565 seconds of Worker execution
+in a 64-second window, 8.8 times faster than serial. Its record is
 [`dogfood-records/2026-09-26-ten-concurrent-workers.json`](dogfood-records/2026-09-26-ten-concurrent-workers.json).
 
-A Worker's peak splits into roughly:
+The last run built the harnesses into the read-only image instead, so every
+container shares one copy. A Worker's peak now splits into roughly:
 
 - 150-190 MiB of process memory
-- 328 MiB of files in its `/sandbox` tmpfs, almost all of it the Codex and
-  code-mode-host binaries streamed in per Attempt
-- about 330 MiB of reclaimable page cache
+- 32 MiB of files in its `/sandbox` tmpfs: the repository and its work
+- about 35 MiB of reclaimable page cache
+
+That halved each Worker, cut ten Workers from 5.1 GiB to 1.8 GiB, and let the
+request fall from 640 MiB to 320 MiB. 454 seconds of Worker execution finished
+in a 65-second window, 7 times faster than serial.
 
 Per-Worker memory did not grow with concurrency, so there was no hidden
 contention cost. CPU was never the constraint: a Worker spends its time
@@ -64,7 +70,7 @@ because `npm install` or a large test suite needs far more than a small Python
 change.
 
 Separating the two is the standard answer. The request is what a Worker is
-expected to use, taken from the measured 570 MiB peak with headroom. The
+expected to use, taken from the measured 293 MiB peak with headroom. The
 ceiling keeps one runaway to 3 GiB, under 40% of this machine, so it cannot
 starve the rest.
 
@@ -79,9 +85,6 @@ VM. The Attempt fails, and recovery treats it like any other failure.
 - **Heavier work is unmeasured.** These were small Python changes. A Worker
   building a large project will use more of its ceiling. Declare a heavier
   `containment_resources` request on that Worker Configuration.
-- **The binaries are copied per Worker.** 328 MiB of every Worker is the
-  harness binaries in its tmpfs. Baking them into the read-only image layer
-  would share them across containers and roughly halve the request.
 - **Model rate limits.** Ten concurrent Codex Workers on one ChatGPT
   subscription hit no limit here; a larger factory might.
 

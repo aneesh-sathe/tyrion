@@ -290,7 +290,14 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert!(log.contains("--env PYTHONPATH=/opt/tyrion"));
     assert!(log.contains("tyrion-containment-probe"));
     assert!(log.contains("descendant-terminated"));
-    assert!(log.contains("/sandbox/codex --version"));
+    // The harness runs from the Worker image; no Worker receives its own copy.
+    // The positive control proves the upload pattern is what the log records.
+    assert!(log.contains("/opt/tyrion/harness/codex --version"));
+    assert!(
+        log_plain.contains("cat > '/sandbox/base.bundle'"),
+        "{log_plain}"
+    );
+    assert!(!log_plain.contains("cat > '/sandbox/codex'"), "{log_plain}");
     assert!(!log.lines().any(|line| {
         line.contains("exec --interactive") && line.contains(path_text(&principal_checkout))
     }));
@@ -755,9 +762,9 @@ fn concurrent_workers_are_pinned_to_disjoint_cpus_and_capacity_is_inspectable() 
     assert_eq!(host["source"], "container_runtime");
     assert_eq!(host["cpus"], 16);
     assert_eq!(host["usable_memory_mib"], 32768 - 1024);
-    assert_eq!(host["default_worker_request"]["memory_mib"], 640);
-    // min(16000 / 250 millicores, 31744 / 640 MiB) Workers at the pinned request.
-    assert_eq!(host["derived_worker_ceiling"], 49);
+    assert_eq!(host["default_worker_request"]["memory_mib"], 320);
+    // min(16000 / 250 millicores, 31744 / 320 MiB) Workers at the pinned request.
+    assert_eq!(host["derived_worker_ceiling"], 64);
     assert_eq!(
         host["reserved"]["memory_mib"], 0,
         "finished Workers hold nothing"
@@ -783,9 +790,9 @@ fn host_capacity_holds_workers_the_machine_cannot_run_together() {
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
     // The Commission allows two concurrent Workers, but the declared host has
-    // room for exactly one: 2000 MiB less the 1024 MiB reserve holds one
-    // 640 MiB request, not two.
-    let (daemon, _fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "2000"]);
+    // room for exactly one: 1500 MiB less the 1024 MiB reserve holds one
+    // 320 MiB request, not two.
+    let (daemon, _fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "1500"]);
     let attachment_token = connect_full_entry(&daemon);
     let proposal_path = temp.path().join("parallel-proposal.json");
     write_parallel_git_proposal(&proposal_path, &principal_checkout, &base_revision);
@@ -821,11 +828,11 @@ fn host_capacity_holds_workers_the_machine_cannot_run_together() {
     let (inspected, hold) = held;
     assert_eq!(inspected["host_capacity"]["source"], "principal");
     assert_eq!(inspected["host_capacity"]["derived_worker_ceiling"], 1);
-    assert_eq!(inspected["host_capacity"]["reserved"]["memory_mib"], 640);
+    assert_eq!(inspected["host_capacity"]["reserved"]["memory_mib"], 320);
     let detail = hold["detail"].as_str().unwrap();
     assert!(
-        detail.contains("Expected to use 0.25 CPUs and 640 MiB")
-            && detail.contains("976 MiB for Workers"),
+        detail.contains("Expected to use 0.25 CPUs and 320 MiB")
+            && detail.contains("476 MiB for Workers"),
         "{detail}"
     );
 
@@ -844,8 +851,8 @@ fn a_worker_profile_the_host_can_never_run_blocks_with_the_exact_requirement() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");
     let base_revision = create_principal_repository(&principal_checkout);
-    // 1500 MiB less the 1024 MiB reserve cannot hold one 640 MiB request.
-    let (daemon, fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "1500"]);
+    // 1300 MiB less the 1024 MiB reserve cannot hold one 320 MiB request.
+    let (daemon, fake_state) = fixture_daemon(&temp, &["--host-memory-mib", "1300"]);
     let attachment_token = connect_full_entry(&daemon);
     let proposal_path = temp.path().join("proposal.json");
     write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
@@ -869,10 +876,10 @@ fn a_worker_profile_the_host_can_never_run_blocks_with_the_exact_requirement() {
     };
     let requirement = blocker["requirement"].as_str().unwrap();
     assert!(
-        requirement.contains("expected to use 0.25 CPUs and 640 MiB"),
+        requirement.contains("expected to use 0.25 CPUs and 320 MiB"),
         "{requirement}"
     );
-    assert!(requirement.contains("476 MiB for Workers"), "{requirement}");
+    assert!(requirement.contains("276 MiB for Workers"), "{requirement}");
     assert!(requirement.contains("--host-memory-mib"), "{requirement}");
     // Nothing was started only to be killed.
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap_or_default();
@@ -1760,7 +1767,7 @@ fn guest_codex_version_mismatch_is_rejected_before_execution() {
         .contains("Codex binary version does not match its pin"));
 
     let log = fs::read_to_string(fixture.fake_state.join("commands.log")).unwrap();
-    assert!(log.contains("/sandbox/codex --version"));
+    assert!(log.contains("/opt/tyrion/harness/codex --version"));
     assert!(!log.contains("run-attempt.sh"));
 }
 
@@ -2600,6 +2607,7 @@ fn git_output(path: &Path, arguments: &[&str]) -> String {
 }
 
 fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path) -> PathBuf {
+    install_in_image(root, "codex", codex);
     let config = root.join("codex-worker.json");
     fs::write(
         &config,
@@ -2610,12 +2618,10 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path) -> PathBuf {
             "docker_host": "unix:///fixture/docker.sock",
             "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
             "worker_image_id": format!("sha256:{}", "1".repeat(64)),
-            "codex_binary": codex,
             "codex_version": "codex-cli 0.156.1",
-            "codex_sha256": sha256_file(codex),
             "model": "fixture-model",
             "lease_ttl_seconds": 30,
-            "memory_request_mib": 640,
+            "memory_request_mib": 320,
             "cpu_request_millis": 250,
             "vcpus": 2,
             "memory_mib": 3072,
@@ -2633,13 +2639,19 @@ fn add_claude_runtime_fixture(root: &Path, runtime: &Path) {
         &root.join("claude"),
         include_str!("fixtures/fake_claude.sh"),
     );
+    install_in_image(root, "claude", &claude);
     let mut config: Value = serde_json::from_slice(&fs::read(runtime).unwrap()).unwrap();
-    config["claude"] = json!({
-        "binary": claude,
-        "version": "2.1.204 (Claude Code)",
-        "sha256": sha256_file(&claude)
-    });
+    config["claude"] = json!({"version": "2.1.204 (Claude Code)"});
     fs::write(runtime, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+/// Put a harness binary where the Worker image carries it: the fake Docker
+/// runs `/opt/tyrion/harness/<name>` from this directory.
+fn install_in_image(root: &Path, name: &str, binary: &Path) {
+    let harness = root.join("fake-docker").join("image").join("harness");
+    fs::create_dir_all(&harness).unwrap();
+    fs::copy(binary, harness.join(name)).unwrap();
+    fs::set_permissions(harness.join(name), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn write_executable(path: &Path, contents: &str) -> PathBuf {

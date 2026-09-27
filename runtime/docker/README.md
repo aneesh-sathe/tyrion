@@ -47,22 +47,22 @@ launched anything else.
 | `egress` | Omit for no network at all. Otherwise exactly the destinations a Worker may reach, each behind its own destination-pinned relay on a per-Attempt internal bridge. |
 | `worker_credentials` | Names of environment variables `tyriond` was started with that may be forwarded into a Worker execution. Empty by default: availability on the host is not permission to use it. |
 | `vcpus`, `memory_mib`, `writable_storage_mib`, `max_processes` | The containment ceilings. Only `2 / 3072 / 2048 / 256` is accepted. |
-| `memory_request_mib`, `cpu_request_millis` | What a Worker is expected to use, which admission reserves. Only `640 / 250` is accepted. |
+| `memory_request_mib`, `cpu_request_millis` | What a Worker is expected to use, which admission reserves. Only `320 / 250` is accepted. |
 
 ## Host capacity
 
 Every Worker has two sets of numbers. Its **ceilings** (2 vCPUs, 3072 MiB,
 2048 MiB of files, 256 processes) are enforced by the container runtime and
-contain a runaway. Its **requests** (0.25 CPU, 640 MiB) are what it is expected
+contain a runaway. Its **requests** (0.25 CPU, 320 MiB) are what it is expected
 to use, and are what admission reserves. They come from measurement: ten real
-Codex Workers running at once each peaked near 570 MiB and 0.14 cores. See
+Codex Workers running at once each peaked at 255-293 MiB and 0.1 cores. See
 [`docs/worker-capacity.md`](../../docs/worker-capacity.md).
 
 At startup the daemon asks the container runtime how many CPUs and how much
 memory it has (on macOS that is the Docker VM, not the Mac), keeps 1024 MiB back
 for the engine and the egress relays, and admits a Worker only while the sum of
 every running Worker's requests fits, across all Commissions. A 12-CPU Docker VM
-with 7.7 GiB admits 10; one with 16 GiB admits 24. Each running container is
+with 7.7 GiB admits 21; with 16 GiB, CPU binds first at 48. Each running container is
 pinned to the least loaded CPUs the runtime really has.
 
 If several Workers exceed their requests at once and the container runtime

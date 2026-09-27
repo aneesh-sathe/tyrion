@@ -66,8 +66,8 @@ Every claim below was measured against real models, with a checked-in record in
 - Codex and Claude running **concurrently** on disjoint work, producing one
   verified integrated artifact and beating serial execution by 20.1 seconds.
 - **Ten** real Codex Workers at once on one Mac, admitted by Tyrion from the
-  machine's own capacity: 10/10 verified, 8.8 times faster than serial, 5.1 GiB
-  at peak. See [Worker capacity](docs/worker-capacity.md).
+  machine's own capacity: 10/10 verified, 7 times faster than serial, 1.8 GiB
+  at peak. The same Mac admits 21. See [Worker capacity](docs/worker-capacity.md).
 - Candidate and integrated verification, each in a separate fresh container.
 - Interruption, and restart recovery against a Worker container genuinely
   orphaned by killing the daemon mid-Attempt.
@@ -120,7 +120,7 @@ rerun:
   5/6  configuration     ~/.local/state/tyrion/runtime/worker-runtime.json
   6/6  daemon            started on this runtime, Entry Session attached (1.5s)
 
-  capacity        10 Codex Workers at once (640 MiB expected each, 3 GiB ceiling)
+  capacity        21 Codex Workers at once (320 MiB expected each, 3 GiB ceiling)
   claude workers  on, authenticated by CLAUDE_CODE_OAUTH_TOKEN
   codex workers   on, authenticated by ~/.codex/auth.json
 

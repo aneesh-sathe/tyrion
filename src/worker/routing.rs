@@ -1069,7 +1069,7 @@ mod tests {
             memory_mib: 3072,
             writable_storage_mib: 2048,
             max_processes: 256,
-            memory_request_mib: 640,
+            memory_request_mib: 320,
             cpu_request_millis: 250,
         }
     }
