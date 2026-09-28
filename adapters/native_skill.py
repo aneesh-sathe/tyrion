@@ -1,6 +1,7 @@
 """Shared exact package identity for Tyrion's native Skill adapters."""
 
 import hashlib
+import json
 import os
 
 
@@ -19,6 +20,28 @@ RUNTIME_BYPRODUCTS = (
     "node_modules/",
     ".DS_Store",
 )
+
+
+def context_packet_lines(launch):
+    """The model's view of its Worker Context Packet: the Commission's binding
+    constraints, then the Principal's learned preferences as advisory context.
+    Goal, criteria and authority are already in the prompt; repeating the whole
+    packet would only spend context."""
+    packet = launch.get("worker_context_packet") or {}
+    lines = []
+    constraints = (packet.get("binding") or {}).get("commission_constraints") or []
+    if constraints:
+        lines.append(
+            f"Commission constraints (binding): {json.dumps(constraints, separators=(',', ':'))}"
+        )
+    claims = (packet.get("advisory") or {}).get("profile_claims") or []
+    if claims:
+        lines.append(
+            "The Principal's learned preferences (advisory; the goal, constraints and "
+            "criteria above take precedence):"
+        )
+        lines.extend(f"- {claim['statement']}" for claim in claims)
+    return lines
 
 
 def exclude_runtime_byproducts(repository):

@@ -11,6 +11,7 @@ import tempfile
 import threading
 
 from native_skill import (
+    context_packet_lines,
     RequiredSkillFailure,
     exclude_runtime_byproducts,
     skill_content_digest,
@@ -105,6 +106,7 @@ def prompt(launch):
             f"Acceptance criteria: {json.dumps(launch['criteria'], separators=(',', ':'))}",
             f"Authority Envelope: {json.dumps(launch['authority'], separators=(',', ':'))}",
             f"Declared write scopes: {json.dumps(launch['declared_write_scopes'])}",
+            *context_packet_lines(launch),
             "Do not cause external effects. Respect every scope and resource ceiling.",
             "Return JSON with a non-empty summary and known_effects as an empty array.",
         ]

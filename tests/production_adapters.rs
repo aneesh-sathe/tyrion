@@ -1023,3 +1023,60 @@ fn git(repository: &Path, arguments: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Every adapter must hand the model the binding Commission constraints and the
+/// advisory learned preferences from its Worker Context Packet. Otherwise a
+/// Learning Receipt records a preference as applied to a model that never saw it.
+#[test]
+fn every_adapter_prompt_carries_constraints_and_learned_preferences() {
+    let temp = TempDir::new().unwrap();
+    // The Claude adapter imports the SDK at module load; the prompt needs none of it.
+    fs::write(
+        temp.path().join("claude_agent_sdk.py"),
+        "AssistantMessage = ClaudeAgentOptions = ClaudeSDKClient = ResultMessage = SystemMessage = TextBlock = ToolUseBlock = object\n",
+    )
+    .unwrap();
+    let adapters = Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters");
+    let mut launch = launch("codex_app_server", "gpt-fixture");
+    launch["worker_context_packet"] = json!({
+        "version": 1,
+        "binding": {"commission_constraints": ["Do not add third-party dependencies."]},
+        "advisory": {"profile_claims": [
+            {"statement": "Give every public function a docstring.", "advisory": true}
+        ]}
+    });
+    for (module, function) in [
+        ("codex_app_server", "prompt"),
+        ("claude_sdk_adapter", "prompt"),
+        ("opencode_server", "prompt"),
+        ("pi_rpc_adapter", "assignment_prompt"),
+    ] {
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "import json, sys; import {module}; print({module}.{function}(json.loads(sys.argv[1])))"
+            ))
+            .arg(launch.to_string())
+            .env(
+                "PYTHONPATH",
+                format!("{}:{}", adapters.display(), temp.path().display()),
+            )
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{module}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let prompt = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            prompt.contains("Do not add third-party dependencies."),
+            "{module} drops the binding constraints:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- Give every public function a docstring."),
+            "{module} drops the learned preferences:\n{prompt}"
+        );
+    }
+}

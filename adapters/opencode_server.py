@@ -23,7 +23,11 @@ import threading
 import time
 import urllib.request
 
-from native_skill import RequiredSkillFailure, exclude_runtime_byproducts
+from native_skill import (
+    RequiredSkillFailure,
+    context_packet_lines,
+    exclude_runtime_byproducts,
+)
 
 # A settled turn with no event for this long is treated as hung.
 ABORT_GRACE_SECONDS = 20
@@ -188,6 +192,7 @@ def prompt(launch):
             f"Acceptance criteria: {json.dumps(launch['criteria'], separators=(',', ':'))}",
             f"Authority Envelope: {json.dumps(launch['authority'], separators=(',', ':'))}",
             f"Declared write scopes: {json.dumps(launch['declared_write_scopes'])}",
+            *context_packet_lines(launch),
             "Do not cause external effects. Respect every scope and resource ceiling.",
             "Finish with a JSON object: a non-empty summary and known_effects as an empty array.",
         ]

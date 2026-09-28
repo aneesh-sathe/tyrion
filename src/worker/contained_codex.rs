@@ -2639,7 +2639,7 @@ fn worker_prompt(assignment: &AssignmentContext, base_revision: &str) -> String 
         })
         .collect::<Vec<_>>();
     format!(
-        "Implement this Assignment in the current Git repository.\n\nGoal: {}\n\nMandate revision: {}\nPlan revision: {}\nImmutable base: {}\nAllowed changed paths: {}\nCompeting candidate bundles and Evidence: {}\n\nWhen candidate bundles are present, inspect each Git bundle and apply the declared comparison rule before editing. Do not use credentials or perform external effects. The authorized repository edit is the Result artifact, not an external effect, so known_effects must be an empty array. Return only the required structured final response.",
+        "Implement this Assignment in the current Git repository.\n\nGoal: {}\n\nMandate revision: {}\nPlan revision: {}\nImmutable base: {}\nAllowed changed paths: {}\nCompeting candidate bundles and Evidence: {}\n{}\nWhen candidate bundles are present, inspect each Git bundle and apply the declared comparison rule before editing. Do not use credentials or perform external effects. The authorized repository edit is the Result artifact, not an external effect, so known_effects must be an empty array. Return only the required structured final response.",
         assignment.goal,
         assignment.mandate_revision,
         assignment.plan_revision,
@@ -2647,7 +2647,40 @@ fn worker_prompt(assignment: &AssignmentContext, base_revision: &str) -> String 
         assignment.declared_write_scopes.join(", "),
         serde_json::to_string(&comparison_candidates)
             .expect("comparison candidate metadata is serializable"),
+        context_packet_text(&assignment.worker_context_packet),
     )
+}
+
+/// The model's view of its Worker Context Packet, as every structured adapter
+/// renders it: binding Commission constraints, then the Principal's learned
+/// preferences as advisory context. Goal, criteria and scope are already in
+/// the prompt.
+fn context_packet_text(packet: &Value) -> String {
+    let mut text = String::new();
+    if let Some(constraints) = packet["binding"]["commission_constraints"]
+        .as_array()
+        .filter(|constraints| !constraints.is_empty())
+    {
+        text.push_str(&format!(
+            "Commission constraints (binding): {}\n",
+            Value::Array(constraints.clone())
+        ));
+    }
+    let statements = packet["advisory"]["profile_claims"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|claim| claim["statement"].as_str())
+        .collect::<Vec<_>>();
+    if !statements.is_empty() {
+        text.push_str(
+            "The Principal's learned preferences (advisory; the goal, constraints and criteria above take precedence):\n",
+        );
+        for statement in statements {
+            text.push_str(&format!("- {statement}\n"));
+        }
+    }
+    text
 }
 
 fn result_schema() -> &'static [u8] {
@@ -3007,6 +3040,21 @@ mod tests {
         attempt_script, is_content_addressed, is_image_id, result_schema,
         symlink_escapes_repository, RUNTIME_BYPRODUCTS,
     };
+
+    #[test]
+    fn the_prompt_carries_constraints_then_advisory_preferences() {
+        let packet = serde_json::json!({
+            "binding": {"commission_constraints": ["Do not add third-party dependencies."]},
+            "advisory": {"profile_claims": [{"statement": "Give every public function a docstring."}]}
+        });
+        assert_eq!(
+            super::context_packet_text(&packet),
+            "Commission constraints (binding): [\"Do not add third-party dependencies.\"]\n\
+             The Principal's learned preferences (advisory; the goal, constraints and criteria above take precedence):\n\
+             - Give every public function a docstring.\n"
+        );
+        assert_eq!(super::context_packet_text(&serde_json::json!({})), "");
+    }
 
     #[test]
     fn a_jwt_expiry_is_read_without_a_base64_dependency() {
