@@ -15437,12 +15437,7 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
                     "codex_git base_revision must be a full hexadecimal Git object id".into(),
                 ));
             }
-            if !proposal.authority.destinations.is_empty() || !proposal.authority.effects.is_empty()
-            {
-                return Err(TyrionError::InvalidRequest(
-                    "the contained codex_git slice does not permit external effects".into(),
-                ));
-            }
+            validate_codex_git_effects(proposal, repository)?;
         }
     }
     let sqlite_integer_max = i64::MAX as u64;
@@ -15481,6 +15476,56 @@ fn validate_proposal(proposal: &CommissionProposal) -> Result<(), TyrionError> {
         if proposal.resource_ceilings.max_attempts < 2 {
             return Err(TyrionError::InvalidRequest(
                 "planning needs max_attempts of at least 2: one to plan and one per Assignment it proposes"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A coding Commission may carry exactly one kind of consequential effect: a
+/// local `filesystem.write` the daemon performs itself behind an Approval
+/// Gate. Workers never receive it. Its target directory must lie wholly
+/// outside the Principal checkout, which stays an input and never a workspace.
+fn validate_codex_git_effects(
+    proposal: &CommissionProposal,
+    repository: &str,
+) -> Result<(), TyrionError> {
+    let authority = &proposal.authority;
+    if authority.effects.is_empty() && authority.destinations.is_empty() {
+        return Ok(());
+    }
+    if authority
+        .effects
+        .iter()
+        .any(|effect| effect != "filesystem.write")
+        || authority
+            .destinations
+            .iter()
+            .any(|destination| destination != "local")
+        || !authority
+            .actions
+            .iter()
+            .any(|action| action == "filesystem.write")
+    {
+        return Err(TyrionError::InvalidRequest(
+            "a codex_git Commission permits only the local filesystem.write effect, with the filesystem.write action and the local destination".into(),
+        ));
+    }
+    let checkout = Path::new(repository).canonicalize()?;
+    for target in authority
+        .repositories
+        .iter()
+        .filter(|value| *value != repository)
+    {
+        let target = Path::new(target).canonicalize().map_err(|error| {
+            TyrionError::InvalidRequest(format!(
+                "filesystem.write target directory cannot be resolved: {error}"
+            ))
+        })?;
+        if target.starts_with(&checkout) || checkout.starts_with(&target) {
+            return Err(TyrionError::InvalidRequest(
+                "a filesystem.write target directory must lie outside the Principal checkout"
                     .into(),
             ));
         }

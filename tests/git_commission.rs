@@ -74,6 +74,54 @@ impl RunningDaemon {
         daemon
     }
 
+    /// Start with the Principal control credential delivered once over a
+    /// private pipe, as `tyriond --principal-control-bootstrap-fd` does.
+    fn start_with_principal(data_dir: &Path, worker_config: &Path) -> (Self, String) {
+        use std::os::unix::io::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        let socket_path = data_dir.join("tyrion.sock");
+        let mut descriptors = [0_i32; 2];
+        // SAFETY: pipe initializes both descriptors, which are closed exactly once below.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let read_fd = descriptors[0];
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tyriond"));
+        command.args([
+            "--data-dir",
+            path_text(data_dir),
+            "--socket",
+            path_text(&socket_path),
+            "--codex-worker-config",
+            path_text(worker_config),
+            "--principal-control-bootstrap-fd",
+            &descriptors[1].to_string(),
+        ]);
+        // SAFETY: close is async-signal-safe and removes the read end from the child.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::close(read_fd) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = command.spawn().expect("daemon should start");
+        // SAFETY: the child inherited the write end and the parent no longer needs it.
+        assert_eq!(unsafe { libc::close(descriptors[1]) }, 0);
+        // SAFETY: the parent owns the read end until the File drops it.
+        let pipe = unsafe { fs::File::from_raw_fd(read_fd) };
+        let mut line = String::new();
+        BufReader::new(pipe).read_line(&mut line).unwrap();
+        let principal = line
+            .trim()
+            .strip_prefix("TYRION_PRINCIPAL_CONTROL_TOKEN=")
+            .expect("daemon should emit the Principal credential")
+            .to_owned();
+        let mut daemon = Self { child, socket_path };
+        daemon.wait_until_ready();
+        (daemon, principal)
+    }
+
     fn wait_until_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -233,6 +281,168 @@ fn contained_codex_receives_the_subscription_login() {
     // The login travelled over stdin, never on a Docker command line.
     let log = fs::read_to_string(fake_state.join("commands.log")).unwrap();
     assert!(!log.contains("fixture-refresh"));
+}
+
+#[test]
+fn a_coding_commission_performs_one_approved_local_effect_outside_the_checkout() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let effect_dir = temp.path().join("effect-target");
+    fs::create_dir(&effect_dir).unwrap();
+    fs::write(effect_dir.join("effect.txt"), "before\n").unwrap();
+    let fake_state = temp.path().join("fake-docker");
+    fs::create_dir(&fake_state).unwrap();
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
+    );
+    let fake_codex = write_executable(
+        &temp.path().join("codex"),
+        include_str!("fixtures/fake_codex.sh"),
+    );
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let (daemon, principal) = RunningDaemon::start_with_principal(&data_dir, &runtime);
+    let attachment_token = connect_full_entry(&daemon);
+
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    // Hold the Worker long enough to approve and perform the effect.
+    proposal["goal"] =
+        json!("TYRION_FIXTURE_DELAY=8 Add issue-4.txt containing contained codex result.");
+    proposal["authority"]["repositories"] = json!([principal_checkout, effect_dir]);
+    proposal["authority"]["paths"] = json!(["issue-4.txt", "effect.txt"]);
+    proposal["authority"]["actions"] = json!(["codex.git_change", "filesystem.write"]);
+    proposal["authority"]["destinations"] = json!(["local"]);
+    proposal["authority"]["effects"] = json!(["filesystem.write"]);
+
+    // The Principal checkout is never an effect target, however it is named.
+    let mut inside = proposal.clone();
+    inside["authority"]["repositories"] =
+        json!([principal_checkout, principal_checkout.join(".git")]);
+    fs::write(&proposal_path, serde_json::to_vec_pretty(&inside).unwrap()).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args(["--socket", path_text(&daemon.socket_path)])
+        .args([
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+        ])
+        .args([
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "inside",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("outside the Principal checkout"));
+
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let running = loop {
+        let state = inspect_commission(&daemon, &attachment_token, &commission_id);
+        if state["attempts"][0]["status"] == "running" {
+            break state;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let attempt = &running["attempts"][0];
+    let operation = json!({
+        "assignment_id": attempt["assignment_id"],
+        "attempt_id": attempt["id"],
+        "worker_lease_id": attempt["lease"]["id"],
+        "mandate_revision": 1,
+        "plan_revision": 1,
+        "operation": "filesystem.write",
+        "repository": effect_dir,
+        "target": "effect.txt",
+        "parameters": {"content": "after\n"},
+        "destination": "local",
+        "effect": "filesystem.write",
+        "consequences": ["Replace effect.txt outside the Principal checkout"],
+        "limits": {"max_output_bytes": 1024, "max_duration_seconds": 5}
+    });
+    let operation_path = temp.path().join("operation.json");
+    fs::write(
+        &operation_path,
+        serde_json::to_vec_pretty(&operation).unwrap(),
+    )
+    .unwrap();
+    let gated = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "operation",
+            "propose",
+            &commission_id,
+            "--file",
+            path_text(&operation_path),
+            "--expected-revision",
+            "1",
+            "--idempotency-key",
+            "propose-effect",
+        ],
+    );
+    let gate = &gated["approval_gates"][0];
+    assert_eq!(gate["status"], "open");
+    assert_eq!(
+        fs::read_to_string(effect_dir.join("effect.txt")).unwrap(),
+        "before\n"
+    );
+    run_principal_cli(
+        &daemon.socket_path,
+        &principal,
+        &[
+            "principal",
+            "approve-gate",
+            &commission_id,
+            gate["id"].as_str().unwrap(),
+            "--expected-operation-digest",
+            gate["operation_digest"].as_str().unwrap(),
+            "--expected-revision",
+            "1",
+            "--idempotency-key",
+            "approve-effect",
+        ],
+    );
+    run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "operation",
+            "execute",
+            &commission_id,
+            gate["id"].as_str().unwrap(),
+            "--file",
+            path_text(&operation_path),
+            "--expected-revision",
+            "1",
+            "--idempotency-key",
+            "execute-effect",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(effect_dir.join("effect.txt")).unwrap(),
+        "after\n"
+    );
+
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    assert_eq!(completed["run_report"]["approval_gates"]["consumed"], 1);
+    assert!(!principal_checkout.join("issue-4.txt").exists());
+    assert!(!principal_checkout.join("effect.txt").exists());
 }
 
 #[test]
@@ -3252,6 +3462,23 @@ fn run_cli(socket_path: &Path, arguments: &[&str]) -> Value {
             .output()
             .expect("CLI should run"),
     )
+}
+
+fn run_principal_cli(socket_path: &Path, principal: &str, arguments: &[&str]) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args([
+            "--socket",
+            path_text(socket_path),
+            "--principal-token-stdin",
+        ])
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Principal CLI should run");
+    writeln!(child.stdin.as_mut().unwrap(), "{principal}").unwrap();
+    successful_json(child.wait_with_output().unwrap())
 }
 
 fn successful_json(output: Output) -> Value {
