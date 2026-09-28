@@ -7,7 +7,10 @@ use crate::{ErrorCode, TyrionError};
 
 pub const PROTOCOL_VERSION: u16 = 2;
 
+/// Unknown fields are refused: a misspelled constraint or ceiling must fail
+/// loudly rather than vanish from the accepted mandate.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CommissionProposal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
@@ -248,6 +251,7 @@ pub struct CompetitionPlan {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptanceCriterion {
     pub id: String,
     pub description: String,
@@ -372,6 +376,7 @@ pub struct VerificationEvidenceSubmission {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationAmendment {
     pub criteria: Vec<AcceptanceCriterion>,
 }
@@ -396,6 +401,7 @@ pub enum ExecutionSpec {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityEnvelope {
     #[serde(default)]
     pub repositories: Vec<String>,
@@ -410,6 +416,7 @@ pub struct AuthorityEnvelope {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceCeilings {
     pub max_attempts: u32,
     pub max_elapsed_seconds: u64,

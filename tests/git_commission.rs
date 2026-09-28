@@ -446,6 +446,136 @@ fn a_coding_commission_performs_one_approved_local_effect_outside_the_checkout()
 }
 
 #[test]
+fn every_accepted_planned_attempt_reports_its_applied_preference() {
+    let fixture = ParallelFixture::new();
+    let (daemon, principal) =
+        RunningDaemon::start_with_principal(&fixture.data_dir, &fixture.runtime);
+    let attachment_token = connect_full_entry(&daemon);
+
+    // A preference learned from an earlier Commission in the same project.
+    let source_path = fixture.temp.path().join("source.json");
+    write_git_proposal(
+        &source_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut source: Value = serde_json::from_slice(&fs::read(&source_path).unwrap()).unwrap();
+    source["project_id"] = json!("fixture-project");
+    fs::write(&source_path, serde_json::to_vec_pretty(&source).unwrap()).unwrap();
+    let source = run_cli(
+        &daemon.socket_path,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+            "--file",
+            path_text(&source_path),
+            "--idempotency-key",
+            "create-source",
+        ],
+    );
+    let claim = run_principal_cli(
+        &daemon.socket_path,
+        &principal,
+        &[
+            "--attachment-token",
+            &attachment_token,
+            "principal",
+            "remember-preference",
+            source["commission"]["id"].as_str().unwrap(),
+            "--statement",
+            "Give every public function a one-line docstring.",
+            "--idempotency-key",
+            "remember",
+        ],
+    )["claim"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let proposal_path = fixture.temp.path().join("planned.json");
+    write_parallel_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["project_id"] = json!("fixture-project");
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+
+    let accepted_attempts = completed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|result| result["status"] == "accepted")
+        .map(|result| result["attempt_id"].as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(accepted_attempts.len() >= 2);
+    let applied = completed["briefing"]["learning_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|receipt| {
+            receipt["kind"] == "profile_claim_applied" && receipt["claim_id"] == claim
+        })
+        .map(|receipt| receipt["attempt_id"].as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(applied, accepted_attempts);
+}
+
+#[test]
+fn a_misspelled_mandate_field_is_refused_rather_than_ignored() {
+    let fixture = ParallelFixture::new();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = fixture.temp.path().join("misspelled.json");
+    write_git_proposal(
+        &proposal_path,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    // The field is commission_constraints. A binding constraint must never
+    // vanish because its key was spelled differently.
+    proposal["constraints"] = json!(["Use only the Python standard library."]);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+        .args(["--socket", path_text(&daemon.socket_path)])
+        .args([
+            "--attachment-token",
+            &attachment_token,
+            "proposal",
+            "create",
+        ])
+        .args([
+            "--file",
+            path_text(&proposal_path),
+            "--idempotency-key",
+            "misspelled",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unknown field `constraints`"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
 fn contained_codex_result_is_verified_integrated_and_verified_again() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");

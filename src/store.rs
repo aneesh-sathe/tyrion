@@ -7123,6 +7123,11 @@ impl Store {
                     "UPDATE results SET status = ?2 WHERE id = ?1",
                     params![result_id, ResultStatus::Accepted.as_str()],
                 )?;
+                record_result_profile_claim_outcome(
+                    &transaction,
+                    result_id,
+                    ProfileClaimOutcome::Accepted,
+                )?;
                 let reason = format!(
                     "planning Worker {handle} ({configuration}) proposed {} Assignments; the Control Plane validated them",
                     plan.assignments.len()
@@ -11959,6 +11964,11 @@ fn accept_planned_result(
             "planned Result acceptance requires one current candidate Result".into(),
         ));
     }
+    record_result_profile_claim_outcome(
+        transaction,
+        acceptance.result_id,
+        ProfileClaimOutcome::Accepted,
+    )?;
     release_successful_attempt(
         transaction,
         SuccessfulAttemptRelease {
