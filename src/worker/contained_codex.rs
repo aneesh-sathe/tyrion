@@ -30,6 +30,8 @@ use crate::TyrionError;
 /// the sized `/sandbox` tmpfs.
 pub(super) const CONTAINMENT_PROFILE: &str = "docker-hardened-v1";
 pub(crate) const CODEX_VERSION: &str = "codex-cli 0.156.1";
+/// The OpenCode adapter speaks this release's HTTP and event API.
+pub(crate) const OPENCODE_VERSION: &str = "1.18.32";
 /// The single writable mount inside every sandbox.
 const SANDBOX_ROOT: &str = "/sandbox";
 /// Every container and network Tyrion creates carries its Attempt, so
@@ -78,6 +80,10 @@ struct RuntimeConfig {
     claude: Option<ClaudeRuntimeConfig>,
     #[serde(default)]
     pi: Option<PiRuntimeConfig>,
+    /// OpenCode signs in with the same ChatGPT login as Codex, so it needs no
+    /// credential of its own; only its pinned version.
+    #[serde(default)]
+    opencode: Option<OpenCodeRuntimeConfig>,
     lease_ttl_seconds: u64,
     /// What a Worker is expected to use, which admission reserves. Below the
     /// ceilings, because measured Workers use a fraction of them.
@@ -197,6 +203,12 @@ pub(crate) struct HostCapacityOverride {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClaudeRuntimeConfig {
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCodeRuntimeConfig {
     version: String,
 }
 
@@ -349,6 +361,9 @@ impl StructuredAdapterSandbox<'_> {
                 }
                 super::routing::WorkerAdapterKind::PiRpc => {
                     "TYRION_PI_BINARY=/opt/tyrion/harness/pi"
+                }
+                super::routing::WorkerAdapterKind::OpenCodeServer => {
+                    "TYRION_OPENCODE_BINARY=/opt/tyrion/harness/opencode"
                 }
                 _ => unreachable!("structured sandbox command uses a structured adapter"),
             })
@@ -534,6 +549,7 @@ impl ContainedCodexRuntime {
             containment_profile: format!("{CONTAINMENT_PROFILE}-{}", &self.fingerprint[..16]),
             supports_claude: self.config.claude.is_some(),
             supports_pi: self.config.pi.is_some(),
+            supports_opencode: self.config.opencode.is_some(),
             pi_model_provider: self.config.pi.as_ref().map(|pi| pi.model_provider.clone()),
             pi_model: self.config.pi.as_ref().map(|pi| pi.model.clone()),
             resources: self.resource_profile(),
@@ -595,8 +611,14 @@ impl ContainedCodexRuntime {
                 profile.binary_environment
             )));
         }
-        if configuration.adapter.kind == super::routing::WorkerAdapterKind::CodexAppServer {
-            self.deliver_codex_login(&sandbox, assignment.lease_expires_at)?;
+        match configuration.adapter.kind {
+            super::routing::WorkerAdapterKind::CodexAppServer => {
+                self.deliver_codex_login(&sandbox, assignment.lease_expires_at)?;
+            }
+            super::routing::WorkerAdapterKind::OpenCodeServer => {
+                self.deliver_opencode_login(&sandbox, assignment.lease_expires_at)?;
+            }
+            _ => {}
         }
         if let Some(git_attempt) = git_attempt {
             sandbox.upload(
@@ -652,6 +674,49 @@ impl ContainedCodexRuntime {
         )
     }
 
+    /// OpenCode's ChatGPT sign-in uses the same OAuth client as Codex, so the
+    /// same approved login serves both. Only the token fields travel, in the
+    /// shape OpenCode stores them, streamed from memory into the guest.
+    fn deliver_opencode_login(
+        &self,
+        sandbox: &Sandbox<'_>,
+        deadline: i64,
+    ) -> Result<(), TyrionError> {
+        let Some(path) = self.config.codex_auth_file.as_ref() else {
+            return Ok(());
+        };
+        let host: Value = serde_json::from_slice(&fs::read(path)?).map_err(|_| {
+            TyrionError::InvalidRequest("the Codex login file is not valid JSON".into())
+        })?;
+        let tokens = &host["tokens"];
+        let field = |name: &str| -> Result<&str, TyrionError> {
+            tokens[name]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    TyrionError::InvalidRequest(format!(
+                        "the Codex login file has no tokens.{name}; run `codex login` first"
+                    ))
+                })
+        };
+        let access = field("access_token")?;
+        let guest = serde_json::json!({
+            "openai": {
+                "type": "oauth",
+                "access": access,
+                "refresh": field("refresh_token")?,
+                "expires": jwt_expiry_millis(access)?,
+                "accountId": field("account_id")?,
+            }
+        });
+        sandbox.upload_bytes(
+            &serde_json::to_vec(&guest)?,
+            "/sandbox/.local/share/opencode/auth.json",
+            "600",
+            deadline,
+        )
+    }
+
     fn structured_runtime_profile(
         &self,
         kind: super::routing::WorkerAdapterKind,
@@ -672,6 +737,19 @@ impl ContainedCodexRuntime {
                     remote_binary: "/opt/tyrion/harness/claude",
                     binary_environment: "Claude",
                     version: &claude.version,
+                })
+            }
+            super::routing::WorkerAdapterKind::OpenCodeServer => {
+                let opencode = self.config.opencode.as_ref().ok_or_else(|| {
+                    TyrionError::InvalidRequest(
+                        "OpenCode Worker execution requires a pinned OpenCode runtime profile"
+                            .into(),
+                    )
+                })?;
+                Ok(StructuredRuntimeProfile {
+                    remote_binary: "/opt/tyrion/harness/opencode",
+                    binary_environment: "OpenCode",
+                    version: &opencode.version,
                 })
             }
             super::routing::WorkerAdapterKind::PiRpc => {
@@ -2095,6 +2173,19 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
             ));
         }
     }
+    if let Some(opencode) = &config.opencode {
+        if opencode.version != OPENCODE_VERSION {
+            return Err(TyrionError::InvalidRequest(format!(
+                "the OpenCode runtime profile must pin OpenCode {OPENCODE_VERSION}; rerun `tyrion init`"
+            )));
+        }
+        // OpenCode signs in with the Codex login; there is no other source.
+        if config.codex_auth_file.is_none() {
+            return Err(TyrionError::InvalidRequest(
+                "the OpenCode runtime profile requires codex_auth_file".into(),
+            ));
+        }
+    }
     if let Some(pi) = &config.pi {
         if pi.model_provider != "openai"
             || !pi.model.starts_with("openai/")
@@ -2669,6 +2760,39 @@ fn symlink_escapes_repository(path: &str, target: &str) -> bool {
     false
 }
 
+/// The expiry, in milliseconds, carried inside a JWT access token. Only the
+/// claim is read; the token is never verified here, because the provider
+/// verifies it on use.
+fn jwt_expiry_millis(token: &str) -> Result<u64, TyrionError> {
+    let invalid = || TyrionError::InvalidRequest("the Codex access token is not a JWT".into());
+    let payload = token.split('.').nth(1).ok_or_else(invalid)?;
+    let mut bits = 0_u32;
+    let mut width = 0;
+    let mut bytes = Vec::with_capacity(payload.len() * 3 / 4);
+    for symbol in payload.bytes() {
+        let value = match symbol {
+            b'A'..=b'Z' => symbol - b'A',
+            b'a'..=b'z' => symbol - b'a' + 26,
+            b'0'..=b'9' => symbol - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return Err(invalid()),
+        };
+        bits = (bits << 6) | u32::from(value);
+        width += 6;
+        if width >= 8 {
+            width -= 8;
+            bytes.push((bits >> width) as u8);
+        }
+    }
+    let claims: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    claims["exp"]
+        .as_u64()
+        .map(|seconds| seconds.saturating_mul(1000))
+        .ok_or_else(invalid)
+}
+
 fn verify_hash(path: &Path, expected: &str) -> Result<(), TyrionError> {
     let actual = sha256_file(path)?;
     if actual != expected {
@@ -2837,6 +2961,14 @@ mod tests {
         attempt_script, is_content_addressed, is_image_id, result_schema,
         symlink_escapes_repository, RUNTIME_BYPRODUCTS,
     };
+
+    #[test]
+    fn a_jwt_expiry_is_read_without_a_base64_dependency() {
+        // {"exp":1790000000,"sub":"x"} in URL-safe base64, no padding.
+        let token = "e30.eyJleHAiOjE3OTAwMDAwMDAsInN1YiI6IngifQ.signature";
+        assert_eq!(super::jwt_expiry_millis(token).unwrap(), 1_790_000_000_000);
+        assert!(super::jwt_expiry_millis("not-a-jwt").is_err());
+    }
 
     #[test]
     fn cpu_pinning_uses_only_real_cpus_and_shares_them_when_over_declared() {

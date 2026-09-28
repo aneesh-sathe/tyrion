@@ -15210,7 +15210,7 @@ fn worker_configuration_supports_control(
 ) -> bool {
     let structured_adapter = matches!(
         configuration["adapter"]["kind"].as_str(),
-        Some("codex_app_server" | "claude_agent_sdk" | "pi_rpc")
+        Some("codex_app_server" | "claude_agent_sdk" | "pi_rpc" | "opencode_server")
     );
     if !structured_adapter {
         return false;

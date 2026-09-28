@@ -33,6 +33,7 @@ pub(super) fn execute(
         WorkerAdapterKind::CodexAppServer => StructuredAdapterKind::CodexAppServer,
         WorkerAdapterKind::ClaudeAgentSdk => StructuredAdapterKind::ClaudeAgentSdk,
         WorkerAdapterKind::PiRpc => StructuredAdapterKind::PiRpc,
+        WorkerAdapterKind::OpenCodeServer => StructuredAdapterKind::OpenCodeServer,
         _ => {
             return Err(TyrionError::InvalidRequest(
                 "structured adapter runner received a non-structured configuration".into(),
@@ -321,6 +322,7 @@ const fn configuration_kind(kind: StructuredAdapterKind) -> WorkerAdapterKind {
         StructuredAdapterKind::CodexAppServer => WorkerAdapterKind::CodexAppServer,
         StructuredAdapterKind::ClaudeAgentSdk => WorkerAdapterKind::ClaudeAgentSdk,
         StructuredAdapterKind::PiRpc => WorkerAdapterKind::PiRpc,
+        StructuredAdapterKind::OpenCodeServer => WorkerAdapterKind::OpenCodeServer,
     }
 }
 

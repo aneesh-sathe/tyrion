@@ -935,6 +935,47 @@ fn qualified_pi_routes_and_executes_with_the_shared_worker_contract() {
 }
 
 #[test]
+fn opencode_routes_and_executes_with_the_shared_worker_contract() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let catalog = write_worker_catalog_value(temp.path(), worker_catalog_with_opencode());
+    let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog, &[]);
+    let attachment_token = connect_full_entry(&daemon, "codex", "opencode-entry");
+    let proposal_path = write_deterministic_routing_proposal(temp.path());
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["worker_requirements"]["require_configurations"] = json!(["opencode-default"]);
+    proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+    proposal["worker_requirements"]["skills"] = json!([]);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+
+    let accepted = create_and_accept(&daemon, &attachment_token, &proposal_path, "opencode");
+    let route = &accepted["assignments"][0]["route"];
+    assert_eq!(route["selected_configuration"]["id"], "opencode-default");
+    assert_eq!(route["selected_configuration"]["harness"], "opencode");
+    let commission_id = accepted["commission"]["id"].as_str().unwrap();
+    let completed = wait_for_commission_status(
+        &daemon,
+        &attachment_token,
+        commission_id,
+        "verified_complete",
+    );
+    assert_eq!(
+        completed["workers"][0]["native_session_id"],
+        "ses_opencode_fixture"
+    );
+    assert_eq!(completed["workers"][0]["usage"]["input_tokens"], 9);
+    assert_eq!(completed["workers"][0]["usage"]["output_tokens"], 3);
+    // The harness ran from the image and its pinned version was checked there.
+    let log = fs::read_to_string(temp.path().join("fake-docker/commands.log")).unwrap();
+    assert!(log.contains("/opt/tyrion/harness/opencode --version"));
+}
+
+#[test]
 fn incomplete_pi_worker_is_visibly_ineligible() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
@@ -1933,11 +1974,16 @@ fn failed_interrupt_delivery_does_not_interrupt_the_worker_locally() {
 
 #[test]
 fn structured_adapters_receive_steering_and_interruption() {
-    for configuration_id in ["codex-deep", "claude-opus-review", "pi-rpc-qualified"] {
+    for configuration_id in [
+        "codex-deep",
+        "claude-opus-review",
+        "pi-rpc-qualified",
+        "opencode-default",
+    ] {
         let temp = TempDir::new().expect("temporary directory should be created");
         let data_dir = temp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
-        let catalog_path = write_worker_catalog(temp.path());
+        let catalog_path = write_worker_catalog_value(temp.path(), worker_catalog_with_opencode());
         let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
         let attachment_token =
             connect_full_entry(&daemon, "codex", &format!("control-{configuration_id}"));
@@ -1949,8 +1995,12 @@ fn structured_adapters_receive_steering_and_interruption() {
         proposal["worker_requirements"]["require_configurations"] = json!([configuration_id]);
         proposal["known_uncertainties"] =
             json!(["The structured Worker interruption will exercise durable recovery."]);
-        if configuration_id == "pi-rpc-qualified" {
+        if matches!(configuration_id, "pi-rpc-qualified" | "opencode-default") {
             proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+        }
+        if configuration_id == "opencode-default" {
+            // OpenCode delivers no native Skills, so it only takes Skill-free work.
+            proposal["worker_requirements"]["skills"] = json!([]);
         }
         fs::write(
             &proposal_path,
@@ -2084,11 +2134,16 @@ fn structured_adapters_receive_steering_and_interruption() {
 
 #[test]
 fn failed_structured_terminals_retain_native_session_and_usage() {
-    for configuration_id in ["codex-deep", "claude-opus-review", "pi-rpc-qualified"] {
+    for configuration_id in [
+        "codex-deep",
+        "claude-opus-review",
+        "pi-rpc-qualified",
+        "opencode-default",
+    ] {
         let temp = TempDir::new().expect("temporary directory should be created");
         let data_dir = temp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
-        let catalog_path = write_worker_catalog(temp.path());
+        let catalog_path = write_worker_catalog_value(temp.path(), worker_catalog_with_opencode());
         let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog_path, &[]);
         let attachment_token =
             connect_full_entry(&daemon, "codex", &format!("failure-{configuration_id}"));
@@ -2097,8 +2152,12 @@ fn failed_structured_terminals_retain_native_session_and_usage() {
             serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
         proposal["goal"] = json!("report structured failure");
         proposal["worker_requirements"]["require_configurations"] = json!([configuration_id]);
-        if configuration_id == "pi-rpc-qualified" {
+        if matches!(configuration_id, "pi-rpc-qualified" | "opencode-default") {
             proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+        }
+        if configuration_id == "opencode-default" {
+            // OpenCode delivers no native Skills, so it only takes Skill-free work.
+            proposal["worker_requirements"]["skills"] = json!([]);
         }
         fs::write(
             &proposal_path,
@@ -2551,7 +2610,12 @@ fn write_worker_catalog_value(root: &Path, catalog: Value) -> PathBuf {
         let kind = configuration["adapter"]["kind"].as_str().unwrap();
         let qualified_pi =
             kind != "pi_rpc" || configuration["settings"]["production_qualified"] == true;
-        if qualified_pi && matches!(kind, "codex_app_server" | "claude_agent_sdk" | "pi_rpc") {
+        if qualified_pi
+            && matches!(
+                kind,
+                "codex_app_server" | "claude_agent_sdk" | "pi_rpc" | "opencode_server"
+            )
+        {
             let adapter = Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/fake_structured_adapter.sh"
@@ -2562,6 +2626,7 @@ fn write_worker_catalog_value(root: &Path, catalog: Value) -> PathBuf {
                     "codex_app_server" => "codex",
                     "claude_agent_sdk" => "claude",
                     "pi_rpc" => "pi",
+                    "opencode_server" => "opencode",
                     _ => unreachable!(),
                 }
             ]);
@@ -2571,6 +2636,44 @@ fn write_worker_catalog_value(root: &Path, catalog: Value) -> PathBuf {
     let path = root.join("worker-catalog.json");
     fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
     path
+}
+
+/// The shared catalog plus an OpenCode configuration, kept separate so the
+/// ranking and eligibility tests over the shared catalog are unchanged.
+fn worker_catalog_with_opencode() -> Value {
+    let mut catalog = worker_catalog();
+    catalog["configurations"].as_array_mut().unwrap().push(json!({
+        "id": "opencode-default",
+        "harness": "opencode",
+        "adapter": {"kind": "opencode_server", "version": "1.0.0"},
+        "model": "openai/gpt-5.6-sol",
+        "settings": {},
+        "tools": ["git"],
+        "skills": [],
+        "context": {"strategy": "fresh_with_retrieval", "capacity_tokens": 200000},
+        "resource_limits": {
+            "max_concurrency_slots": 1,
+            "max_storage_bytes": 2097152,
+            "max_model_spend_cents": 0,
+            "max_paid_service_spend_cents": 0
+        },
+        "capabilities": ["structured_lifecycle", "semantic_interrupt", "terminal_state", "usage", "result_submission", "contained"],
+        "authority_actions": ["deterministic.echo", "codex.git_change"],
+        "authority_scope_types": ["repository", "path", "action"],
+        "assignment_constraints": ["coding"],
+        "containment_profile": "docker-hardened-v1",
+        "replacement_class": "opencode-coding",
+        "available": true,
+        "metrics": {
+            "expected_verified_correctness": 8000,
+            "preference_adherence": 8000,
+            "first_pass_acceptance": 8000,
+            "commission_elapsed_time_contribution_ms": 5000,
+            "cost_cents": 1,
+            "continuity": 0
+        }
+    }));
+    catalog
 }
 
 fn worker_catalog() -> Value {
@@ -2768,6 +2871,26 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
     install_in_image(root, "claude", claude);
     // The Pi fixture answers the Claude fixture's version probe.
     install_in_image(root, "pi", claude);
+    let opencode = root.join("fake-opencode");
+    fs::write(&opencode, "#!/bin/sh\nprintf '%s\\n' 1.18.32\n").unwrap();
+    install_in_image(root, "opencode", &opencode);
+    // OpenCode signs in with the Codex login, so its profile requires one. The
+    // access token only has to be a JWT whose expiry Tyrion can read.
+    let login = root.join("codex-auth.json");
+    fs::write(
+        &login,
+        serde_json::to_vec(&json!({
+            "tokens": {
+                "id_token": "fixture-id",
+                "access_token": "e30.eyJleHAiOjQxMDI0NDQ4MDB9.fixture",
+                "refresh_token": "fixture-refresh",
+                "account_id": "fixture-account"
+            },
+            "last_refresh": "2026-09-27T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let config = root.join("codex-worker.json");
     fs::write(
         &config,
@@ -2786,6 +2909,8 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
                 "model": "openai/fixture-pi",
                 "version": "2.1.204 (Claude Code)"
             },
+            "opencode": {"version": "1.18.32"},
+            "codex_auth_file": login,
             "lease_ttl_seconds": 30,
             "memory_request_mib": 320,
             "cpu_request_millis": 250,

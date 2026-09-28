@@ -14,19 +14,23 @@ binds its socket, which is correct but opaque. So `init`:
   context's endpoint once into `docker_host`
 - builds the Worker image from [`Dockerfile`](Dockerfile), tagged by a digest of
   its build inputs, and pins its image ID
-- downloads the Linux Claude Code and Codex builds for the engine's
-  architecture and checks each against its publisher's SHA-256 manifest
-- streams each binary into a container under the exact Worker profile and reads
-  its version there, which is the only place a Linux guest binary can report
-  one and doubles as proof it runs under the profile at all
+- downloads the Linux Claude Code, Codex and OpenCode builds for the engine's
+  architecture and checks each against a SHA-256: Claude's and Codex's
+  published manifests, and for OpenCode, which publishes none, GitHub's asset
+  digest pinned in Tyrion's source
+- builds them into the image and runs each one in a container under the exact
+  Worker profile to read its version there, which is the only place a Linux
+  guest binary can report one and doubles as proof it runs under the profile
 - names `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` in
   `worker_credentials` only if you have it exported, and picks up
-  `~/.codex/auth.json` when present, then sets the egress each harness needs
+  `~/.codex/auth.json` when present, which also signs in OpenCode Workers,
+  then sets the egress each harness needs
 - writes the file, and the Worker catalog, to `$TYRION_DATA_DIR/runtime/`
   (default `~/.local/state/tyrion/runtime/`), where `tyrion claude` and
   `tyrion codex` find them
-- starts a throwaway daemon on the result and drives one deterministic
-  Commission to `verified_complete`
+- starts a throwaway daemon on the result and attaches an Entry Session to it,
+  exactly as `tyrion claude` does, which proves every pin without spending
+  model tokens
 
 [`codex-worker.example.json`](codex-worker.example.json) shows the shape.
 Unknown fields are rejected.
@@ -45,6 +49,8 @@ launched anything else.
 | `docker_version` | Exact `docker --version` output. |
 | `docker_host` | Explicit daemon address. Tyrion never resolves an ambient Docker context. |
 | `egress` | Omit for no network at all. Otherwise exactly the destinations a Worker may reach, each behind its own destination-pinned relay on a per-Attempt internal bridge. |
+| `codex_auth_file` | The host Codex login. Tyrion copies only its token fields into each Codex or OpenCode sandbox, from memory, at dispatch. Required when `opencode` is set. |
+| `claude`, `opencode` | Each harness's pinned version, checked inside every sandbox. OpenCode must be `1.18.32`, the release its adapter speaks. |
 | `worker_credentials` | Names of environment variables `tyriond` was started with that may be forwarded into a Worker execution. Empty by default: availability on the host is not permission to use it. |
 | `vcpus`, `memory_mib`, `writable_storage_mib`, `max_processes` | The containment ceilings. Only `2 / 3072 / 2048 / 256` is accepted. |
 | `memory_request_mib`, `cpu_request_millis` | What a Worker is expected to use, which admission reserves. Only `320 / 250` is accepted. |

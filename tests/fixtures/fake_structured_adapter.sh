@@ -34,6 +34,7 @@ session = {
     "codex": "codex-thread-fixture",
     "claude": "claude-session-fixture",
     "pi": "pi-session-fixture",
+    "opencode": "ses_opencode_fixture",
 }[kind]
 inventory = launch["worker_configuration"].get("skills", [])
 names = sorted(skill["name"] if isinstance(skill, dict) else skill for skill in inventory)
@@ -73,6 +74,19 @@ if [ "$kind" = codex ]; then
     '{"method":"turn/started","params":{"turn":{"status":"inProgress"}}}'
 elif [ "$kind" = pi ]; then
   printf '%s\n' '{"type":"agent_start"}'
+elif [ "$kind" = opencode ]; then
+  # Tyrion must have delivered the Codex login in OpenCode's own shape.
+  login="$HOME/.local/share/opencode/auth.json"
+  for field in '"type":"oauth"' '"expires":4102444800000' '"accountId":"fixture-account"' '"refresh":"fixture-refresh"'; do
+    if ! grep -qF "$field" "$login" 2>/dev/null; then
+      printf 'OpenCode login missing %s\n' "$field" >&2
+      exit 1
+    fi
+  done
+  # Shapes observed from the real OpenCode 1.18.32 server.
+  printf '%s\n' \
+    '{"type":"tyrion.opencode.started","session_id":"ses_opencode_fixture"}' \
+    '{"type":"step_start","part":{"type":"step-start"}}'
 else
   printf '%s\n' \
     '{"type":"session.status_running"}'
@@ -117,6 +131,11 @@ case "$launch" in
       printf '%s\n' \
         '{"type":"span.model_request_end","usage":{"input_tokens":6,"output_tokens":1}}' \
         '{"type":"session.error","message":"fixture failure"}'
+    elif [ "$kind" = opencode ]; then
+      printf '%s\n' \
+        '{"type":"error","error":{"name":"APIError","data":{"message":"fixture failure"}}}' \
+        '{"type":"tyrion.opencode.usage","input_tokens":6,"output_tokens":1}' \
+        '{"type":"tyrion.opencode.settled","status":"failed"}'
     else
       printf '%s\n' \
         '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":6,"output":1,"cost":{"total":0}}}}' \
@@ -142,6 +161,11 @@ case "$launch" in
         '{"type":"span.model_request_end","usage":{"input_tokens":2,"output_tokens":0}}' \
         '{"type":"user.interrupt"}' \
         '{"type":"session.status_idle"}'
+    elif [ "$kind" = opencode ]; then
+      printf '%s\n' \
+        '{"type":"tyrion.opencode.interrupt"}' \
+        '{"type":"tyrion.opencode.usage","input_tokens":2,"output_tokens":0}' \
+        '{"type":"tyrion.opencode.settled","status":"interrupted"}'
     else
       printf '%s\n' \
         '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":2,"output":0,"cost":{"total":0}}}}' \
@@ -162,6 +186,13 @@ elif [ "$kind" = claude ]; then
     '{"type":"agent.message","content":[{"type":"text","text":"fixture completed"}]}' \
     '{"type":"span.model_request_end","usage":{"input_tokens":10,"output_tokens":5}}' \
     '{"type":"session.status_idle"}'
+elif [ "$kind" = opencode ]; then
+  printf '%s\n' \
+    '{"type":"tool_use","part":{"type":"tool","tool":"apply_patch","state":{"status":"completed"}}}' \
+    '{"type":"text","part":{"type":"text","text":"fixture completed","time":{"end":1}}}' \
+    '{"type":"step_finish","part":{"type":"step-finish","reason":"stop","tokens":{"input":9,"output":3}}}' \
+    '{"type":"tyrion.opencode.usage","input_tokens":9,"output_tokens":3}' \
+    '{"type":"tyrion.opencode.settled","status":"completed"}'
 else
   printf '%s\n' \
     '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"fixture completed"}],"usage":{"input":11,"output":6,"cost":{"total":0}}}}' \

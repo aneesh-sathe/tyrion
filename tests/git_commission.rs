@@ -138,6 +138,55 @@ fn real_docker_boundary_completes_the_contained_git_assignment() {
 }
 
 #[test]
+#[ignore = "requires `tyrion init` output and a real Codex login"]
+fn real_opencode_worker_completes_the_contained_git_assignment() {
+    let runtime = std::env::var_os("TYRION_REAL_WORKER_RUNTIME")
+        .map(PathBuf::from)
+        .expect("set TYRION_REAL_WORKER_RUNTIME to the worker-runtime.json `tyrion init` wrote");
+    let catalog = std::env::var_os("TYRION_REAL_WORKER_CATALOG")
+        .map(PathBuf::from)
+        .expect("set TYRION_REAL_WORKER_CATALOG to the worker-catalog.json `tyrion init` wrote");
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let daemon = RunningDaemon::start_with_catalog(&data_dir, &runtime, &catalog);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let mut proposal: Value = serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+    proposal["worker_requirements"] = json!({
+        "tools": ["git"],
+        "assignment_constraints": ["coding"],
+        "require_configurations": ["opencode-default"]
+    });
+    proposal["resource_ceilings"]["max_elapsed_seconds"] = json!(900);
+    fs::write(
+        &proposal_path,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let completed = wait_for_completion_with_timeout(
+        &daemon,
+        &attachment_token,
+        &commission_id,
+        Duration::from_secs(900),
+    );
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    let worker = &completed["workers"][0];
+    assert_eq!(worker["configuration"]["id"], "opencode-default");
+    assert!(worker["native_session_id"]
+        .as_str()
+        .is_some_and(|session| session.starts_with("ses_")));
+    assert!(worker["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(completed["attempts"][0]["lease"]["status"], "released");
+    assert!(!principal_checkout.join("issue-4.txt").exists());
+}
+
+#[test]
 fn contained_codex_result_is_verified_integrated_and_verified_again() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");

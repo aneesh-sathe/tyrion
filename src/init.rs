@@ -26,16 +26,18 @@ use crate::entry_mcp::connect_entry;
 use crate::native_entry_launcher::{
     daemon_is_ready, default_data_dir, RUNTIME_CATALOG, RUNTIME_CONFIG,
 };
-use crate::worker::{CODEX_VERSION, HOST_MEMORY_RESERVE_MIB};
+use crate::worker::{CODEX_VERSION, HOST_MEMORY_RESERVE_MIB, OPENCODE_VERSION};
 use crate::{NativeHarness, TyrionError};
 
 const DOCKERFILE: &str = include_str!("../runtime/docker/Dockerfile");
 const NATIVE_SKILL: &str = include_str!("../adapters/native_skill.py");
 const CLAUDE_ADAPTER: &str = include_str!("../adapters/claude_sdk_adapter.py");
 const CODEX_ADAPTER: &str = include_str!("../adapters/codex_app_server.py");
+const OPENCODE_ADAPTER: &str = include_str!("../adapters/opencode_server.py");
 
 const CLAUDE_RELEASES: &str = "https://downloads.claude.ai/claude-code-releases";
 const CODEX_RELEASES: &str = "https://github.com/openai/codex/releases/download";
+const OPENCODE_RELEASES: &str = "https://github.com/anomalyco/opencode/releases/download";
 /// Names a Claude Worker may authenticate with, forwarded by name only.
 const CLAUDE_CREDENTIALS: [&str; 2] = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"];
 
@@ -44,6 +46,7 @@ pub struct InitOptions {
     pub claude_version: String,
     pub claude_model: String,
     pub codex_model: String,
+    pub opencode_model: String,
 }
 
 pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
@@ -70,6 +73,7 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     private_dir(&harness_dir)?;
     let claude = fetch_claude(&harness_dir, docker.platform, &options.claude_version)?;
     let codex = fetch_codex(&harness_dir, docker.platform)?;
+    let opencode = fetch_opencode(&harness_dir, docker.platform)?;
 
     // The harnesses are built into the image, so every Worker shares one
     // read-only copy and the image ID pins them.
@@ -79,6 +83,7 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
             ("codex", &codex.binary),
             ("codex-code-mode-host", &codex.code_mode_host),
             ("claude", &claude.binary),
+            ("opencode", &opencode.binary),
         ],
     )?;
     report(
@@ -107,14 +112,27 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         ));
     }
     report(4, "codex", &format!("{codex_version} {}", codex.note));
+    let opencode_version = probe.version("opencode")?;
+    if opencode_version != OPENCODE_VERSION {
+        return Err(next_action(
+            &format!("the downloaded OpenCode reports {opencode_version}, but this Tyrion pins {OPENCODE_VERSION}"),
+            "delete the OpenCode download and rerun `tyrion init`",
+        ));
+    }
+    report(
+        5,
+        "opencode",
+        &format!("{opencode_version} {}", opencode.note),
+    );
     probe.finish()?;
 
     let adapters = runtime_dir.join("adapters");
     private_dir(&adapters)?;
     let claude_adapter = write_private(&adapters.join("claude_sdk_adapter.py"), CLAUDE_ADAPTER)?;
     let codex_adapter = write_private(&adapters.join("codex_app_server.py"), CODEX_ADAPTER)?;
+    let opencode_adapter = write_private(&adapters.join("opencode_server.py"), OPENCODE_ADAPTER)?;
     // The daemon launches adapters directly, so they must be executable.
-    for adapter in [&claude_adapter, &codex_adapter] {
+    for adapter in [&claude_adapter, &codex_adapter, &opencode_adapter] {
         fs::set_permissions(adapter, fs::Permissions::from_mode(0o700))?;
     }
 
@@ -162,6 +180,36 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
             json!({"reasoning_effort": "low"}),
             1,
         )?);
+        // OpenCode signs in with the same ChatGPT login and reaches the same
+        // two hosts. It delivers no native Skills, so it never claims them,
+        // and routing keeps Skill-requiring work away from it.
+        let mut opencode = configuration(
+            "opencode-default",
+            "opencode",
+            "opencode_server",
+            &opencode_adapter,
+            &options.opencode_model,
+            json!({}),
+            1,
+        )?;
+        opencode["capabilities"] = json!([
+            "structured_lifecycle",
+            "semantic_interrupt",
+            "terminal_state",
+            "usage",
+            "result_submission",
+            "contained",
+        ]);
+        // Not yet measured against Codex, so it ranks just below it: still an
+        // approximately equal fallback, never the default choice.
+        for metric in [
+            "expected_verified_correctness",
+            "preference_adherence",
+            "first_pass_acceptance",
+        ] {
+            opencode["metrics"][metric] = json!(8950);
+        }
+        configurations.push(opencode);
     }
 
     let mut runtime = json!({
@@ -188,6 +236,7 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     });
     if let Some(auth) = &codex_auth {
         runtime["codex_auth_file"] = json!(auth);
+        runtime["opencode"] = json!({"version": opencode_version});
     }
     let config_path = runtime_dir.join(RUNTIME_CONFIG);
     let catalog_path = runtime_dir.join(RUNTIME_CATALOG);
@@ -200,11 +249,11 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
             &serde_json::to_string_pretty(&json!({"configurations": configurations}))?,
         )?;
     }
-    report(5, "configuration", &display(&config_path));
+    report(6, "configuration", &display(&config_path));
 
     let elapsed = check_daemon(&data_dir, &config_path, &catalog_path)?;
     report(
-        6,
+        7,
         "daemon",
         &format!(
             "started on this runtime, Entry Session attached ({:.1}s)",
@@ -215,17 +264,17 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     println!();
     let ceiling = worker_ceiling(docker.cpus, docker.memory_mib);
     println!(
-        "  capacity        {ceiling} Codex Worker{} at once ({WORKER_MEMORY_REQUEST_MIB} MiB expected each, {} GiB ceiling){}",
+        "  capacity          {ceiling} Codex Worker{} at once ({WORKER_MEMORY_REQUEST_MIB} MiB expected each, {} GiB ceiling){}",
         if ceiling == 1 { "" } else { "s" },
         WORKER_MEMORY_MIB / 1024,
         match ceiling {
-            0 => "\n                  Workers will be blocked: give Docker more memory",
-            1..=3 => "\n                  give Docker more memory to run more Workers in parallel",
+            0 => "\n                    Workers will be blocked: give Docker more memory",
+            1..=3 => "\n                    give Docker more memory to run more Workers in parallel",
             _ => "",
         }
     );
     println!(
-        "  claude workers  {}",
+        "  claude workers    {}",
         if claude_credentials.is_empty() {
             "off: run `claude setup-token`, export CLAUDE_CODE_OAUTH_TOKEN, then rerun `tyrion init`"
                 .to_owned()
@@ -234,7 +283,15 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         }
     );
     println!(
-        "  codex workers   {}",
+        "  codex workers     {}",
+        if codex_auth.is_some() {
+            "on, authenticated by ~/.codex/auth.json"
+        } else {
+            "off: run `codex login`, then rerun `tyrion init`"
+        }
+    );
+    println!(
+        "  opencode workers  {}",
         if codex_auth.is_some() {
             "on, authenticated by ~/.codex/auth.json"
         } else {
@@ -263,11 +320,13 @@ fn worker_ceiling(cpus: u64, memory_mib: u64) -> u64 {
         .min(memory_mib.saturating_sub(HOST_MEMORY_RESERVE_MIB) / WORKER_MEMORY_REQUEST_MIB)
 }
 
+const INIT_STEPS: u8 = 7;
+
 fn report(step: u8, name: &str, detail: &str) {
     if step == 1 {
         println!();
     }
-    println!("  {step}/6  {name:<17} {detail}");
+    println!("  {step}/{INIT_STEPS}  {name:<17} {detail}");
 }
 
 fn display(path: &Path) -> String {
@@ -294,6 +353,10 @@ struct Platform {
     docker_arch: &'static str,
     claude: &'static str,
     codex: &'static str,
+    /// OpenCode's release asset and its SHA-256, pinned here because OpenCode
+    /// publishes no checksum file of its own. These are GitHub's recorded
+    /// asset digests for the pinned release.
+    opencode: (&'static str, &'static str),
 }
 
 impl Platform {
@@ -303,11 +366,20 @@ impl Platform {
                 docker_arch: "linux/arm64",
                 claude: "linux-arm64",
                 codex: "aarch64-unknown-linux-musl",
+                opencode: (
+                    "opencode-linux-arm64.tar.gz",
+                    "568461b7d4d8c19865c97e9a1102e613049c6039d01fe772154de873c1865840",
+                ),
             }),
             "amd64" | "x86_64" => Some(Self {
                 docker_arch: "linux/amd64",
                 claude: "linux-x64",
                 codex: "x86_64-unknown-linux-musl",
+                // The baseline build runs on x86-64 hosts without AVX2.
+                opencode: (
+                    "opencode-linux-x64-baseline.tar.gz",
+                    "763af386ef88a8cab18df00fcf055690e5a55e31a7088beabe02307142a6adce",
+                ),
             }),
             _ => None,
         }
@@ -584,6 +656,54 @@ fn fetch_codex(dir: &Path, platform: Platform) -> Result<Codex, TyrionError> {
     })
 }
 
+struct OpenCode {
+    binary: PathBuf,
+    note: &'static str,
+}
+
+/// OpenCode ships one self-contained binary per platform. The archive digest
+/// is pinned in source, so a rerun re-verifies the extracted binary against the
+/// digest recorded when the archive itself was verified.
+fn fetch_opencode(dir: &Path, platform: Platform) -> Result<OpenCode, TyrionError> {
+    let (archive_name, expected) = platform.opencode;
+    let home = dir.join(format!(
+        "opencode-{OPENCODE_VERSION}-{}",
+        archive_name.trim_end_matches(".tar.gz")
+    ));
+    let opencode = OpenCode {
+        binary: home.join("opencode"),
+        note: "(cached, checksum verified)",
+    };
+    let recorded = home.join("SHA256SUMS");
+    if let Ok(sums) = fs::read_to_string(&recorded) {
+        if sums == format!("{}\n", sha256_file(&opencode.binary).unwrap_or_default()) {
+            return Ok(opencode);
+        }
+    }
+    let _ = fs::remove_dir_all(&home);
+    private_dir(&home)?;
+    let archive = home.join(archive_name);
+    download_verified(
+        &format!("{OPENCODE_RELEASES}/v{OPENCODE_VERSION}/{archive_name}"),
+        &archive,
+        expected,
+    )?;
+    let extracted = run(Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&home)
+        .arg("opencode"));
+    fs::remove_file(&archive)?;
+    extracted?;
+    fs::set_permissions(&opencode.binary, fs::Permissions::from_mode(0o700))?;
+    fs::write(&recorded, format!("{}\n", sha256_file(&opencode.binary)?))?;
+    Ok(OpenCode {
+        note: "(downloaded, checksum verified)",
+        ..opencode
+    })
+}
+
 /// Find one file's digest in a `sha256sum`-format listing. Only a well-formed
 /// 64-digit hex digest counts, so a truncated or tampered listing fails.
 fn published_checksum<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
@@ -643,6 +763,8 @@ struct Probe<'a> {
 impl<'a> Probe<'a> {
     fn start(docker: &'a Docker, image_id: &str) -> Result<Self, TyrionError> {
         let name = format!("tyrion-init-{}", Uuid::new_v4());
+        let memory = format!("{WORKER_MEMORY_MIB}m");
+        let tmpfs = format!("/sandbox:rw,exec,nosuid,nodev,size={WORKER_STORAGE_MIB}m,mode=1777");
         run(docker.command().args([
             "run",
             "--detach",
@@ -656,11 +778,11 @@ impl<'a> Probe<'a> {
             "--pids-limit",
             "256",
             "--memory",
-            "6144m",
+            &memory,
             "--memory-swap",
-            "6144m",
+            &memory,
             "--cpus",
-            "2",
+            &WORKER_VCPUS.to_string(),
             "--cpuset-cpus",
             "0-1",
             "--cap-drop",
@@ -672,9 +794,16 @@ impl<'a> Probe<'a> {
             "--user",
             "65534:65534",
             "--tmpfs",
-            "/sandbox:rw,exec,nosuid,nodev,size=1024m,mode=1777",
+            &tmpfs,
+            // The same environment a Worker sandbox gets: the root filesystem
+            // is read-only, so a harness that writes temporary or config
+            // files must find them under /sandbox.
             "--env",
             "HOME=/sandbox",
+            "--env",
+            "TMPDIR=/sandbox/tmp",
+            "--env",
+            "XDG_CONFIG_HOME=/sandbox/.config",
             "--env",
             "PYTHONPATH=/opt/tyrion",
             image_id,

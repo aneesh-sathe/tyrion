@@ -44,6 +44,9 @@ enum TopLevelCommand {
         claude_model: String,
         #[arg(long, default_value = "gpt-5.6-sol")]
         codex_model: String,
+        /// OpenCode names models by provider, and signs in to OpenAI.
+        #[arg(long, default_value = "openai/gpt-5.6-sol")]
+        opencode_model: String,
     },
     /// Launch Claude Code as a Tyrion Entry Session.
     Claude {
@@ -446,12 +449,14 @@ fn main() {
         claude_version,
         claude_model,
         codex_model,
+        opencode_model,
     } = &arguments.command
     {
         if let Err(error) = tyrion::run_init(&tyrion::InitOptions {
             claude_version: claude_version.clone(),
             claude_model: claude_model.clone(),
             codex_model: codex_model.clone(),
+            opencode_model: opencode_model.clone(),
         }) {
             eprintln!("\nerror: {error}");
             std::process::exit(1);

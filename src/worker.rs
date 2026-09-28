@@ -21,7 +21,7 @@ mod structured_process;
 
 pub(crate) use contained_codex::{
     HostCapacity, HostCapacityOverride, HostCapacitySource, ResourceProfile, CODEX_VERSION,
-    HOST_MEMORY_RESERVE_MIB,
+    HOST_MEMORY_RESERVE_MIB, OPENCODE_VERSION,
 };
 
 pub const DETERMINISTIC_ACTION: &str = "deterministic.echo";
@@ -280,6 +280,26 @@ impl WorkerControl {
                 Some("extension_error") => {
                     meaningful_activity = Some("Pi adapter reported an error")
                 }
+                _ => {}
+            },
+            routing::WorkerAdapterKind::OpenCodeServer => match event["type"].as_str() {
+                Some("tyrion.opencode.started") => {
+                    meaningful_activity = Some("OpenCode session started")
+                }
+                Some("tool_use") => meaningful_activity = Some("OpenCode is using a tool"),
+                Some("text") => meaningful_activity = Some("OpenCode produced a structured Result"),
+                Some("step_finish") => meaningful_activity = Some("OpenCode finished a step"),
+                Some("tyrion.opencode.usage") => {
+                    if let (Some(input), Some(output)) = (
+                        event["input_tokens"].as_u64(),
+                        event["output_tokens"].as_u64(),
+                    ) {
+                        telemetry.input_tokens = input;
+                        telemetry.output_tokens = output;
+                        telemetry.usage_reported = true;
+                    }
+                }
+                Some("error") => meaningful_activity = Some("OpenCode reported an error"),
                 _ => {}
             },
             _ => {}
@@ -945,7 +965,8 @@ impl WorkerRuntime {
                 (
                     routing::WorkerAdapterKind::CodexAppServer
                     | routing::WorkerAdapterKind::ClaudeAgentSdk
-                    | routing::WorkerAdapterKind::PiRpc,
+                    | routing::WorkerAdapterKind::PiRpc
+                    | routing::WorkerAdapterKind::OpenCodeServer,
                     ExecutionSpec::Deterministic,
                 ) => {
                     let runtime = self.contained_codex.as_ref().ok_or_else(|| {
@@ -983,7 +1004,8 @@ impl WorkerRuntime {
                 (
                     routing::WorkerAdapterKind::CodexAppServer
                     | routing::WorkerAdapterKind::ClaudeAgentSdk
-                    | routing::WorkerAdapterKind::PiRpc,
+                    | routing::WorkerAdapterKind::PiRpc
+                    | routing::WorkerAdapterKind::OpenCodeServer,
                     ExecutionSpec::CodexGit {
                         repository,
                         base_revision,

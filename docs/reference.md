@@ -47,7 +47,7 @@ Missing capabilities include the affected protocol operations, the practical eff
 
 Tyrion routes the whole Worker Configuration, not a model name by itself. A configuration includes the Agent Harness, adapter version, model settings, tools, native Skills, context strategy, resource limits, authority compatibility, containment profile, availability, and measured outcomes. The Entry Session's harness does not receive a routing preference.
 
-The repository contains reference structured adapters for Codex app-server, Claude Agent SDK, and qualified Pi RPC. Production eligibility requires the complete shared lifecycle, usage, interruption, Result, Skill, restart, and containment contract. Terminal text scraping does not qualify a Worker.
+The repository contains reference structured adapters for Codex app-server, Claude Agent SDK, OpenCode server, and qualified Pi RPC. Production eligibility requires the complete shared lifecycle, usage, interruption, Result, Skill, restart, and containment contract. Terminal text scraping does not qualify a Worker.
 
 ## Inspect and control work
 
@@ -102,6 +102,7 @@ Do not begin by guessing values in the runtime JSON. Startup verifies paths, ver
 - [Contained Codex Git assignments](contained-codex.md)
 - [Cross-harness Worker routing and control](cross-harness-workers.md)
 - [Pi Entry and Worker adapters](pi-adapter.md)
+- [OpenCode Worker adapter](opencode-adapter.md)
 - [Credentialed effects](credentialed-effects.md)
 
 The daemon accepts these optional runtime files:

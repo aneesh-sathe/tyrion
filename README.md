@@ -3,7 +3,7 @@
 Tyrion runs coding agents for you, in parallel, and only accepts work it can prove.
 
 You describe a job once, in your own words, in the harness you already use. Tyrion
-splits it up, runs the pieces across Claude Code, Codex and Pi at the same time,
+splits it up, runs the pieces across Claude Code, Codex, OpenCode and Pi at the same time,
 keeps each one in a sealed container, checks the result against criteria you set,
 and hands you a Git branch to review. You never supervise a Worker window and you
 never write JSON.
@@ -65,6 +65,9 @@ Every claim below was measured against real models, with a checked-in record in
   [Claude host](docs/dogfood-records/2026-09-27-claude-host-plan.json).
 - Codex and Claude running **concurrently** on disjoint work, producing one
   verified integrated artifact and beating serial execution by 20.1 seconds.
+- **OpenCode and Codex** in one plan: two Workers of each, verified in 63
+  seconds against 200 seconds of serial Worker time.
+  [Record](docs/dogfood-records/2026-09-27-opencode-cross-harness.json).
 - **Tyrion plans on request.** Asked for four ledger features with no plan, a
   contained planning Worker read the project and proposed four disjoint
   Assignments; Tyrion validated the plan and ran them in parallel, verified on
@@ -101,7 +104,7 @@ a whole Commission and requires them identical afterwards.
 
 - macOS
 - Docker Desktop or Colima, running, with at least 2 CPUs and 8 GB of memory
-- A login for Claude Code, Codex, or both
+- A login for Claude Code, Codex, or both (OpenCode Workers use the Codex login)
 
 ## Install
 
@@ -117,16 +120,18 @@ Or from a clone: `cargo install --path . && tyrion init`.
 rerun:
 
 ```
-  1/6  docker            Docker version 28.0.4, build b8034c0 (linux/arm64, 12 CPUs, 7.7 GiB)
-  2/6  worker image      sha256:346764c72dcd (built)
-  3/6  claude code       2.1.274 (Claude Code) (downloaded, checksum verified)
-  4/6  codex             codex-cli 0.156.1 (downloaded, checksum verified)
-  5/6  configuration     ~/.local/state/tyrion/runtime/worker-runtime.json
-  6/6  daemon            started on this runtime, Entry Session attached (1.5s)
+  1/7  docker            Docker version 28.0.4, build b8034c0 (linux/arm64, 12 CPUs, 7.7 GiB)
+  2/7  worker image      sha256:a6c81da93553 (built, harnesses built in)
+  3/7  claude code       2.1.274 (Claude Code) (downloaded, checksum verified)
+  4/7  codex             codex-cli 0.156.1 (downloaded, checksum verified)
+  5/7  opencode          1.18.32 (downloaded, checksum verified)
+  6/7  configuration     ~/.local/state/tyrion/runtime/worker-runtime.json
+  7/7  daemon            started on this runtime, Entry Session attached (0.5s)
 
-  capacity        21 Codex Workers at once (320 MiB expected each, 3 GiB ceiling)
-  claude workers  on, authenticated by CLAUDE_CODE_OAUTH_TOKEN
-  codex workers   on, authenticated by ~/.codex/auth.json
+  capacity          21 Codex Workers at once (320 MiB expected each, 3 GiB ceiling)
+  claude workers    on, authenticated by CLAUDE_CODE_OAUTH_TOKEN
+  codex workers     on, authenticated by ~/.codex/auth.json
+  opencode workers  on, authenticated by ~/.codex/auth.json
 
 Tyrion is ready. From any Git repository, run `tyrion claude` or `tyrion codex`.
 ```
@@ -145,6 +150,7 @@ Workers authenticate separately from your own harness session, so they need:
   `CLAUDE_CODE_OAUTH_TOKEN` in your shell profile, or export
   `ANTHROPIC_API_KEY`.
 - **Codex**: run `codex login`.
+- **OpenCode**: nothing extra. It signs in with the Codex login.
 
 Rerun `tyrion init` after adding either.
 

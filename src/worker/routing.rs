@@ -36,6 +36,7 @@ pub(super) struct ContainedCodexDescriptor {
     pub containment_profile: String,
     pub supports_claude: bool,
     pub supports_pi: bool,
+    pub supports_opencode: bool,
     pub pi_model_provider: Option<String>,
     pub pi_model: Option<String>,
     pub resources: super::contained_codex::ResourceProfile,
@@ -93,6 +94,8 @@ pub(super) enum WorkerAdapterKind {
     CodexAppServer,
     ClaudeAgentSdk,
     PiRpc,
+    #[serde(rename = "opencode_server")]
+    OpenCodeServer,
     DeterministicLocal,
     ContainedCodex,
 }
@@ -205,6 +208,7 @@ impl WorkerCatalog {
                 WorkerAdapterKind::CodexAppServer
                     | WorkerAdapterKind::ClaudeAgentSdk
                     | WorkerAdapterKind::PiRpc
+                    | WorkerAdapterKind::OpenCodeServer
             ) {
                 continue;
             }
@@ -214,6 +218,15 @@ impl WorkerCatalog {
             {
                 return Err(TyrionError::InvalidRequest(format!(
                     "available Worker Configuration {} requires a pinned Claude runtime profile",
+                    configuration.id
+                )));
+            }
+            if configuration.available
+                && configuration.adapter.kind == WorkerAdapterKind::OpenCodeServer
+                && !descriptor.supports_opencode
+            {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "available Worker Configuration {} requires a pinned OpenCode runtime profile",
                     configuration.id
                 )));
             }
@@ -356,6 +369,7 @@ impl WorkerCatalog {
                     WorkerAdapterKind::CodexAppServer
                         | WorkerAdapterKind::ClaudeAgentSdk
                         | WorkerAdapterKind::PiRpc
+                        | WorkerAdapterKind::OpenCodeServer
                 )
         })
     }
@@ -374,6 +388,7 @@ impl WorkerCatalog {
                     WorkerAdapterKind::CodexAppServer
                         | WorkerAdapterKind::ClaudeAgentSdk
                         | WorkerAdapterKind::PiRpc
+                        | WorkerAdapterKind::OpenCodeServer
                 )
             {
                 continue;
@@ -426,6 +441,7 @@ impl WorkerCatalog {
                 WorkerAdapterKind::CodexAppServer | WorkerAdapterKind::ContainedCodex => "codex",
                 WorkerAdapterKind::ClaudeAgentSdk => "claude",
                 WorkerAdapterKind::PiRpc => "pi",
+                WorkerAdapterKind::OpenCodeServer => "opencode",
                 WorkerAdapterKind::DeterministicLocal => "tyrion",
             };
             if configuration.harness != expected_harness {
@@ -524,6 +540,7 @@ impl WorkerCatalog {
                 WorkerAdapterKind::CodexAppServer
                 | WorkerAdapterKind::ClaudeAgentSdk
                 | WorkerAdapterKind::PiRpc
+                | WorkerAdapterKind::OpenCodeServer
                 | WorkerAdapterKind::ContainedCodex => matches!(
                     configuration.context.strategy.as_str(),
                     "fresh" | "fresh_with_retrieval"
@@ -552,6 +569,7 @@ impl WorkerCatalog {
                 WorkerAdapterKind::CodexAppServer
                     | WorkerAdapterKind::ClaudeAgentSdk
                     | WorkerAdapterKind::PiRpc
+                    | WorkerAdapterKind::OpenCodeServer
             ) && (configuration.adapter.kind != WorkerAdapterKind::PiRpc
                 || pi_is_production_qualified(configuration))
             {
@@ -627,6 +645,13 @@ impl WorkerCatalog {
                     }
                 }
                 for capability in REQUIRED_ADAPTER_CAPABILITIES {
+                    // The OpenCode adapter delivers no native Skills. Its empty
+                    // inventory already keeps Skill-requiring work away from it.
+                    if capability == "skills"
+                        && configuration.adapter.kind == WorkerAdapterKind::OpenCodeServer
+                    {
+                        continue;
+                    }
                     if !configuration
                         .capabilities
                         .iter()
@@ -658,6 +683,7 @@ fn configuration_is_available(configuration: &WorkerConfiguration) -> bool {
         WorkerAdapterKind::CodexAppServer
             | WorkerAdapterKind::ClaudeAgentSdk
             | WorkerAdapterKind::PiRpc
+            | WorkerAdapterKind::OpenCodeServer
     ) {
         return true;
     }
@@ -1017,6 +1043,7 @@ mod tests {
             containment_profile: crate::worker::contained_codex::CONTAINMENT_PROFILE.into(),
             supports_claude: false,
             supports_pi: true,
+            supports_opencode: false,
             pi_model_provider: Some("openai".into()),
             pi_model: Some("openai/pinned-model".into()),
             resources: pinned_profile(),
@@ -1093,6 +1120,7 @@ mod tests {
             containment_profile: crate::worker::contained_codex::CONTAINMENT_PROFILE.into(),
             supports_claude: true,
             supports_pi: false,
+            supports_opencode: false,
             pi_model_provider: None,
             pi_model: None,
             resources: pinned_profile(),

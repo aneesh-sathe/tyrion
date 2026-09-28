@@ -8,6 +8,7 @@ pub enum StructuredAdapterKind {
     CodexAppServer,
     ClaudeAgentSdk,
     PiRpc,
+    OpenCodeServer,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,6 +207,7 @@ pub fn validate_trace(
         StructuredAdapterKind::CodexAppServer => codex_lifecycle(&vendor_events)?,
         StructuredAdapterKind::ClaudeAgentSdk => claude_lifecycle(&vendor_events)?,
         StructuredAdapterKind::PiRpc => pi_lifecycle(&vendor_events)?,
+        StructuredAdapterKind::OpenCodeServer => opencode_lifecycle(&vendor_events)?,
     };
     validate_lifecycle_order(kind, &vendor_events)?;
     if let Some(summary) = result_summary {
@@ -356,11 +358,13 @@ fn validate_lifecycle_order(
         StructuredAdapterKind::CodexAppServer => event["method"] == "turn/started",
         StructuredAdapterKind::ClaudeAgentSdk => event["type"] == "session.status_running",
         StructuredAdapterKind::PiRpc => event["type"] == "agent_start",
+        StructuredAdapterKind::OpenCodeServer => event["type"] == "tyrion.opencode.started",
     };
     let is_usage = |event: &&Value| match kind {
         StructuredAdapterKind::CodexAppServer => event["method"] == "thread/tokenUsage/updated",
         StructuredAdapterKind::ClaudeAgentSdk => event["type"] == "span.model_request_end",
         StructuredAdapterKind::PiRpc => event["type"] == "tyrion.pi.usage",
+        StructuredAdapterKind::OpenCodeServer => event["type"] == "tyrion.opencode.usage",
     };
     let is_terminal = |event: &&Value| match kind {
         StructuredAdapterKind::CodexAppServer => {
@@ -370,6 +374,7 @@ fn validate_lifecycle_order(
             event["type"] == "session.status_idle" || event["type"] == "session.error"
         }
         StructuredAdapterKind::PiRpc => event["type"] == "agent_settled",
+        StructuredAdapterKind::OpenCodeServer => event["type"] == "tyrion.opencode.settled",
     };
     let starts = events
         .iter()
@@ -601,6 +606,56 @@ fn pi_lifecycle(events: &[&Value]) -> Result<Lifecycle, TyrionError> {
     Ok(lifecycle)
 }
 
+/// OpenCode's live server events, observed from the real binary, bracketed by
+/// the adapter's start and settled markers. Usage is one authoritative total
+/// the adapter reads from the server when the turn ends, however it ends.
+fn opencode_lifecycle(events: &[&Value]) -> Result<Lifecycle, TyrionError> {
+    let mut lifecycle = Lifecycle::default();
+    for event in events {
+        match event["type"].as_str() {
+            Some("tyrion.opencode.started") => {
+                lifecycle.started = true;
+                lifecycle.latest_activity = "OpenCode session started".into();
+            }
+            Some("tool_use") => {
+                if let Some(tool) = event["part"]["tool"].as_str() {
+                    lifecycle.latest_activity = format!("OpenCode used {tool}");
+                }
+            }
+            Some("text") => {
+                if event["part"]["text"].as_str().is_some() {
+                    lifecycle.latest_activity = "OpenCode produced a structured Result".into();
+                }
+            }
+            Some("step_finish") => {
+                lifecycle.latest_activity = "OpenCode finished a step".into();
+            }
+            Some("tyrion.opencode.usage") => {
+                if lifecycle.usage_reported {
+                    return Err(TyrionError::InvalidRequest(
+                        "OpenCode adapter emitted more than one authoritative usage report".into(),
+                    ));
+                }
+                lifecycle.input_tokens = unsigned(event, "input_tokens")?;
+                lifecycle.output_tokens = unsigned(event, "output_tokens")?;
+                lifecycle.usage_reported = true;
+            }
+            Some("tyrion.opencode.interrupt") => lifecycle.interrupted = true,
+            Some("error") => {
+                lifecycle.terminal_state = "failed".into();
+                lifecycle.latest_activity = "OpenCode reported an error".into();
+            }
+            Some("tyrion.opencode.settled") => {
+                if lifecycle.terminal_state != "failed" {
+                    lifecycle.terminal_state = required_string(event, "status")?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(lifecycle)
+}
+
 fn required_string(value: &Value, field: &str) -> Result<String, TyrionError> {
     value[field]
         .as_str()
@@ -757,6 +812,51 @@ mod tests {
             report.latest_meaningful_activity,
             "Claude produced a structured Result"
         );
+    }
+
+    #[test]
+    fn opencode_server_passes_the_shared_worker_adapter_contract() {
+        // Shapes observed from the real OpenCode 1.18.32 binary.
+        let report = validate_trace(
+            StructuredAdapterKind::OpenCodeServer,
+            &[
+                ready("ses_opencode"),
+                invoked(),
+                json!({"type":"tyrion.opencode.started", "session_id":"ses_opencode"}),
+                json!({"type":"step_start", "part":{"type":"step-start"}}),
+                json!({"type":"tool_use", "part":{"type":"tool", "tool":"apply_patch"}}),
+                json!({"type":"step_finish", "part":{"reason":"tool-calls", "tokens":{"input":5919, "output":40, "reasoning":72, "cache":{"read":0, "write":0}}}}),
+                json!({"type":"text", "part":{"type":"text", "text":"implemented backend"}}),
+                json!({"type":"step_finish", "part":{"reason":"stop", "tokens":{"input":292, "output":5, "reasoning":0, "cache":{"read":5760, "write":0}}}}),
+                json!({"type":"tyrion.opencode.usage", "input_tokens":11971, "output_tokens":117}),
+                json!({"type":"tyrion.opencode.settled", "status":"completed"}),
+                result("implemented backend"),
+            ],
+            expectation(),
+        )
+        .unwrap();
+        assert_eq!(report.terminal_state, "completed");
+        assert_eq!(report.native_session_id, "ses_opencode");
+        assert_eq!(report.input_tokens, 11971);
+        assert_eq!(report.output_tokens, 117);
+        assert_eq!(report.result_summary, "implemented backend");
+
+        let interrupted = validate_trace(
+            StructuredAdapterKind::OpenCodeServer,
+            &[
+                ready("ses_opencode"),
+                invoked(),
+                json!({"type":"tyrion.opencode.started", "session_id":"ses_opencode"}),
+                json!({"type":"tyrion.opencode.interrupt"}),
+                // Interrupted before any step finished: usage still arrives.
+                json!({"type":"tyrion.opencode.usage", "input_tokens":6005, "output_tokens":177}),
+                json!({"type":"tyrion.opencode.settled", "status":"interrupted"}),
+            ],
+            expectation(),
+        )
+        .unwrap();
+        assert!(interrupted.interrupted);
+        assert_eq!(interrupted.terminal_state, "interrupted");
     }
 
     #[test]
