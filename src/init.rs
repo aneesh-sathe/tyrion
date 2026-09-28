@@ -146,7 +146,9 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
     let mut destinations = Vec::new();
     let mut configurations = Vec::new();
     if !claude_credentials.is_empty() {
-        destinations.push(json!({"host": "api.anthropic.com", "port": 443}));
+        // Each Worker gets relays only to its own provider.
+        destinations
+            .push(json!({"host": "api.anthropic.com", "port": 443, "harnesses": ["claude"]}));
         let mut claude = configuration(
             "claude-default",
             "claude",
@@ -169,8 +171,10 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
         configurations.push(claude);
     }
     if codex_auth.is_some() {
-        destinations.push(json!({"host": "chatgpt.com", "port": 443}));
-        destinations.push(json!({"host": "auth.openai.com", "port": 443}));
+        for host in ["chatgpt.com", "auth.openai.com"] {
+            destinations
+                .push(json!({"host": host, "port": 443, "harnesses": ["codex", "opencode"]}));
+        }
         configurations.push(configuration(
             "codex-default",
             "codex",

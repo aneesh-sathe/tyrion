@@ -48,7 +48,7 @@ launched anything else.
 | `docker_sha256` | SHA-256 of the Docker CLI this host will run. A silent Docker Desktop upgrade fails closed. |
 | `docker_version` | Exact `docker --version` output. |
 | `docker_host` | Explicit daemon address. Tyrion never resolves an ambient Docker context. |
-| `egress` | Omit for no network at all. Otherwise exactly the destinations a Worker may reach, each behind its own destination-pinned relay on a per-Attempt internal bridge. |
+| `egress` | Omit for no network at all. Otherwise exactly the destinations a Worker may reach, each behind its own destination-pinned relay on a per-Attempt internal bridge. A destination's optional `harnesses` list limits it to those harnesses' Workers; `init` scopes Anthropic to Claude and the OpenAI pair to Codex and OpenCode. |
 | `codex_auth_file` | The host Codex login. Tyrion copies only its token fields into each Codex or OpenCode sandbox, from memory, at dispatch. Required when `opencode` is set. |
 | `claude`, `opencode` | Each harness's pinned version, checked inside every sandbox. OpenCode must be `1.18.32`, the release its adapter speaks. |
 | `worker_credentials` | Names of environment variables `tyriond` was started with that may be forwarded into a Worker execution. Empty by default: availability on the host is not permission to use it. |

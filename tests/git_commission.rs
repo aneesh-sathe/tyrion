@@ -187,6 +187,55 @@ fn real_opencode_worker_completes_the_contained_git_assignment() {
 }
 
 #[test]
+fn contained_codex_receives_the_subscription_login() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let principal_checkout = temp.path().join("principal-checkout");
+    let base_revision = create_principal_repository(&principal_checkout);
+    let fake_state = temp.path().join("fake-docker");
+    fs::create_dir(&fake_state).unwrap();
+    fs::write(fake_state.join("expect-codex-login"), "").unwrap();
+    let fake_docker = write_executable(
+        &temp.path().join("docker"),
+        include_str!("fixtures/fake_docker.sh"),
+    );
+    let fake_codex = write_executable(
+        &temp.path().join("codex"),
+        include_str!("fixtures/fake_codex.sh"),
+    );
+    let runtime = write_runtime_fixture(temp.path(), &fake_docker, &fake_codex);
+    let login = temp.path().join("codex-auth.json");
+    fs::write(
+        &login,
+        serde_json::to_vec(&json!({
+            "tokens": {
+                "id_token": "fixture-id",
+                "access_token": "fixture-access",
+                "refresh_token": "fixture-refresh",
+                "account_id": "fixture-account"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut config: Value = serde_json::from_slice(&fs::read(&runtime).unwrap()).unwrap();
+    config["codex_auth_file"] = json!(login);
+    fs::write(&runtime, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    let daemon = RunningDaemon::start(&data_dir, &runtime, &fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal_path = temp.path().join("proposal.json");
+    write_git_proposal(&proposal_path, &principal_checkout, &base_revision);
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal_path);
+
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    // The login travelled over stdin, never on a Docker command line.
+    let log = fs::read_to_string(fake_state.join("commands.log")).unwrap();
+    assert!(!log.contains("fixture-refresh"));
+}
+
+#[test]
 fn contained_codex_result_is_verified_integrated_and_verified_again() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");

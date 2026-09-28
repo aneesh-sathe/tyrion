@@ -976,6 +976,65 @@ fn opencode_routes_and_executes_with_the_shared_worker_contract() {
 }
 
 #[test]
+fn each_worker_reaches_only_its_own_harness_destinations() {
+    for (configuration_id, own, other) in [
+        ("claude-opus-review", "api.anthropic.com", "chatgpt.com"),
+        ("opencode-default", "chatgpt.com", "api.anthropic.com"),
+    ] {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let data_dir = temp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(
+            temp.path().join("egress.json"),
+            serde_json::to_vec(&json!({"destinations": [
+                {"host": "api.anthropic.com", "port": 443, "harnesses": ["claude"]},
+                {"host": "chatgpt.com", "port": 443, "harnesses": ["codex", "opencode"]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog = write_worker_catalog_value(temp.path(), worker_catalog_with_opencode());
+        let daemon = RunningDaemon::start_with_arguments(&data_dir, &catalog, &[]);
+        let attachment_token =
+            connect_full_entry(&daemon, "codex", &format!("egress-{configuration_id}"));
+        let proposal_path = write_deterministic_routing_proposal(temp.path());
+        let mut proposal: Value =
+            serde_json::from_slice(&fs::read(&proposal_path).unwrap()).unwrap();
+        proposal["worker_requirements"]["require_configurations"] = json!([configuration_id]);
+        if configuration_id == "opencode-default" {
+            proposal["resource_ceilings"]["max_model_spend_cents"] = json!(0);
+            proposal["worker_requirements"]["skills"] = json!([]);
+        }
+        fs::write(
+            &proposal_path,
+            serde_json::to_vec_pretty(&proposal).unwrap(),
+        )
+        .unwrap();
+        let accepted = create_and_accept(
+            &daemon,
+            &attachment_token,
+            &proposal_path,
+            &format!("egress-{configuration_id}"),
+        );
+        let commission_id = accepted["commission"]["id"].as_str().unwrap();
+        wait_for_commission_status(
+            &daemon,
+            &attachment_token,
+            commission_id,
+            "verified_complete",
+        );
+        let log = fs::read_to_string(temp.path().join("fake-docker/commands.log")).unwrap();
+        // The Worker is mapped to a relay for its own provider and has no
+        // route of any kind to the other harness's provider.
+        assert!(
+            log.contains(&format!("{own}:10.88.0.2")),
+            "{configuration_id} lacks {own}"
+        );
+        assert!(!log.contains(other), "{configuration_id} can reach {other}");
+    }
+}
+
+#[test]
 fn incomplete_pi_worker_is_visibly_ineligible() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let data_dir = temp.path().join("data");
@@ -2892,36 +2951,36 @@ fn write_runtime_fixture(root: &Path, docker: &Path, codex: &Path, claude: &Path
     )
     .unwrap();
     let config = root.join("codex-worker.json");
-    fs::write(
-        &config,
-        serde_json::to_vec_pretty(&json!({
-            "docker_binary": docker,
-            "docker_sha256": sha256_file(docker),
-            "docker_version": "Docker version 28.0.4, build fixture",
-            "docker_host": "unix:///fixture/docker.sock",
-            "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
-            "worker_image_id": format!("sha256:{}", "1".repeat(64)),
-            "codex_version": "codex-cli 0.156.1",
-            "model": "fixture-model",
-            "claude": {"version": "2.1.204 (Claude Code)"},
-            "pi": {
-                "model_provider": "openai",
-                "model": "openai/fixture-pi",
-                "version": "2.1.204 (Claude Code)"
-            },
-            "opencode": {"version": "1.18.32"},
-            "codex_auth_file": login,
-            "lease_ttl_seconds": 30,
-            "memory_request_mib": 320,
-            "cpu_request_millis": 250,
-            "vcpus": 2,
-            "memory_mib": 3072,
-            "writable_storage_mib": 2048,
-            "max_processes": 256
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let mut runtime = json!({
+        "docker_binary": docker,
+        "docker_sha256": sha256_file(docker),
+        "docker_version": "Docker version 28.0.4, build fixture",
+        "docker_host": "unix:///fixture/docker.sock",
+        "worker_image": format!("registry.invalid/tyrion-worker@sha256:{}", "b".repeat(64)),
+        "worker_image_id": format!("sha256:{}", "1".repeat(64)),
+        "codex_version": "codex-cli 0.156.1",
+        "model": "fixture-model",
+        "claude": {"version": "2.1.204 (Claude Code)"},
+        "pi": {
+            "model_provider": "openai",
+            "model": "openai/fixture-pi",
+            "version": "2.1.204 (Claude Code)"
+        },
+        "opencode": {"version": "1.18.32"},
+        "codex_auth_file": login,
+        "lease_ttl_seconds": 30,
+        "memory_request_mib": 320,
+        "cpu_request_millis": 250,
+        "vcpus": 2,
+        "memory_mib": 3072,
+        "writable_storage_mib": 2048,
+        "max_processes": 256
+    });
+    // A test that exercises brokered egress supplies the destinations.
+    if let Ok(egress) = fs::read(root.join("egress.json")) {
+        runtime["egress"] = serde_json::from_slice(&egress).unwrap();
+    }
+    fs::write(&config, serde_json::to_vec_pretty(&runtime).unwrap()).unwrap();
     config
 }
 

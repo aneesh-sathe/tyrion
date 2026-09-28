@@ -67,8 +67,14 @@ case "$operation" in
             esac
         done
         [[ -n $name ]]
-        # Every sandbox must be created with the whole hardened profile.
-        for required in --read-only --cap-drop --security-opt --user --tmpfs --pids-limit --memory --cpus; do
+        # Every sandbox must be created with the whole hardened profile. An
+        # egress relay holds no files and only forwards bytes, so it runs
+        # without a writable mount or a CPU share, but is hardened otherwise.
+        required_flags=(--read-only --cap-drop --security-opt --user --tmpfs --pids-limit --memory --cpus)
+        if [[ $name =~ -net-r[0-9]+$ ]]; then
+            required_flags=(--read-only --cap-drop --security-opt --user --pids-limit --memory)
+        fi
+        for required in "${required_flags[@]}"; do
             if [[ " ${seen[*]-} " != *" $required "* ]]; then
                 printf 'fake docker: missing hardening flag %s\n' "$required" >&2
                 exit 64
@@ -93,7 +99,7 @@ case "$operation" in
         ;;
     logs)
         name=$1
-        cat "$state/containers/$name/stderr" 2>/dev/null >&2 || true
+        cat "$state/containers/$name/stderr" >&2 2>/dev/null || true
         ;;
     inspect)
         format=

@@ -35,6 +35,13 @@ done
 
 test -n "$repo"
 test -n "$output"
+# HOME is $state/containers/<name>/home inside the fake sandbox.
+state_dir=$(dirname "$(dirname "$(dirname "$HOME")")")
+if [ -e "$state_dir/expect-codex-login" ] &&
+    ! grep -qF '"account_id":"fixture-account"' "${CODEX_HOME:-/nonexistent}/auth.json" 2>/dev/null; then
+    printf '%s\n' 'Codex login was not delivered to CODEX_HOME' >&2
+    exit 71
+fi
 if env | grep -E '^(OPENAI_API_KEY|AWS_ACCESS_KEY_ID|GH_TOKEN|GITHUB_TOKEN|SSH_AUTH_SOCK)=' >/dev/null; then
     printf '%s\n' 'ambient credential reached Codex' >&2
     exit 70

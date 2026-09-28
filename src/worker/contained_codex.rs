@@ -111,7 +111,21 @@ struct EgressConfig {
 struct EgressDestination {
     host: String,
     port: u16,
+    /// The harnesses whose Workers may reach this destination. Empty means
+    /// every harness, so a single-harness runtime needs no scoping; with more
+    /// than one, each Worker gets relays only to its own provider.
+    #[serde(default)]
+    harnesses: Vec<String>,
 }
+
+impl EgressDestination {
+    fn serves(&self, harness: &str) -> bool {
+        self.harnesses.is_empty() || self.harnesses.iter().any(|name| name == harness)
+    }
+}
+
+/// Harness names a brokered destination may be scoped to.
+const EGRESS_HARNESSES: [&str; 4] = ["codex", "claude", "pi", "opencode"];
 
 /// The ceilings one Worker container runs under. The runtime pins the largest
 /// profile any Worker may have; a Worker Configuration may declare a smaller
@@ -528,6 +542,7 @@ impl ContainedCodexRuntime {
                 .map(|egress| egress
                     .destinations
                     .iter()
+                    .filter(|destination| destination.serves("codex"))
                     .map(|destination| format!("{}:{}", destination.host, destination.port))
                     .collect::<Vec<_>>())
                 .unwrap_or_default()),
@@ -579,7 +594,9 @@ impl ContainedCodexRuntime {
             self,
             &sandbox_name,
             &assignment.attempt_id,
-            NetworkPolicy::Brokered,
+            NetworkPolicy::Brokered {
+                harness: &configuration.harness,
+            },
             configuration
                 .containment_resources
                 .unwrap_or_else(|| self.resource_profile()),
@@ -934,7 +951,7 @@ impl ContainedCodexRuntime {
             self,
             &sandbox_name,
             &assignment.attempt_id,
-            NetworkPolicy::Brokered,
+            NetworkPolicy::Brokered { harness: "codex" },
             self.assignment_profile(assignment),
             assignment.lease_expires_at,
         )?;
@@ -961,6 +978,9 @@ impl ContainedCodexRuntime {
                 "Codex binary version does not match its pin".into(),
             ));
         }
+        // After preflight, like the structured path, so the ambient-credential
+        // assertion stays exact.
+        self.deliver_codex_login(&sandbox, assignment.lease_expires_at)?;
         let prompt_path = artifact_dir.join("prompt.txt");
         fs::write(&prompt_path, worker_prompt(assignment, base_revision))?;
         sandbox.upload(
@@ -1387,11 +1407,12 @@ struct Sandbox<'a> {
 }
 
 /// Whether a sandbox may reach anything at all. Verification runs are always
-/// denied; Worker Attempts reach only the configured brokered destinations.
+/// denied; Worker Attempts reach only the configured brokered destinations
+/// that serve their harness.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NetworkPolicy {
+enum NetworkPolicy<'h> {
     Denied,
-    Brokered,
+    Brokered { harness: &'h str },
 }
 
 impl<'a> Sandbox<'a> {
@@ -1399,15 +1420,30 @@ impl<'a> Sandbox<'a> {
         runtime: &'a ContainedCodexRuntime,
         name: &str,
         attempt_id: &str,
-        policy: NetworkPolicy,
+        policy: NetworkPolicy<'_>,
         resources: ResourceProfile,
         deadline: i64,
     ) -> Result<Self, TyrionError> {
-        let network = match (policy, runtime.config.egress.as_ref()) {
-            (NetworkPolicy::Brokered, Some(egress)) => Some(AttemptNetwork::create(
-                runtime, name, attempt_id, egress, deadline,
-            )?),
-            _ => None,
+        let destinations: Vec<&EgressDestination> = match policy {
+            NetworkPolicy::Brokered { harness } => runtime
+                .config
+                .egress
+                .iter()
+                .flat_map(|egress| &egress.destinations)
+                .filter(|destination| destination.serves(harness))
+                .collect(),
+            NetworkPolicy::Denied => Vec::new(),
+        };
+        let network = if destinations.is_empty() {
+            None
+        } else {
+            Some(AttemptNetwork::create(
+                runtime,
+                name,
+                attempt_id,
+                &destinations,
+                deadline,
+            )?)
         };
         let mut sandbox = Self {
             runtime,
@@ -1839,7 +1875,7 @@ impl<'a> AttemptNetwork<'a> {
         runtime: &'a ContainedCodexRuntime,
         name: &str,
         attempt_id: &str,
-        egress: &EgressConfig,
+        destinations: &[&EgressDestination],
         deadline: i64,
     ) -> Result<Self, TyrionError> {
         let label = format!("{ATTEMPT_LABEL}={attempt_id}");
@@ -1850,7 +1886,7 @@ impl<'a> AttemptNetwork<'a> {
             relays: Vec::new(),
             aliases: Vec::new(),
         };
-        if let Err(error) = network.build(&label, egress, deadline) {
+        if let Err(error) = network.build(&label, destinations, deadline) {
             let _ = network.remove();
             return Err(error);
         }
@@ -1860,7 +1896,7 @@ impl<'a> AttemptNetwork<'a> {
     fn build(
         &mut self,
         label: &str,
-        egress: &EgressConfig,
+        destinations: &[&EgressDestination],
         deadline: i64,
     ) -> Result<(), TyrionError> {
         self.runtime.docker_checked(
@@ -1878,7 +1914,7 @@ impl<'a> AttemptNetwork<'a> {
             &["network", "create", "--label", label, &self.egress],
             deadline,
         )?;
-        for (index, destination) in egress.destinations.iter().enumerate() {
+        for (index, destination) in destinations.iter().enumerate() {
             let relay = format!("{}-r{index}", self.internal);
             let port = destination.port.to_string();
             // The relay starts on the egress bridge so it can reach the
@@ -2146,6 +2182,16 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
                 return Err(TyrionError::InvalidRequest(
                     "each brokered egress destination needs a host and a nonzero port".into(),
                 ));
+            }
+            if let Some(unknown) = destination
+                .harnesses
+                .iter()
+                .find(|name| !EGRESS_HARNESSES.contains(&name.as_str()))
+            {
+                return Err(TyrionError::InvalidRequest(format!(
+                    "brokered egress destination {} names unknown harness {unknown}",
+                    destination.host
+                )));
             }
         }
     }
@@ -2538,13 +2584,13 @@ codex_credential_env="{forwarded}""#
         r#"#!/bin/sh
 set -eu
 root=${{TYRION_WORKSPACE_ROOT:-/sandbox}}
-mkdir -p "$root/home"
-chmod 700 "$root/home"
+mkdir -p "$root/home" "$root/.codex"
+chmod 700 "$root/home" "$root/.codex"
 git clone -q "$root/base.bundle" "$root/repository"
 printf '%s\n' {byproducts} >>"$root/repository/.git/info/exclude"
 git -C "$root/repository" checkout -q --detach {base}
 {auth_setup}
-env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/home/.codex" \
+env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/home" CODEX_HOME="$root/.codex" \
   TMPDIR="$root/tmp" $codex_credential_env \
   "${{TYRION_HARNESS_ROOT:-/opt/tyrion/harness}}/codex" exec --json --ephemeral --ignore-user-config \
   --dangerously-bypass-approvals-and-sandbox -C "$root/repository" \
