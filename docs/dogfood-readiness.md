@@ -25,49 +25,26 @@ TYRION_CAPTURE_COMMISSION_RECORD="$PWD/.scratch/issue-16-safe-smoke.json" \
   -- --exact
 ```
 
-## Current actionable Blocker
+## Production result
 
-2026-09-21 containment replacement: plain Docker replaced the repaired
-OpenShell MicroVM as the Worker containment boundary, removing Tyrion's
-custom-kernel distribution burden. Every ceiling the profile requires is now
-enforced by the Docker daemon from outside the container and was measured,
-including the 256-process ceiling stock Docker Sandboxes could not enforce.
-[Qualification and complete claim set](prototypes/docker-containment-qualification.md).
-This is a no-model boundary qualification. No real Worker has executed on it,
-so it is not a dogfood readiness claim and issue 16 remains open.
+On 2026-09-28 one real Commission combined every issue 16 criterion. Two
+harnesses, Codex and OpenCode, worked four Assignments on a Git repository in
+the Docker boundary. The run included:
 
-Two contract changes need an explicit Principal decision before production
-eligibility changes:
+- one dependency-ordered Integration and an approved local effect outside the
+  checkout
+- adversarial probes of the live Worker containers
+- a planned Worker interruption, and Entry Session loss with replay and
+  takeover
+- a learned preference applied and receipted
 
-1. **Resources.** 2 vCPU / 2048 MiB memory / 4096 MiB overlay became 2 vCPU /
-   6144 MiB combined memory-and-files / 4096 MiB writable storage / 256
-   processes. Same host envelope, one hard combined ceiling plus a hard
-   storage sub-ceiling, because the memory cgroup charges tmpfs pages.
-2. **Credentials.** A declared provider credential now reaches the Worker
-   execution's environment, scoped to one `docker exec`. The OpenShell provider
-   kept it out of the Attempt entirely. Destination pinning still prevents
-   sending it elsewhere; it does not bound spend or disclosure at the
-   destination.
+It reached `verified_complete` in 109 seconds with no Security Invariant
+failure, and was reproduced twice more. The mandate, record, probes, driver,
+criterion-by-criterion assessment, and the limits of the claim are in
+[`dogfood-records/2026-09-28-readiness/`](dogfood-records/2026-09-28-readiness/README.md).
 
-2026-09-11 Docker Sandboxes qualification: rejected. No process-ceiling or
-storage flag exists, `--allow-network` and `--ttl` are cloud-only, `--skills`
-defaults to a writable mount, and `--clone` bind-mounts the host repository.
-[Results and limits](prototypes/docker-sandboxes-qualification.md) are retained
-as evidence.
-
-Do not claim dogfood readiness until one small production Commission runs on
-the Docker boundary with eligible real Worker providers. The run must use the
-exact production Worker configurations in its exported record and combine all
-issue 16 criteria in that one Commission. The smallest next requirement is:
-
-> Provision the pinned Worker image and the Linux Codex binary, name the
-> authorized provider, model, credential variable, and spend limit, then run
-> one small Commission whose Principal checkout remains read-only and whose
-> only consequential effect targets a disposable local file.
-
-If those prerequisites are unavailable, preserve this Blocker and leave issue
-16 open. Do not substitute fixture evidence or a boundary qualification for the
-missing production run.
+The exporter still reports `unassessed`, never `ready`: that assessment is the
+Principal's to accept.
 
 ## Record review
 

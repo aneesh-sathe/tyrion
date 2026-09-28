@@ -65,6 +65,13 @@ Every claim below was measured against real models, with a checked-in record in
   [Claude host](docs/dogfood-records/2026-09-27-claude-host-plan.json).
 - Codex and Claude running **concurrently** on disjoint work, producing one
   verified integrated artifact and beating serial execution by 20.1 seconds.
+- **The whole dogfood bar in one Commission.** Codex and OpenCode Workers
+  extended a real repository in parallel. The run also covered an approved
+  local write outside the checkout, adversarial probes of every live Worker
+  container (0 of 123 attacks reached), a planned Worker interruption,
+  Entry Session loss with replay and takeover, and a learned preference that
+  every Worker followed. Verified complete in 109 seconds.
+  [Evidence](docs/dogfood-records/2026-09-28-readiness/README.md).
 - **OpenCode and Codex** in one plan: two Workers of each, verified in 63
   seconds against 200 seconds of serial Worker time.
   [Record](docs/dogfood-records/2026-09-27-opencode-cross-harness.json).
