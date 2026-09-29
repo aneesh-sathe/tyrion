@@ -31,6 +31,9 @@ binds its socket, which is correct but opaque. So `init`:
 - starts a throwaway daemon on the result and attaches an Entry Session to it,
   exactly as `tyrion claude` does, which proves every pin without spending
   model tokens
+- only then removes the Worker images earlier runs of `init` built. It never
+  forces, so an image a container still uses is kept and named, and it leaves
+  any image whose tag is not in its own digest format alone
 
 [`codex-worker.example.json`](codex-worker.example.json) shows the shape.
 Unknown fields are rejected.

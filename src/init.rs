@@ -264,6 +264,23 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
             elapsed.as_secs_f64()
         ),
     );
+    // Only now that the new runtime is proven are older images disposable.
+    let pruned = docker.prune_worker_images(&image_id);
+    if !pruned.removed.is_empty() {
+        println!(
+            "       removed {} older Worker image{}",
+            pruned.removed.len(),
+            if pruned.removed.len() == 1 { "" } else { "s" }
+        );
+    }
+    if !pruned.kept.is_empty() {
+        println!(
+            "       kept {} older Worker image{} still in use: {}",
+            pruned.kept.len(),
+            if pruned.kept.len() == 1 { "" } else { "s" },
+            pruned.kept.join(", ")
+        );
+    }
 
     println!();
     let ceiling = worker_ceiling(docker.cpus, docker.memory_mib);
@@ -518,6 +535,34 @@ impl Docker {
         Ok((id, true))
     }
 
+    /// Remove the Worker images earlier runs of `init` built, now that the
+    /// runtime pins a newer one. Only tags in init's own digest format are
+    /// touched, and never by force: Docker refuses an image a container still
+    /// uses, and that image is kept.
+    fn prune_worker_images(&self, current_id: &str) -> Pruned {
+        let listing = self
+            .command()
+            .args([
+                "images",
+                "tyrion-worker",
+                "--no-trunc",
+                "--format",
+                "{{.Tag}} {{.ID}}",
+            ])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        let mut pruned = Pruned::default();
+        for tag in stale_worker_tags(&listing, current_id) {
+            let reference = format!("tyrion-worker:{tag}");
+            match self.command().args(["image", "rm", &reference]).output() {
+                Ok(output) if output.status.success() => pruned.removed.push(reference),
+                _ => pruned.kept.push(reference),
+            }
+        }
+        pruned
+    }
+
     fn image_id(&self, tag: &str) -> Option<String> {
         run(self
             .command()
@@ -525,6 +570,29 @@ impl Docker {
         .ok()
         .map(text)
     }
+}
+
+#[derive(Default)]
+struct Pruned {
+    removed: Vec<String>,
+    kept: Vec<String>,
+}
+
+/// Tags in `docker images tyrion-worker --format '{{.Tag}} {{.ID}}'` output
+/// that init built (twelve hex digits) and that are not the current image.
+fn stale_worker_tags(listing: &str, current_id: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(tag, id)| {
+            tag.len() == 12
+                && tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && id.trim() != current_id
+        })
+        .map(|(tag, _)| tag.to_owned())
+        .collect()
 }
 
 fn find_docker() -> Option<PathBuf> {
@@ -1109,6 +1177,22 @@ fn tail(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_older_images_init_built_are_stale() {
+        let current = "sha256:aaaa";
+        let listing = "ab7ca8cfdac7 sha256:aaaa\n\
+                       346a3e366cc2 sha256:bbbb\n\
+                       2026-09-22 sha256:cccc\n\
+                       latest sha256:dddd\n\
+                       ABCDEF123456 sha256:eeee\n\
+                       fff343fd301b sha256:ffff\n";
+        assert_eq!(
+            stale_worker_tags(listing, current),
+            ["346a3e366cc2", "fff343fd301b"]
+        );
+        assert!(stale_worker_tags("", current).is_empty());
+    }
 
     #[test]
     fn docker_architectures_map_to_published_linux_builds() {
