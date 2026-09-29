@@ -152,4 +152,4 @@ explains each field.
   contract every harness meets
 - [Effects](reference/effects.md): approved actions that need a credential
 - [OpenCode](reference/opencode.md) and [Pi](reference/pi.md): harness notes
-- [Proof](proof/README.md): the recorded runs behind every claim
+- [Results](results.md): the recorded runs behind every claim

@@ -58,7 +58,6 @@ a typed Required Skill failure. It declares no monetary budget, like Codex.
 - Real proof, 2026-09-27: two OpenCode and two Codex Workers ran one ledger
   plan concurrently and reached `verified_complete` in 63 seconds against 200
   seconds of serial Worker time, with no failed Evidence.
-  [Record](../proof/2026-09-27-opencode-cross-harness.json).
 
 ## Running the real test
 

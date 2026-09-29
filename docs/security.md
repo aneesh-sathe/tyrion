@@ -80,12 +80,10 @@ uncertain, Tyrion stops and asks.
 
 These are claims only because they were attacked:
 
-- **Qualification** ([record](proof/2026-09-21-containment-qualification.md)):
-  every limit above was measured from inside a container. A fork bomb stopped
+- **Qualification:** every limit above was measured from inside a container. A fork bomb stopped
   at 256; memory, disk and CPU held; and guest root could not raise any of
   them.
-- **Live Workers**
-  ([probes](proof/2026-09-28-readiness/probe-worker-1.txt)): during a real
+- **Live Workers:** during a real
   job, 26 attacks were run inside each of three running Worker containers,
   and none reached anything. They tried becoming root, mounting, reading your
   home and checkout, writing system folders, raising their own limits,

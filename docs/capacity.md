@@ -17,8 +17,9 @@ Admission sums the requests of every running Worker, across all Commissions,
 against what the container runtime reports, less 1024 MiB kept back for the
 engine and the egress relays. The ceilings contain a Worker that runs away.
 
-On a 12-CPU Docker VM with 7.7 GiB that admits **21 Workers at once**. With
-16 GiB, CPU binds first at 48.
+On a 12-CPU Docker VM with 7.7 GiB that admits **21 Workers at once**, and a
+real run of 21 concurrent Codex Workers verified all 21 (2026-09-29, 16.6 times
+faster than serial). With 16 GiB, memory and CPU both bind at 48.
 
 The previous profile was 2 vCPUs and 6144 MiB, reserved in full. It was
 inherited from an earlier sandbox design and never measured. On the same
@@ -45,8 +46,7 @@ The first four runs streamed the Codex and code-mode-host binaries into each
 Worker's tmpfs: 328 MiB of memory-charged files per Worker, identical in every
 one. The default-admission run used no capacity override (the daemon admitted
 all ten from Docker's own figures) and finished 565 seconds of Worker execution
-in a 64-second window, 8.8 times faster than serial. Its record is
-[`proof/2026-09-26-ten-concurrent-workers.json`](proof/2026-09-26-ten-concurrent-workers.json).
+in a 64-second window, 8.8 times faster than serial.
 
 The last run built the harnesses into the read-only image instead, so every
 container shares one copy. A Worker's peak now splits into roughly:
@@ -87,7 +87,7 @@ VM. The Attempt fails, and recovery treats it like any other failure.
 - **Heavier work is unmeasured.** These were small Python changes. A Worker
   building a large project will use more of its ceiling. Declare a heavier
   `containment_resources` request on that Worker Configuration.
-- **Model rate limits.** Ten concurrent Codex Workers on one ChatGPT
+- **Model rate limits.** Twenty-one concurrent Codex Workers on one ChatGPT
   subscription hit no limit here; a larger factory might.
 
 ## Reproducing

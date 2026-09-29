@@ -15,7 +15,6 @@
 - [OpenCode](reference/opencode.md) and [Pi](reference/pi.md)
 - [Worker runtime fields](../runtime/docker/README.md)
 
-**Proof**
+**Results**
 
-- [Every recorded run](proof/README.md), with instructions to check a record
-  yourself
+- [Every recorded run](results.md), and what an exported record holds

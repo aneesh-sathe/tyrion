@@ -3,24 +3,24 @@
   <desc id="desc">A request to add monthly interest, CSV export, daily limits and a CLI is split across four Workers. Vega and Altair run on OpenCode, Rigel and Lyra on Codex. The CLI waits for interest and export. Each result is checked, and the work merges into one branch: five of five checks passed, 122 seconds faster than running the work one piece at a time.</desc>
   <defs>
     <radialGradient id="stage" cx="50%" cy="0%" r="95%">
-      <stop offset="0" stop-color="#1a1a1f"/>
-      <stop offset="0.6" stop-color="#0a0a0c"/>
-      <stop offset="1" stop-color="#000"/>
+      <stop offset="0" stop-color="#2a150e"/>
+      <stop offset="0.6" stop-color="#140a07"/>
+      <stop offset="1" stop-color="#090504"/>
     </radialGradient>
     <clipPath id="promptClip"><rect x="80" y="104" width="1040" height="60"/></clipPath>
   </defs>
   <style>
     text { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
     .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-    .caption { font-size: 14px; font-weight: 600; letter-spacing: 2.4px; fill: #6e6e76; }
-    .prompt { font-size: 21px; fill: #ececf1; }
-    .handle { font-size: 24px; font-weight: 700; fill: #fff; letter-spacing: -0.3px; }
+    .caption { font-size: 14px; font-weight: 600; letter-spacing: 2.4px; fill: #9a8062; }
+    .prompt { font-size: 21px; fill: #f3e8d6; }
+    .handle { font-size: 24px; font-weight: 700; fill: #f8efe0; letter-spacing: -0.3px; }
     .harness { font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
-    .task { font-size: 20px; font-weight: 500; fill: #d8d8de; }
-    .path { font-size: 14px; fill: #6e6e76; }
-    .wait { font-size: 14px; font-weight: 500; fill: #8e8e96; letter-spacing: 0.2px; }
-    .result { font-size: 21px; font-weight: 600; fill: #d9f7e0; letter-spacing: -0.2px; }
-    .result-dim { font-size: 21px; font-weight: 500; fill: #8fbf9b; }
+    .task { font-size: 20px; font-weight: 500; fill: #e9dcc6; }
+    .path { font-size: 14px; fill: #8f7659; }
+    .wait { font-size: 14px; font-weight: 500; fill: #b39b7c; letter-spacing: 0.2px; }
+    .result { font-size: 21px; font-weight: 600; fill: #f8e3b4; letter-spacing: -0.2px; }
+    .result-dim { font-size: 21px; font-weight: 500; fill: #c9a878; }
 
     .anim { animation-duration: 14s; animation-iteration-count: infinite; animation-fill-mode: both; }
     .fb { transform-box: fill-box; }
@@ -65,20 +65,20 @@
   </style>
 
   <rect width="1200" height="648" rx="28" fill="url(#stage)"/>
-  <rect x="0.5" y="0.5" width="1199" height="647" rx="27.5" fill="none" stroke="#2c2c31"/>
+  <rect x="0.5" y="0.5" width="1199" height="647" rx="27.5" fill="none" stroke="#4a3420"/>
 
   <g class="anim scene">
     <text class="caption anim cap" x="64" y="70">A REAL RUN, REPLAYED</text>
-    <text class="caption anim cap" x="1136" y="70" text-anchor="end" style="fill:#48484f">TIMES COMPRESSED</text>
+    <text class="caption anim cap" x="1136" y="70" text-anchor="end" style="fill:#6a5540">TIMES COMPRESSED</text>
 
     <!-- The request -->
     <g class="anim box">
-      <rect x="64" y="96" width="1072" height="76" rx="18" fill="#111114" stroke="#27272c"/>
+      <rect x="64" y="96" width="1072" height="76" rx="18" fill="#1a0f0b" stroke="#3d2b1d"/>
       <text class="mono prompt" x="96" y="142">› Add monthly interest, CSV export, daily limits, and a CLI that uses them.</text>
       <g clip-path="url(#promptClip)">
         <g class="anim cover">
-          <rect x="121.2" y="108" width="1010" height="52" fill="#111114"/>
-          <rect class="caret" x="122.2" y="122" width="2" height="26" fill="#ececf1"/>
+          <rect x="121.2" y="108" width="1010" height="52" fill="#1a0f0b"/>
+          <rect class="caret" x="122.2" y="122" width="2" height="26" fill="#f3e8d6"/>
         </g>
       </g>
     </g>
@@ -86,63 +86,63 @@
     <!-- Lane 1: Vega, OpenCode, interest -->
     <g class="anim l1 fb">
       <text class="handle" x="96" y="232">Vega</text>
-      <text class="harness" x="96" y="256" fill="#bf5af2">OpenCode</text>
+      <text class="harness" x="96" y="256" fill="#e2575f">OpenCode</text>
       <text class="task" x="262" y="232">Monthly interest</text>
       <text class="mono path" x="262" y="256">ledger/interest.py</text>
-      <rect x="500" y="236" width="530" height="8" rx="4" fill="#1e1e23"/>
-      <rect class="anim b1 fb left" x="500" y="236" width="530" height="8" rx="4" fill="#bf5af2"/>
+      <rect x="500" y="236" width="530" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim b1 fb left" x="500" y="236" width="530" height="8" rx="4" fill="#c8323b"/>
       <g class="anim c1 fb center">
-        <circle cx="1078" cy="240" r="17" fill="#30d158"/>
-        <path d="M1070 240.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="1078" cy="240" r="17" fill="#d9a441"/>
+        <path d="M1070 240.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
 
     <!-- Lane 2: Rigel, Codex, export -->
     <g class="anim l2 fb">
       <text class="handle" x="96" y="316">Rigel</text>
-      <text class="harness" x="96" y="340" fill="#0a84ff">Codex</text>
+      <text class="harness" x="96" y="340" fill="#e6b75f">Codex</text>
       <text class="task" x="262" y="316">CSV export</text>
       <text class="mono path" x="262" y="340">ledger/export.py</text>
-      <rect x="500" y="320" width="530" height="8" rx="4" fill="#1e1e23"/>
-      <rect class="anim b2 fb left" x="500" y="320" width="530" height="8" rx="4" fill="#0a84ff"/>
+      <rect x="500" y="320" width="530" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim b2 fb left" x="500" y="320" width="530" height="8" rx="4" fill="#d9a441"/>
       <g class="anim c2 fb center">
-        <circle cx="1078" cy="324" r="17" fill="#30d158"/>
-        <path d="M1070 324.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="1078" cy="324" r="17" fill="#d9a441"/>
+        <path d="M1070 324.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
 
     <!-- Lane 3: Altair, OpenCode, limits -->
     <g class="anim l3 fb">
       <text class="handle" x="96" y="400">Altair</text>
-      <text class="harness" x="96" y="424" fill="#bf5af2">OpenCode</text>
+      <text class="harness" x="96" y="424" fill="#e2575f">OpenCode</text>
       <text class="task" x="262" y="400">Daily limits</text>
       <text class="mono path" x="262" y="424">ledger/limits.py</text>
-      <rect x="500" y="404" width="530" height="8" rx="4" fill="#1e1e23"/>
-      <rect class="anim b3 fb left" x="500" y="404" width="530" height="8" rx="4" fill="#bf5af2"/>
+      <rect x="500" y="404" width="530" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim b3 fb left" x="500" y="404" width="530" height="8" rx="4" fill="#c8323b"/>
       <g class="anim c3 fb center">
-        <circle cx="1078" cy="408" r="17" fill="#30d158"/>
-        <path d="M1070 408.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="1078" cy="408" r="17" fill="#d9a441"/>
+        <path d="M1070 408.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
 
     <!-- Lane 4: Lyra, Codex, CLI, which depends on interest and export -->
     <g class="anim l4 fb">
       <text class="handle" x="96" y="484">Lyra</text>
-      <text class="harness" x="96" y="508" fill="#0a84ff">Codex</text>
+      <text class="harness" x="96" y="508" fill="#e6b75f">Codex</text>
       <text class="task" x="262" y="484">Command-line tool</text>
       <text class="mono path" x="262" y="508">ledger/cli.py</text>
-      <rect x="500" y="488" width="530" height="8" rx="4" fill="#1e1e23"/>
+      <rect x="500" y="488" width="530" height="8" rx="4" fill="#2e1d14"/>
       <text class="wait anim waiting" x="500" y="476">waits for interest and export</text>
-      <rect class="anim b4 fb left" x="500" y="488" width="530" height="8" rx="4" fill="#0a84ff"/>
+      <rect class="anim b4 fb left" x="500" y="488" width="530" height="8" rx="4" fill="#d9a441"/>
       <g class="anim c4 fb center">
-        <circle cx="1078" cy="492" r="17" fill="#30d158"/>
-        <path d="M1070 492.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="1078" cy="492" r="17" fill="#d9a441"/>
+        <path d="M1070 492.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
 
     <!-- One branch -->
     <g class="anim res fb">
-      <rect x="64" y="544" width="1072" height="56" rx="16" fill="#0c1a10" stroke="#1f4a2a"/>
+      <rect x="64" y="544" width="1072" height="56" rx="16" fill="#241208" stroke="#7a5427"/>
       <text x="600" y="579" text-anchor="middle"><tspan class="result">One branch to review</tspan><tspan class="result-dim">   ·   5 of 5 checks passed on the merged code   ·   122 s faster than serial</tspan></text>
     </g>
   </g>
