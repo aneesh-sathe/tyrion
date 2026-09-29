@@ -48,6 +48,12 @@ enum TopLevelCommand {
         #[arg(long, default_value = "openai/gpt-5.6-sol")]
         opencode_model: String,
     },
+    /// Remove Tyrion's data and Docker leftovers, after naming any unmerged results.
+    Uninstall {
+        /// Remove without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Launch Claude Code as a Tyrion Entry Session.
     Claude {
         #[arg(last = true)]
@@ -463,6 +469,13 @@ fn main() {
         }
         return;
     }
+    if let TopLevelCommand::Uninstall { yes } = &arguments.command {
+        if let Err(error) = tyrion::run_uninstall(&tyrion::UninstallOptions { yes: *yes }) {
+            eprintln!("\nerror: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let TopLevelCommand::Claude { claude_arguments } = &arguments.command {
         if let Err(error) = launch_native_entry(
             NativeHarness::Claude,
@@ -845,7 +858,9 @@ fn attachment_handshake(
 fn build_request(arguments: &Arguments) -> Result<Request, tyrion::TyrionError> {
     let (command, idempotency_key, expected_revision, expected_control_revision) =
         match &arguments.command {
-            TopLevelCommand::Init { .. } | TopLevelCommand::Claude { .. } => {
+            TopLevelCommand::Init { .. }
+            | TopLevelCommand::Uninstall { .. }
+            | TopLevelCommand::Claude { .. } => {
                 return Err(tyrion::TyrionError::InvalidRequest(
                     "local commands must be handled before protocol request construction".into(),
                 ));

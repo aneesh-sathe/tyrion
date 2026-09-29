@@ -252,9 +252,27 @@ case "$operation" in
         attempt=${filter#label=tyrion.attempt=}
         for container in "$state/containers"/*; do
             [[ -d $container ]] || continue
-            if [[ -z $filter || -f $container/attempt-$attempt ]]; then
+            if [[ -z $filter ]]; then
+                basename "$container"
+            elif [[ $filter == label=tyrion.attempt ]]; then
+                compgen -G "$container/attempt-*" >/dev/null && basename "$container"
+            elif [[ -f $container/attempt-$attempt ]]; then
                 basename "$container"
             fi
+        done
+        ;;
+    images)
+        # images [--format ...] REPOSITORY: one "repository:tag" per line.
+        repository=${*: -1}
+        for image in "$state/images"/*; do
+            [[ -f $image ]] || continue
+            name=$(basename "$image")
+            [[ $name == "$repository":* ]] && printf '%s\n' "$name"
+        done
+        ;;
+    rmi)
+        for name in "$@"; do
+            rm -f "$state/images/$name"
         done
         ;;
     network)
@@ -285,6 +303,11 @@ case "$operation" in
                 fi
                 mkdir -p "$state/networks/$name"
                 [[ -z $subnet ]] || printf '%s\n' "$subnet" >"$state/networks/$name/subnet"
+                previous=
+                for argument in "$@"; do
+                    [[ $previous == --label ]] && printf '%s\n' "$argument" >"$state/networks/$name/label"
+                    previous=$argument
+                done
                 printf '%s\n' "$name"
                 ;;
             connect) printf '\n' ;;
@@ -293,7 +316,22 @@ case "$operation" in
                     rm -rf "${state:?}/networks/$name"
                 done
                 ;;
-            ls) : ;;
+            ls)
+                # --filter label=KEY matches any value; label=KEY=VALUE only that one.
+                filter=
+                previous=
+                for argument in "$@"; do
+                    [[ $previous == --filter ]] && filter=${argument#label=}
+                    previous=$argument
+                done
+                for network in "$state/networks"/*; do
+                    [[ -f $network/label ]] || continue
+                    label=$(cat "$network/label")
+                    if [[ -z $filter || $label == "$filter" || ${label%%=*} == "$filter" ]]; then
+                        basename "$network"
+                    fi
+                done
+                ;;
             *) printf 'unsupported fake network action: %s\n' "$action" >&2; exit 2 ;;
         esac
         ;;

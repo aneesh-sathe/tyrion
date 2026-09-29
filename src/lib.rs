@@ -14,6 +14,7 @@ mod init;
 mod native_entry_launcher;
 pub mod protocol;
 mod store;
+mod uninstall;
 mod worker;
 
 pub use client::send_request;
@@ -22,3 +23,4 @@ pub use entry_mcp::{run_entry_mcp, NativeHarness};
 pub use error::{ErrorCode, TyrionError};
 pub use init::{run_init, InitOptions};
 pub use native_entry_launcher::launch_native_entry;
+pub use uninstall::{run_uninstall, UninstallOptions};

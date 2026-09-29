@@ -620,6 +620,105 @@ fn concurrent_workers_never_exhaust_docker_address_pools() {
 }
 
 #[test]
+fn uninstall_names_unmerged_work_and_removes_everything_tyrion_made() {
+    let fixture = ParallelFixture::new();
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal = fixture.temp.path().join("proposal.json");
+    write_git_proposal(
+        &proposal,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+    // Where `tyrion init` leaves the runtime, and a Worker image it built.
+    fs::create_dir_all(fixture.data_dir.join("runtime")).unwrap();
+    fs::copy(
+        &fixture.runtime,
+        fixture.data_dir.join("runtime/worker-runtime.json"),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.fake_state.join("images")).unwrap();
+    fs::write(
+        fixture.fake_state.join("images/tyrion-worker:abc123def456"),
+        "",
+    )
+    .unwrap();
+
+    let uninstall = |input: &str, arguments: &[&str]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tyrion"))
+            .arg("uninstall")
+            .args(arguments)
+            .env("TYRION_DATA_DIR", &fixture.data_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // Never pull Docker out from under a running Tyrion.
+    let running = uninstall("", &["--yes"]);
+    assert!(!running.status.success());
+    assert!(String::from_utf8_lossy(&running.stderr).contains("still running"));
+    drop(daemon);
+
+    // Answering anything but "delete" removes nothing, and names the work
+    // that exists only in Tyrion's data folder.
+    let declined = uninstall("no\n", &[]);
+    let declined_out = String::from_utf8_lossy(&declined.stdout);
+    assert!(!declined.status.success());
+    assert!(
+        declined_out.contains("Add issue-4.txt containing contained codex result."),
+        "{declined_out}"
+    );
+    assert!(fixture.data_dir.exists());
+    assert!(fixture
+        .fake_state
+        .join("images/tyrion-worker:abc123def456")
+        .exists());
+
+    // Once the result is merged, it is no longer reported as unmerged.
+    let integration = fixture
+        .data_dir
+        .join(format!("integrations/{commission_id}/repository"));
+    git(
+        &fixture.principal_checkout,
+        &["fetch", "-q", path_text(&integration), "tyrion-integration"],
+    );
+    git(
+        &fixture.principal_checkout,
+        &["merge", "-q", "--ff-only", "FETCH_HEAD"],
+    );
+    let removed = uninstall("delete\n", &[]);
+    let removed_out = String::from_utf8_lossy(&removed.stdout);
+    assert!(
+        removed.status.success(),
+        "{removed_out}{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!removed_out.contains("Add issue-4.txt"), "{removed_out}");
+    assert!(
+        removed_out.contains("brew uninstall tyrion"),
+        "{removed_out}"
+    );
+    assert!(!fixture.data_dir.exists());
+    assert!(!fixture
+        .fake_state
+        .join("images/tyrion-worker:abc123def456")
+        .exists());
+}
+
+#[test]
 fn contained_codex_result_is_verified_integrated_and_verified_again() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");

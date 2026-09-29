@@ -595,7 +595,7 @@ fn stale_worker_tags(listing: &str, current_id: &str) -> Vec<String> {
         .collect()
 }
 
-fn find_docker() -> Option<PathBuf> {
+pub(crate) fn find_docker() -> Option<PathBuf> {
     let on_path = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
