@@ -1718,7 +1718,7 @@ fn active_entry_session_inspects_steers_and_interrupts_by_worker_handle() {
     let commission_id = accepted["commission"]["id"].as_str().unwrap();
     let running = wait_for_worker_status(&daemon, &attachment_token, commission_id, "running");
     let worker = &running["workers"][0];
-    assert_eq!(worker["handle"], "Arya");
+    assert_eq!(worker["handle"], "Vega");
     assert!(worker["id"].as_str().is_some_and(|id| !id.is_empty()));
     assert_eq!(worker["assignment"]["logical_id"], "legacy-assignment");
     assert_eq!(worker["configuration"]["id"], "claude-opus-review");
@@ -1738,7 +1738,7 @@ fn active_entry_session_inspects_steers_and_interrupts_by_worker_handle() {
             "worker",
             "steer",
             commission_id,
-            "Arya",
+            "Vega",
             "--clarification",
             "Focus on the accepted greeting wording.",
             "--expected-revision",
@@ -1769,7 +1769,7 @@ fn active_entry_session_inspects_steers_and_interrupts_by_worker_handle() {
             "worker",
             "interrupt",
             commission_id,
-            "Arya",
+            "Vega",
             "--reason",
             "Principal requested a stop.",
             "--expected-revision",
@@ -1799,7 +1799,7 @@ fn active_entry_session_inspects_steers_and_interrupts_by_worker_handle() {
             "worker",
             "retry",
             commission_id,
-            "Arya",
+            "Vega",
             "--expected-revision",
             "1",
             "--idempotency-key",
@@ -1807,7 +1807,7 @@ fn active_entry_session_inspects_steers_and_interrupts_by_worker_handle() {
         ],
     );
     let retried = wait_for_worker_attempt(&daemon, &attachment_token, commission_id, 2, "running");
-    assert_ne!(retried["workers"][1]["handle"], "Arya");
+    assert_ne!(retried["workers"][1]["handle"], "Vega");
     assert_eq!(retried["attention_conditions"][0]["status"], "resolved");
 
     let second_handle = retried["workers"][1]["handle"].as_str().unwrap();
@@ -1860,11 +1860,11 @@ fn pi_native_commands_render_steer_interrupt_and_retry_controls() {
     pi.prompt("/tyrion-accept");
     let running = wait_for_pi_worker(&mut pi, 1, "running");
     let running_content = running["content"].as_str().unwrap();
-    assert!(running_content.contains("- Arya: running"));
+    assert!(running_content.contains("- Vega: running"));
     assert!(running_content.contains("controls: inspect, steer, interrupt"));
     assert!(running_content.contains("configuration claude-opus-review"));
 
-    pi.prompt("/tyrion-steer Arya Focus on the accepted greeting wording.");
+    pi.prompt("/tyrion-steer Vega Focus on the accepted greeting wording.");
     let steered = latest_pi_projection(&mut pi);
     assert_eq!(steered["worker_commands"][0]["kind"], "steer");
     assert_eq!(steered["worker_commands"][0]["status"], "delivered");
@@ -1873,7 +1873,7 @@ fn pi_native_commands_render_steer_interrupt_and_retry_controls() {
         .unwrap()
         .contains("accepted greeting wording"));
 
-    pi.prompt("/tyrion-interrupt Arya Principal requested a stop.");
+    pi.prompt("/tyrion-interrupt Vega Principal requested a stop.");
     let interrupted = wait_for_pi_worker(&mut pi, 1, "interrupted");
     assert!(interrupted["content"]
         .as_str()
@@ -1884,12 +1884,12 @@ fn pi_native_commands_render_steer_interrupt_and_retry_controls() {
         "interrupt"
     );
 
-    pi.prompt("/tyrion-retry Arya");
+    pi.prompt("/tyrion-retry Vega");
     let retried = wait_for_pi_worker(&mut pi, 2, "running");
     let second_handle = retried["details"]["commission"]["workers"][1]["handle"]
         .as_str()
         .unwrap();
-    assert_ne!(second_handle, "Arya");
+    assert_ne!(second_handle, "Vega");
     assert!(retried["content"].as_str().unwrap().contains(second_handle));
     assert_eq!(
         retried["details"]["commission"]["attention_conditions"][0]["status"],
@@ -1961,7 +1961,7 @@ fn workers_without_live_adapter_controls_expose_only_inspection() {
             "worker",
             "steer",
             commission_id,
-            "Arya",
+            "Vega",
             "--clarification",
             "This worker cannot receive steering.",
             "--expected-revision",
@@ -2009,7 +2009,7 @@ fn failed_interrupt_delivery_does_not_interrupt_the_worker_locally() {
             "worker",
             "interrupt",
             commission_id,
-            "Arya",
+            "Vega",
             "--reason",
             "Exercise the broken control pipe.",
             "--expected-revision",
@@ -2099,7 +2099,7 @@ fn structured_adapters_receive_steering_and_interruption() {
                 "worker",
                 "steer",
                 commission_id,
-                "Arya",
+                "Vega",
                 "--clarification",
                 "Preserve the accepted mandate.",
                 "--expected-revision",
@@ -2116,7 +2116,7 @@ fn structured_adapters_receive_steering_and_interruption() {
                 "worker",
                 "interrupt",
                 commission_id,
-                "Arya",
+                "Vega",
                 "--reason",
                 "Stop the structured adapter.",
                 "--planned-uncertainty",
@@ -2139,7 +2139,7 @@ fn structured_adapters_receive_steering_and_interruption() {
                 "worker",
                 "interrupt",
                 commission_id,
-                "Arya",
+                "Vega",
                 "--reason",
                 "Stop the structured adapter.",
                 "--planned-uncertainty",

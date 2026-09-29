@@ -5569,7 +5569,7 @@ impl Store {
             readiness_blockers.push(serde_json::json!({
                 "code": "failed_or_uncertain_effects",
                 "count": failed_or_uncertain_effects,
-                "requirement": "Reconcile every consequential effect before evaluating dogfood readiness.",
+                "requirement": "Reconcile every consequential effect before evaluating readiness.",
             }));
         }
         let readiness_status = if readiness_blockers.is_empty() {
@@ -5585,15 +5585,16 @@ impl Store {
             .filter(|criterion| criterion["status"] == "passed")
             .count();
         let summary_markdown = format!(
-            "# Tyrion Commission Record\n\nChecksum: `{checksum}`\n\nCommission: `{commission_id}`\n\nStatus: `{status}`\n\nDogfood readiness: `{readiness_status}`\n\nAcceptance Criteria: `{passed}/{criteria}` passed\n\nContainment scope: {containment_note}\n"
+            "# Tyrion Commission Record\n\nChecksum: `{checksum}`\n\nCommission: `{commission_id}`\n\nStatus: `{status}`\n\nReadiness: `{readiness_status}`\n\nAcceptance Criteria: `{passed}/{criteria}` passed\n\nContainment scope: {containment_note}\n"
         );
         Ok(serde_json::json!({
             "format": "tyrion.commission",
-            "version": 1,
+            // Version 2 renamed `dogfood_readiness` to `readiness`.
+            "version": 2,
             "exported_at": unix_timestamp_millis()?,
             "checksum": checksum,
             "record": record,
-            "dogfood_readiness": {
+            "readiness": {
                 "status": readiness_status,
                 "blockers": readiness_blockers,
                 "automatic_ready_claims_supported": false,
@@ -17500,23 +17501,11 @@ fn next_worker_handle(
     transaction: &Transaction<'_>,
     commission_id: &str,
 ) -> Result<String, TyrionError> {
+    // Stars: short, distinct, easy to say aloud when steering a Worker, and
+    // carrying no meaning. A handle names a Worker, never a capability.
     const HANDLES: [&str; 16] = [
-        "Arya",
-        "Brienne",
-        "Davos",
-        "Gendry",
-        "Grey Worm",
-        "Jaime",
-        "Jon",
-        "Meera",
-        "Missandei",
-        "Podrick",
-        "Samwell",
-        "Sansa",
-        "Theon",
-        "Tormund",
-        "Tyrion",
-        "Yara",
+        "Vega", "Rigel", "Altair", "Lyra", "Sirius", "Deneb", "Spica", "Mira", "Castor", "Pollux",
+        "Capella", "Antares", "Polaris", "Electra", "Hadar", "Izar",
     ];
     let count = transaction.query_row(
         "SELECT COUNT(*) FROM workers WHERE commission_id = ?1",

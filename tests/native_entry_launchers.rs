@@ -349,7 +349,7 @@ fn native_entry_mcp_runs_sequential_commissions_with_minimal_lifecycle_tools() {
         }),
     );
     let record = &exported["result"]["structuredContent"];
-    assert_eq!(record["version"], 1);
+    assert_eq!(record["version"], 2);
     assert!(record["checksum"]
         .as_str()
         .is_some_and(|checksum| checksum.starts_with("sha256:")));
@@ -358,7 +358,7 @@ fn native_entry_mcp_runs_sequential_commissions_with_minimal_lifecycle_tools() {
         "verified_complete"
     );
     // The exporter never self-certifies readiness.
-    assert_ne!(record["dogfood_readiness"]["status"], "ready");
+    assert_ne!(record["readiness"]["status"], "ready");
 
     daemon.restart();
     wait_for_current_commission(&mut input, &mut output, 50, "verified_complete");

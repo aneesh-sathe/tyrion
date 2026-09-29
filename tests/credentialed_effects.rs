@@ -167,7 +167,7 @@ fn brokered_effect_uses_a_single_keychain_credential_without_projecting_it() {
             "broker": {
                 "curl_binary": "/usr/bin/curl",
                 "curl_sha256": sha256_file(Path::new("/usr/bin/curl")),
-                "destinations": {"dogfood-api": destination}
+                "destinations": {"release-api": destination}
             }
         }))
         .unwrap(),
@@ -231,7 +231,7 @@ fn brokered_effect_uses_a_single_keychain_credential_without_projecting_it() {
             "plan_revision": 1,
             "credential_reference": credential_reference,
             "capability": "http_bearer",
-            "destination": "dogfood-api",
+            "destination": "release-api",
             "exposure": "brokered_only",
             "credential_expires_at": unix_timestamp() + 300,
             "revocation": "delete_from_keychain"
@@ -271,10 +271,10 @@ fn brokered_effect_uses_a_single_keychain_credential_without_projecting_it() {
             "confirmed_reconciliation_sha256": format!("{:x}", Sha256::digest(b"applied")),
             "not_applied_reconciliation_sha256": format!("{:x}", Sha256::digest(b"not-applied"))
         },
-        "destination": "dogfood-api",
+        "destination": "release-api",
         "effect": "external.write",
         "credential": {"grant_id": grant_id, "mode": "brokered"},
-        "consequences": ["Create the exact dogfood release marker"],
+        "consequences": ["Create the exact release marker"],
         "limits": {
             "max_output_bytes": 1024,
             "max_duration_seconds": 5,
@@ -455,7 +455,7 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
             "broker": {
                 "curl_binary": "/usr/bin/curl",
                 "curl_sha256": sha256_file(Path::new("/usr/bin/curl")),
-                "destinations": {"dogfood-api": destination}
+                "destinations": {"release-api": destination}
             },
             "effect_sandbox": {
                 "docker_binary": path_text(&docker),
@@ -467,7 +467,7 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
                 "adapter_binary": path_text(&adapter),
                 "adapter_sha256": sha256_file(&adapter),
                 "adapter_version": "tyrion-effect-adapter 1.0.0",
-                "destination": "dogfood-api",
+                "destination": "release-api",
                 "vcpus": 2,
                 "memory_mib": 6144,
                 "writable_storage_mib": 4096,
@@ -542,7 +542,7 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
             "plan_revision": 1,
             "credential_reference": credential_reference,
             "capability": "http_bearer",
-            "destination": "dogfood-api",
+            "destination": "release-api",
             "exposure": "one_shot",
             "credential_expires_at": unix_timestamp() + 300,
             "revocation": "delete_from_keychain"
@@ -582,10 +582,10 @@ fn stranded_one_shot_exposure_is_contained_before_reconciliation() {
             "confirmed_reconciliation_sha256": format!("{:x}", Sha256::digest(b"applied")),
             "not_applied_reconciliation_sha256": format!("{:x}", Sha256::digest(b"not-applied"))
         },
-        "destination": "dogfood-api",
+        "destination": "release-api",
         "effect": "external.write",
         "credential": {"grant_id": grant_id, "mode": "one_shot_exposure"},
-        "consequences": ["Create the exact one-shot dogfood release marker"],
+        "consequences": ["Create the exact one-shot release marker"],
         "limits": {
             "max_output_bytes": 1024,
             "max_duration_seconds": 5,
@@ -861,7 +861,7 @@ fn lost_acknowledgement_reconciles_read_only_without_replaying_the_effect() {
             "broker": {
                 "curl_binary": "/usr/bin/curl",
                 "curl_sha256": sha256_file(Path::new("/usr/bin/curl")),
-                "destinations": {"dogfood-api": destination}
+                "destinations": {"release-api": destination}
             }
         }))
         .unwrap(),
@@ -925,7 +925,7 @@ fn lost_acknowledgement_reconciles_read_only_without_replaying_the_effect() {
             "plan_revision": 1,
             "credential_reference": credential_reference,
             "capability": "http_bearer",
-            "destination": "dogfood-api",
+            "destination": "release-api",
             "exposure": "brokered_only",
             "credential_expires_at": unix_timestamp() + 300,
             "revocation": "delete_from_keychain"
@@ -967,7 +967,7 @@ fn lost_acknowledgement_reconciles_read_only_without_replaying_the_effect() {
             "confirmed_reconciliation_sha256": confirmed_sha256,
             "not_applied_reconciliation_sha256": not_applied_sha256
         },
-        "destination": "dogfood-api",
+        "destination": "release-api",
         "effect": "external.write",
         "credential": {"grant_id": grant_id, "mode": "brokered"},
         "consequences": ["Create one release marker without duplicate replay"],
@@ -1126,7 +1126,7 @@ fn proposal() -> Value {
             "repositories": [],
             "paths": [],
             "actions": ["deterministic.echo", "credential.http.request"],
-            "destinations": ["dogfood-api"],
+            "destinations": ["release-api"],
             "effects": ["external.write"]
         },
         "resource_ceilings": {

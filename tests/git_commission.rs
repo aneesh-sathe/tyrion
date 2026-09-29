@@ -636,7 +636,7 @@ fn contained_codex_result_is_verified_integrated_and_verified_again() {
     assert!(completed["attempts"][0]["worker_configuration"]
         .as_str()
         .is_some_and(|configuration| configuration.starts_with("contained-codex-")));
-    assert_eq!(completed["workers"][0]["handle"], "Arya");
+    assert_eq!(completed["workers"][0]["handle"], "Vega");
     assert_eq!(
         completed["workers"][0]["configuration"]["adapter"]["kind"],
         "contained_codex"
@@ -975,7 +975,7 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
         ],
     );
     assert_eq!(exported["format"], "tyrion.commission");
-    assert_eq!(exported["version"], 1);
+    assert_eq!(exported["version"], 2);
     assert_eq!(exported["record"]["commission"]["id"], commission_id);
     assert_eq!(
         exported["record"]["commission"]["status"],
@@ -1032,8 +1032,8 @@ fn codex_and_claude_structured_adapters_complete_one_git_commission() {
         .as_str()
         .unwrap()
         .contains("fixture-backed Worker evidence is not production containment attestation"));
-    assert_eq!(exported["dogfood_readiness"]["status"], "blocked");
-    assert!(exported["dogfood_readiness"]["blockers"]
+    assert_eq!(exported["readiness"]["status"], "blocked");
+    assert!(exported["readiness"]["blockers"]
         .as_array()
         .unwrap()
         .iter()
@@ -2172,8 +2172,8 @@ fn failed_containment_preflight_revokes_the_lease_without_launching_codex() {
             &commission_id,
         ],
     );
-    assert_eq!(exported["dogfood_readiness"]["status"], "blocked");
-    assert!(exported["dogfood_readiness"]["blockers"]
+    assert_eq!(exported["readiness"]["status"], "blocked");
+    assert!(exported["readiness"]["blockers"]
         .as_array()
         .unwrap()
         .iter()
