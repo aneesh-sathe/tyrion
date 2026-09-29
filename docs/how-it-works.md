@@ -1,121 +1,155 @@
-# Reference
+# How Tyrion works
 
-Detail that used to live in the README. Start with the [README](../README.md) if you have not read it.
+Start with the [README](../README.md). This page follows one job from the
+sentence you type to the branch you merge.
 
-## The vocabulary
+## One job, start to finish
 
-- A Principal is the person who accepts the mandate and approves consequential changes.
-- A Commission is the durable unit of work. It contains the Goal, criteria, authority, ceilings, plan, history, and outcome.
-- An Entry Session is the Agent Harness session used to inspect or control a Commission.
-- An Assignment is one planned piece of a Commission.
-- An Attempt is one Worker's bounded execution of an Assignment.
-- A Result is a candidate output. It remains unaccepted until verification passes.
-- Evidence records why a criterion passed, failed, or remains uncertain.
-- Verified Completion means every current criterion passed and every required gate closed.
+1. **You ask.** In Claude Code or Codex, launched through `tyrion claude` or
+   `tyrion codex`, you describe the job in your own words.
+2. **Your harness drafts a proposal.** It turns your words into a precise
+   proposal:
+   - the goal
+   - the checks that will prove it is done
+   - the files agents may change
+   - the time and storage limits
 
-These names appear in the CLI output and protocol. They are worth learning because Tyrion uses them precisely.
+   It sends the proposal to Tyrion, and nothing runs yet.
+3. **Tyrion plans.** Independent parts become separate pieces of work that can
+   run at once. Parts that depend on each other wait their turn. If you ask,
+   a planning agent drafts the plan and Tyrion checks it before anything
+   writes.
+4. **Agents work in sealed rooms.** Each piece goes to the harness best suited
+   to it, running inside its own disposable container with a copy of your
+   code and nothing else. Your checkout is never touched.
+5. **Tyrion checks every result twice.** First on its own, in a fresh
+   container. Then again after it is merged with everyone else's work, in
+   another fresh container. An agent saying "done" counts for nothing; only
+   the checks do.
+6. **You review one branch.** When every check passes, Tyrion reports the job
+   complete and gives you the exact commands to fetch, diff and merge.
 
-## How a real Commission runs
+If something fails, Tyrion keeps the evidence and picks a concrete next step:
 
-1. An Entry Session consumes a short-lived launch token and negotiates its capabilities. Tyrion derives Full, Limited, or Observer mode from the accepted manifest.
-2. The Entry Session submits a Commission Proposal. The proposal names the Goal, Acceptance Criteria, Authority Envelope, resource ceilings, and known uncertainties.
-3. The Principal reviews and accepts an exact revision. No Worker can start before this point.
-4. The daemon creates Assignments, reserves their complete resource budgets, and routes each one to an eligible Worker Configuration.
-5. A Worker receives one revision-bound launch message and an expiring Lease. It returns a candidate Result rather than a completion claim.
-6. Tyrion validates the candidate, runs the required checks, and integrates accepted Git work into daemon-owned state.
-7. Tyrion verifies the integrated artifact again. It commits Verified Completion only when every current criterion passes.
+- retry a passing hiccup once
+- hand the work to a better-suited agent
+- create a job to reconcile conflicting changes
+- stop and tell you exactly what it needs
 
-If a check fails, Tyrion keeps the Evidence and chooses a concrete recovery action. It may retry a transient failure once, route to a better fit, create a reconciliation Assignment, or stop at an actionable Blocker. A daemon restart does not erase this history.
+It never quietly gives up, and never quietly declares victory.
 
-## Authority and effects
+## The words Tyrion uses
 
-Harness capability is a technical limit, not permission. Effective authority is the intersection of three things:
+The output uses a small, precise vocabulary. Learn these and everything
+else reads plainly.
 
-- What the Entry Session or Worker can do
-- What the accepted Commission allows
-- What the current Assignment and Worker Lease grant
+| Word | Meaning |
+| --- | --- |
+| **Commission** | One job you delegate: its goal, checks, limits, plan, history and outcome |
+| **Assignment** | One planned piece of a Commission |
+| **Worker** | One agent working one Assignment, in its own container. Workers get short names like `Vega` or `Rigel` so you can steer them |
+| **Result** | What a Worker hands back. It is only a candidate until the checks pass |
+| **Evidence** | The recorded outcome of a check: passed, failed, or uncertain, and why |
+| **Verified Completion** | Every check passed on the merged result |
+| **Blocker** | The one thing Tyrion needs from you to continue |
+| **Entry Session** | Your Claude Code or Codex session, attached to Tyrion |
+| **Principal** | You: the person who approves the job and anything consequential |
 
-Consequential operations use exact, single-use Approval Gates. The approval binds the current revisions, target identity, parameters, consequences, limits, and operation digest. A changed request needs a new approval. Tyrion never treats ambient credentials or installed tools as authority.
+## Authority is granted, not assumed
 
-Credentialed effects use the macOS Keychain broker and, when necessary, a fresh one-shot Effect Sandbox. Secret values stay outside SQLite, Worker environments, Entry Sessions, command arguments, Evidence, and durable receipts. See [Credentialed effects](credentialed-effects.md).
+An agent is never trusted because it is capable. What a Worker may do is the
+overlap of three things:
 
-## Entry Sessions and Workers
+- what its harness can technically do
+- what the Commission you approved allows
+- what its current, expiring grant covers
 
-An Entry Session may observe many Commissions, but each Commission has one Active Attachment. Other Attachments remain observers until an explicit revision-checked takeover. Disconnecting every Entry Session does not stop accepted daemon work.
+Anything consequential stops at an **Approval Gate**. That covers writing a
+file outside the job, or calling an outside service. The approval binds the
+exact target, content, limits and revision. Change any of them and the
+approval no longer applies.
 
-Missing capabilities include the affected protocol operations, the practical effect, a concrete alternative, and a supported harness that can restore Full control. Capability loss removes affected controls and records an ordered `attachment_capabilities_changed` event.
+Only you can approve, with a Principal credential the daemon hands out exactly
+once over a private pipe (`tyriond --principal-control-bootstrap-fd`). The
+agents and the harness session never hold it. See
+[Security](security.md).
 
-Tyrion routes the whole Worker Configuration, not a model name by itself. A configuration includes the Agent Harness, adapter version, model settings, tools, native Skills, context strategy, resource limits, authority compatibility, containment profile, availability, and measured outcomes. The Entry Session's harness does not receive a routing preference.
+## Watching and steering
 
-The repository contains reference structured adapters for Codex app-server, Claude Agent SDK, OpenCode server, and qualified Pi RPC. Production eligibility requires the complete shared lifecycle, usage, interruption, Result, Skill, restart, and containment contract. Terminal text scraping does not qualify a Worker.
+`tyrion_status` in your Entry Session shows a compact digest:
 
-## Inspect and control work
+- anything that needs you
+- one line per Worker: its state, activity, time and cost
+- how many checks have passed
 
-`commission inspect` returns the accepted mandate, plan revisions, Assignment frontier, Attempts, Worker Handles, routing decisions, reservations, Results, Evidence, recovery history, current controls, and completion briefing.
+Ask for detail and you get everything:
 
-Export a portable, integrity-checked Commission Record after completion or when preserving an actionable Blocker:
+- the plan and its revisions
+- why each Worker was routed where it was
+- every Result, check and recovery
 
-```sh
-target/debug/tyrion --socket "$TYRION_SOCKET" \
-  --attachment-token "$ATTACHMENT_SESSION_TOKEN" \
-  commission export-record COMMISSION_ID > commission-record.json
-```
+You can steer a running Worker with a clarification, or interrupt it. Neither
+can change the goal, the checks or the limits you approved.
 
-The `sha256:` checksum covers the complete `record` value, while `exported_at` remains export metadata. The record includes the accepted mandate, routing and Worker configurations, Attempts, Results, Integration, Evidence, effects and Approval Gates, recovery, learning receipts, terminal events, and a metric-separated final run report. Its summary states that exported containment Evidence is not independent runtime attestation and calls out fixture-backed Workers explicitly. `dogfood_readiness.status` is fail closed: fixture evidence, an incomplete Commission, a Security Invariant failure, or an unreconciled effect produces `blocked`; an otherwise clean export remains `unassessed` and never automatically claims readiness.
-
-The Active Attachment can steer or interrupt a live structured Worker when both the Entry Session and selected Worker Configuration support that command:
-
-```sh
-"$TYRION" --socket "$TYRION_SOCKET" \
-  --attachment-token "$ATTACHMENT_SESSION_TOKEN" \
-  worker steer "$COMMISSION_ID" Arya \
-  --clarification "Keep the accepted API contract unchanged." \
-  --expected-revision CURRENT_REVISION \
-  --idempotency-key steer-arya
-
-"$TYRION" --socket "$TYRION_SOCKET" \
-  --attachment-token "$ATTACHMENT_SESSION_TOKEN" \
-  worker interrupt "$COMMISSION_ID" Arya \
-  --reason "Stop this Attempt." \
-  --planned-uncertainty "The interruption will exercise durable recovery." \
-  --expected-revision CURRENT_REVISION \
-  --idempotency-key interrupt-arya
-```
-
-Steering may clarify an Assignment. It cannot change the Goal, criteria, authority, or ceilings. Interruption revokes the live Lease and preserves the Attempt in history. `--planned-uncertainty` must exactly match a known uncertainty in the accepted mandate, which prevents an ad hoc intervention from being relabeled after the fact. The final briefing reports those mandate-bound controls separately from unplanned Principal interventions.
-
-Use the built-in help for the full command tree:
-
-```sh
-target/debug/tyrion --help
-target/debug/tyrion commission --help
-target/debug/tyrion worker --help
-target/debug/tyrion principal --help
-```
-
-## Run with production Workers
-
-The deterministic walkthrough does not prove the containment boundary. Real Git work needs Docker, a pinned Worker image, and the pinned harness binaries.
-
-Do not begin by guessing values in the runtime JSON. Startup verifies paths, versions, hashes, the Docker CLI identity, the Worker image identity, and the resource ceilings, and it refuses to start rather than run something unverified. Follow the setup document for the role you need:
-
-- [Contained Codex Git assignments](contained-codex.md)
-- [Cross-harness Worker routing and control](cross-harness-workers.md)
-- [Pi Entry and Worker adapters](pi-adapter.md)
-- [OpenCode Worker adapter](opencode-adapter.md)
-- [Credentialed effects](credentialed-effects.md)
-
-The daemon accepts these optional runtime files:
+Behind the scenes it's the same public CLI you can use directly:
 
 ```sh
-target/debug/tyriond \
-  --data-dir .scratch/tyrion-data \
-  --socket .scratch/tyrion-data/tyrion.sock \
-  --codex-worker-config /absolute/path/to/codex-worker.json \
-  --worker-catalog /absolute/path/to/worker-catalog.json \
-  --credential-runtime /absolute/path/to/credential-runtime.json
+tyrion commission inspect COMMISSION_ID
+tyrion worker steer COMMISSION_ID Vega --clarification "Keep the public API unchanged." ...
+tyrion worker interrupt COMMISSION_ID Vega --reason "Stop and let me re-plan." ...
+tyrion commission export-record COMMISSION_ID > record.json
 ```
 
-`tyrion init` generates the first two and `tyrion claude` or `tyrion codex` passes them automatically, so you only need these flags to run a daemon by hand. [`runtime/docker/README.md`](../runtime/docker/README.md) explains each field.
+Run `tyrion --help` for the full command tree.
 
-`--credential-runtime` drives the exceptional one-shot credentialed Effect Sandbox. It uses the same hardened Docker profile as a Worker, on a per-operation internal network whose only route out is a relay pinned to the one approved destination.
+## Tyrion learns how you build
+
+Tell Tyrion a preference once, for example "Give every public function a
+one-line docstring.", and it reaches every later Worker in that project as
+advisory context. Your current instructions, checks and limits always win over
+anything learned.
+
+Every job's report includes a receipt for each preference an agent received,
+and whether that agent's work was accepted. You can inspect, correct, suppress
+or forget any learned preference, and export all of it.
+
+## Records you can check
+
+Every job can be exported as a single JSON record with a SHA-256 checksum:
+
+- what you approved
+- every routing decision, Result and check
+- every approval and recovery
+- a report that keeps approvals, interventions, corrections, timing and cost
+  apart
+
+The record never certifies itself: its `readiness` status is only ever
+`blocked` or `unassessed`. The judgement is yours.
+
+## Running the daemon yourself
+
+`tyrion claude` and `tyrion codex` start the daemon for you with the setup
+`tyrion init` wrote. To run it by hand:
+
+```sh
+tyriond \
+  --data-dir ~/.local/state/tyrion \
+  --socket ~/.local/state/tyrion/tyrion.sock \
+  --codex-worker-config ~/.local/state/tyrion/runtime/worker-runtime.json \
+  --worker-catalog ~/.local/state/tyrion/runtime/worker-catalog.json
+```
+
+The daemon refuses to start on anything it cannot verify. That covers the
+Docker CLI, the Worker image and each harness version, and it applies to
+every configured Worker. [`runtime/docker/README.md`](../runtime/docker/README.md)
+explains each field.
+
+## Going deeper
+
+- [Security](security.md): the container boundary, and how it was attacked
+- [Capacity](capacity.md): how many Workers one machine runs, and why
+- [Routing](reference/routing.md): how Workers are chosen, and the adapter
+  contract every harness meets
+- [Effects](reference/effects.md): approved actions that need a credential
+- [OpenCode](reference/opencode.md) and [Pi](reference/pi.md): harness notes
+- [Proof](proof/README.md): the recorded runs behind every claim

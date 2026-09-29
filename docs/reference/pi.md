@@ -1,4 +1,4 @@
-# Pi Entry and Worker adapters
+# Pi
 
 Pi has two independent production roles in Tyrion. The Entry adapter attaches Pi's native extension host to an existing durable Control Plane. The Worker adapter starts a fresh, contained Pi RPC process for one revision-bound Assignment. Running the Entry adapter never makes Pi eligible as a Worker.
 

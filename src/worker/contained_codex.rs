@@ -2126,7 +2126,7 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), TyrionError> {
     // Decided from real measurements: with the harnesses built into the image,
     // ten concurrent Codex Workers each peaked at 255-293 MiB and 0.1 cores.
     // The ceilings contain a runaway; the requests are what admission
-    // reserves. See docs/worker-capacity.md.
+    // reserves. See docs/capacity.md.
     if config.vcpus != 2
         || config.memory_mib != 3072
         || config.writable_storage_mib != 2048

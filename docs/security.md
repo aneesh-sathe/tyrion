@@ -1,185 +1,105 @@
-# Contained Codex Git assignments
+# Security
 
-Tyrion supports one production Git assignment profile: Codex CLI `0.156.1`
-inside a hardened Docker container. One disposable container holds each
-Attempt, each verification run, and each comparison. The boundary is
-qualified in
-[`prototypes/docker-containment-qualification.md`](prototypes/docker-containment-qualification.md).
+A coding agent is a program that can write code and run it. Tyrion's position
+is simple: **contain effects, not cognition.** Each agent keeps its model, its
+tools and its judgement. What it cannot keep is access to your machine.
 
-On macOS the host protection is the hypervisor: Docker Desktop, Colima, and
-Lima all run containers inside a Linux VM under Apple's
-Virtualization.framework, so a Worker never shares a kernel with macOS. Docker
-maintains that VM, which is why Tyrion no longer builds or ships one. Sibling
-Attempts are isolated from each other at namespace strength, not VM strength;
-that limit is stated deliberately.
+## One disposable container per Worker
 
-## The boundary
+Every Worker, every check, and every comparison runs in its own fresh Docker
+container, deleted afterwards. The Docker daemon sets every limit from
+outside, where nothing inside the container can raise it.
 
-Every sandbox is created with the whole profile, and the daemon sets each
-ceiling from outside the container:
-
-| Control | Flag | Effect |
+| Control | How | What it means |
 | --- | --- | --- |
-| Processes | `--pids-limit 256` | `fork` fails at 256. `/sys/fs/cgroup` is read-only, so guest root cannot raise it. |
-| Memory and files | `--memory 3072m --memory-swap 3072m` | One hard ceiling over process memory and the writable tmpfs together. |
-| Writable storage | `--mount type=tmpfs,destination=/sandbox,tmpfs-size=4GiB` | The only writable mount. |
-| Root filesystem | `--read-only` | Nothing outside `/sandbox` can be modified. |
-| CPU | `--cpus 2 --cpuset-cpus <its own CPUs>` | A two-core quota that the guest also observes. Each running container is pinned to CPUs no other running Worker holds. |
-| Privilege | `--cap-drop ALL --security-opt no-new-privileges --user 65534:65534` | No capabilities, no privilege escalation, not root. |
-| Syscalls | `--security-opt seccomp=builtin` | Required: Docker Desktop leaves seccomp **unconfined** by default. |
-| Network | `--network none`, or a per-Attempt `--internal` bridge | No route off the bridge except through a brokered relay. |
-| Host filesystem | no bind mount of any kind | `docker cp` is never used; it silently writes underneath a tmpfs mount instead of into it. |
+| Processes | `--pids-limit 256` | A fork bomb stops at 256 |
+| Memory and files | `--memory 3072m --memory-swap 3072m` | One hard ceiling over memory and written files together |
+| Written files | a 2 GiB tmpfs at `/sandbox` | The only writable place |
+| Everything else | `--read-only` | Nothing outside `/sandbox` can change |
+| CPU | `--cpus 2 --cpuset-cpus <two least-loaded>` | At most two cores, spread across the machine's least busy CPUs |
+| Privilege | `--cap-drop ALL --security-opt no-new-privileges --user 65534:65534` | Not root, no capabilities, no escalation |
+| System calls | `--security-opt seccomp=builtin` | Filtered. Docker Desktop leaves this off by default, so Tyrion always sets it |
+| Your files | no bind mount of any kind | Your home, your checkout, SSH keys and the Docker socket do not exist inside |
 
-Before any Worker code runs, a preflight proves all of this from inside the
-container: it reads each ceiling from the container's own cgroup, confirms
-`CapEff=0`, `NoNewPrivs=1`, a non-zero `Seccomp` mode and a non-root uid,
-fails if guest root can raise `pids.max` or write `/etc`, asserts the absence
-of the Principal checkout, the daemon state directory, the container runtime
-socket, every authentication directory, and every ambient credential variable,
-rejects any mount that is not container-owned, confirms undeclared egress is
-denied, and starts a descendant canary. A failed preflight is a Security
-Invariant violation and the Attempt never launches.
+Code goes in and results come out as Git bundles streamed over `docker exec`.
+The Worker never sees your checkout. Tyrion checks every bundle before
+accepting it:
 
-## Provision the runtime
+- linear history from the approved base
+- only the approved files changed
+- no symlink pointing outside the repository
 
-Build the Worker image, then pin it. See
-[`runtime/docker/README.md`](../runtime/docker/README.md).
+Before any agent starts, a preflight inside the container proves every row of
+that table. It reads the real limits and checks privilege, and it confirms
+that your checkout, Tyrion's own state, the container socket, login folders
+and credential variables are all absent. A failed preflight stops the Worker
+before it runs.
 
-```sh
-docker build -t registry.example/tyrion-worker:2026-09-21 runtime/docker
-docker image inspect registry.example/tyrion-worker:2026-09-21 \
-  --format '{{index .RepoDigests 0}}{{"\n"}}{{.Id}}'
-```
+## Network: its own provider, and nothing else
 
-Tyrion never pulls. It fails at startup if the pinned image is not already
-present locally, and fails again at sandbox creation if `docker inspect`
-reports that the container launched anything other than the pinned image ID.
-It also pins the Docker CLI by SHA-256 and version, and takes an explicit
-`docker_host` rather than resolving an ambient Docker context.
+A Worker has no network unless its model needs one. When it does, it gets:
 
-`tyrion init` writes this file. The Codex binary is built into the Worker
-image at `/opt/tyrion/harness/codex`, so the image ID pins it; it must report
-`codex-cli 0.156.1`, and Tyrion checks that inside every sandbox, because a
-Linux guest binary cannot report its version on the host.
-[`runtime/docker/codex-worker.example.json`](../runtime/docker/codex-worker.example.json)
-shows the shape.
+- a private network with no route out
+- one relay per allowed destination, pinned to exactly one `host:port`
 
-```sh
-target/debug/tyriond \
-  --data-dir .scratch/tyrion-data \
-  --socket .scratch/tyrion-data/tyrion.sock \
-  --codex-worker-config /absolute/path/to/codex-worker.json
-```
+The relay forwards encrypted traffic without opening it, so no certificate is
+swapped and nothing is decrypted in between.
 
-## Egress and credentials
+Destinations are scoped to the harness that needs them. A Codex or OpenCode
+Worker reaches `chatgpt.com` and `auth.openai.com`; a Claude Worker reaches
+`api.anthropic.com`; neither reaches the other's provider or anything else.
 
-Omit `egress` and every sandbox runs with `--network none`.
+## Credentials
 
-With `egress`, each Attempt gets its own `--internal` bridge, which Docker
-gives no route off itself, plus one relay container per authorized
-destination. The relay forwards TCP to exactly one `host:port` and never
-terminates TLS, and the Worker reaches it through `--add-host`. The
-certificate presented is the real destination's, no CA is injected, and no
-other host or address is reachable.
+Having a credential on your machine is never permission to use it.
 
-`worker_credentials` names environment variables `tyriond` was started with
-that may be forwarded into a Worker execution. It is empty by default:
-availability on the host is never permission to use it. Tyrion passes
-`docker exec --env NAME`, so Docker reads the value from the daemon process
-and it never appears in a command line, in the container's persistent
-environment, or in Tyrion's durable state. Because the preflight runs before
-any credential is delivered, its assertion that no provider variable exists
-stays exactly true.
+- **Claude Workers** receive only the credential variables you configured.
+  The value never appears in a file, a command line, or Tyrion's records:
+  Docker reads it from the daemon's own environment when it starts the Worker.
+- **Codex and OpenCode Workers** receive only the four token fields of your
+  Codex login. They are streamed from memory into the container and never
+  written to disk on the host.
+- **Effects that need a credential**, such as calling an API on your behalf,
+  go through a separate broker backed by the macOS Keychain. Workers never
+  see those credentials. See [Effects](reference/effects.md).
 
-This is a documented reduction from the previous OpenShell provider, which
-kept the credential outside the Attempt entirely and substituted it in the
-proxy. Destination pinning still prevents sending it anywhere else, but a
-credential inside the Worker is a credential the Worker can use. Provider
-access conveys spend and disclosure authority regardless of containment, so
-Tyrion's effect gates and the Commission's spend ceilings remain the controls
-for that.
+A model credential inside a Worker is a credential that Worker can use at its
+provider. Tyrion pins where it can be sent; it cannot bound what you spend
+there. **Your provider's spending cap is the spending control.**
 
-## Propose a Git Commission
+## Approvals
 
-The immutable base must be a full Git object ID. The repository path must
-appear exactly in the Authority Envelope, and changed paths must be declared
-before acceptance. Command verifiers use an argv array and run without a host
-shell unless the proposal explicitly selects one.
+Anything consequential waits at an Approval Gate, such as writing a file
+outside the job or calling an outside service. You approve the exact target,
+content and limits with a Principal credential that only you hold. The agents
+and your harness session never receive it. A changed request needs a new
+approval, and an effect is never retried blindly: if its outcome is
+uncertain, Tyrion stops and asks.
 
-```json
-{
-  "goal": "Add the requested behavior and its focused test.",
-  "execution": {
-    "kind": "codex_git",
-    "repository": "/absolute/path/to/principal-checkout",
-    "base_revision": "0123456789abcdef0123456789abcdef01234567"
-  },
-  "criteria": [
-    {
-      "id": "focused-test",
-      "description": "The focused test passes in the integrated repository",
-      "required_evidence": "focused_test_output",
-      "verifier_type": "deterministic",
-      "verification_depth": "standard",
-      "verifier_configuration": "contained-command-v1",
-      "verification_environment": "docker-hardened-v1",
-      "verifier": {
-        "kind": "command",
-        "argv": ["cargo", "test", "--test", "focused_test"]
-      }
-    }
-  ],
-  "authority": {
-    "repositories": ["/absolute/path/to/principal-checkout"],
-    "paths": ["src", "tests/focused_test.rs"],
-    "actions": ["codex.git_change"],
-    "destinations": [],
-    "effects": []
-  },
-  "resource_ceilings": {
-    "max_attempts": 1,
-    "max_elapsed_seconds": 900,
-    "max_worker_concurrency": 1,
-    "max_storage_bytes": 104857600,
-    "max_model_spend_cents": 500,
-    "max_paid_service_spend_cents": 0
-  },
-  "known_uncertainties": []
-}
-```
+## Tested by attacking it
 
-Tyrion copies the selected commit into an independent bundle without mutating
-the Principal checkout. It streams only that bundle, the pinned Codex
-executable, the bounded prompt, the output schema, and its runner into the
-container over `docker exec`.
+These are claims only because they were attacked:
 
-Codex submits a candidate bundle and structured summary. The Control Plane
-independently verifies the bundle, linear ancestry, commits, and the union of
-paths touched by every candidate commit. It then runs each criterion in a
-fresh container with no network and records immutable candidate Evidence. Only
-a passing candidate is eligible to enter the daemon-owned integration
-repository. A third fresh container records integrated Evidence; the Result
-becomes accepted in the same transaction as Verified Completion only when that
-verification passes.
+- **Qualification** ([record](proof/2026-09-21-containment-qualification.md)):
+  every limit above was measured from inside a container. A fork bomb stopped
+  at 256; memory, disk and CPU held; and guest root could not raise any of
+  them.
+- **Live Workers**
+  ([probes](proof/2026-09-28-readiness/probe-worker-1.txt)): during a real
+  job, 26 attacks were run inside each of three running Worker containers,
+  and none reached anything. They tried becoming root, mounting, reading your
+  home and checkout, writing system folders, raising their own limits,
+  finding credentials, and reaching arbitrary hosts or the other provider.
+- **Every job:** a test fingerprints every file, mode and byte of your
+  checkout before and after a full job, and requires them identical.
 
-Cleanup never guesses names: every container and network carries a
-`tyrion.attempt` label, and removal is confirmed by `docker inspect` failing
-rather than by `docker exec`, which would restart a stopped container. Each
-container is also started with a command that exits when the Worker Lease
-does, so its lifetime is bounded even if Tyrion itself is lost.
+## What it does not claim
 
-## Boundary attestation
-
-The normal integration suite uses protocol fakes so it is deterministic in CI.
-It is not boundary attestation. With a provisioned image and a real Docker
-daemon, run the opt-in test:
-
-```sh
-TYRION_REAL_CODEX_WORKER_CONFIG=/absolute/path/to/codex-worker.json \
-  cargo test --test git_commission \
-  real_docker_boundary_completes_the_contained_git_assignment \
-  -- --ignored --exact --nocapture --test-threads=1
-```
-
-It runs the same launch-time probes every Attempt uses and verifies that the
-Principal and sibling checkouts are unchanged after transfer and integration.
+- **Sibling Workers are separated by container walls, not virtual machines.**
+  On macOS, Docker's virtual machine protects your Mac. Running Colima or Lima
+  with no host file sharing narrows the remaining gap further.
+- **Tyrion does not bound model spend.** No harness offers a hard monetary
+  ceiling, so Tyrion reports cost rather than pretending to enforce it.
+- **It does not defend against you, your operating system, or other programs
+  running as you.** It protects your machine from the agents, not from
+  itself.

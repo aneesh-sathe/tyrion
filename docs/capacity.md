@@ -1,7 +1,8 @@
-# Worker capacity
+# Capacity
 
-How many Workers Tyrion runs at once, and why the numbers are what they are.
-Decided 2026-09-26 from measurement, and revised 2026-09-27 after the harnesses moved into the image.
+How many Workers Tyrion runs at once on one machine, and why the numbers are
+what they are. Decided 2026-09-26 from measurement, and revised 2026-09-27
+after the harnesses moved into the Worker image.
 
 ## The decision
 
@@ -19,9 +20,10 @@ engine and the egress relays. The ceilings contain a Worker that runs away.
 On a 12-CPU Docker VM with 7.7 GiB that admits **21 Workers at once**. With
 16 GiB, CPU binds first at 48.
 
-The previous profile was 2 vCPUs and 6144 MiB, reserved in full. It came from
-the retired OpenShell MicroVM and was never measured. On the same machine it
-admitted one Worker, and every container was pinned to the same two CPUs.
+The previous profile was 2 vCPUs and 6144 MiB, reserved in full. It was
+inherited from an earlier sandbox design and never measured. On the same
+machine it admitted one Worker, and every container was pinned to the same
+two CPUs.
 
 ## What was measured
 
@@ -44,7 +46,7 @@ Worker's tmpfs: 328 MiB of memory-charged files per Worker, identical in every
 one. The default-admission run used no capacity override (the daemon admitted
 all ten from Docker's own figures) and finished 565 seconds of Worker execution
 in a 64-second window, 8.8 times faster than serial. Its record is
-[`dogfood-records/2026-09-26-ten-concurrent-workers.json`](dogfood-records/2026-09-26-ten-concurrent-workers.json).
+[`proof/2026-09-26-ten-concurrent-workers.json`](proof/2026-09-26-ten-concurrent-workers.json).
 
 The last run built the harnesses into the read-only image instead, so every
 container shares one copy. A Worker's peak now splits into roughly:

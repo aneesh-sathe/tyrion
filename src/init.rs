@@ -328,7 +328,7 @@ pub fn run_init(options: &InitOptions) -> Result<(), TyrionError> {
 ///
 /// Decided from measurement: ten concurrent Codex Workers each peaked near
 /// 570 MiB and 0.14 cores. The ceilings contain a runaway; the requests are
-/// what admission reserves. See docs/worker-capacity.md.
+/// what admission reserves. See docs/capacity.md.
 const WORKER_VCPUS: u64 = 2;
 const WORKER_MEMORY_MIB: u64 = 3072;
 const WORKER_STORAGE_MIB: u64 = 2048;

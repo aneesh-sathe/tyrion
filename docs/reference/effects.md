@@ -1,4 +1,11 @@
-# Credentialed effects
+# Effects
+
+An effect is anything a Commission does beyond the code change itself. Two kinds exist:
+
+- **A local file write** outside the checkout, such as release notes, performed by the daemon itself behind an Approval Gate.
+- **A credentialed request**, such as calling an API on your behalf, which is the rest of this page.
+
+## Credentialed effects
 
 Tyrion can perform one exact credentialed HTTP effect while keeping the credential outside its SQLite state, Workers, and Entry Sessions. This path currently targets Apple Silicon macOS and uses macOS Keychain as the operating-system credential store.
 

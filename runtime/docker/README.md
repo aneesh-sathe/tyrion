@@ -65,7 +65,7 @@ Every Worker has two sets of numbers. Its **ceilings** (2 vCPUs, 3072 MiB,
 contain a runaway. Its **requests** (0.25 CPU, 320 MiB) are what it is expected
 to use, and are what admission reserves. They come from measurement: ten real
 Codex Workers running at once each peaked at 255-293 MiB and 0.1 cores. See
-[`docs/worker-capacity.md`](../../docs/worker-capacity.md).
+[`docs/capacity.md`](../../docs/capacity.md).
 
 At startup the daemon asks the container runtime how many CPUs and how much
 memory it has (on macOS that is the Docker VM, not the Mac), keeps 1024 MiB back
