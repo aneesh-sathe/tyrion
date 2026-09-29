@@ -1,43 +1,95 @@
-# Tyrion
+<p align="center">
+  <img src="docs/assets/hero.svg" alt="Tyrion. One sentence in. Verified software out." width="100%">
+</p>
 
-Tyrion runs coding agents for you, in parallel, and only accepts work it can prove.
+<p align="center">
+  <a href="#get-started"><b>Get started</b></a> &nbsp;·&nbsp;
+  <a href="docs/how-it-works.md">How it works</a> &nbsp;·&nbsp;
+  <a href="docs/security.md">Security</a> &nbsp;·&nbsp;
+  <a href="docs/proof/README.md">Proof</a>
+</p>
 
-You describe a job once, in your own words, in the harness you already use. Tyrion
-splits it up, runs the pieces across Claude Code, Codex, OpenCode and Pi at the same time,
-keeps each one in a sealed container, checks the result against criteria you set,
-and hands you a Git branch to review. You never supervise a Worker window and you
-never write JSON.
+<br>
 
-If it cannot prove the work is done, it tells you exactly what is blocking it.
+<h3 align="center">Coding agents are brilliant. One at a time.</h3>
 
-## Why
+<p align="center">
+  Give one a job and it writes the code. Give ten the same afternoon, and you become their manager.<br>
+  You split the work, watch every window, untangle their collisions, and read every line yourself,<br>
+  because an agent saying <i>done</i> tells you nothing about whether it is.
+</p>
 
-Running one coding agent well means watching it. Running three means watching
-three, then reconciling their edits by hand, then reading every line because the
-agent's confidence tells you nothing about whether the code works. Meanwhile it
-has your filesystem, your shell and whatever credentials are in your environment.
+<p align="center"><b>That is not engineering at scale. That is babysitting.</b></p>
 
-Tyrion takes the part agents are structurally bad at: authority, custody,
-evidence and recovery. The agents keep the part they are good at. It contains
-effects, not cognition, so each harness keeps its own model, tools and Skills.
+<br>
 
-## What it looks like
+<p align="center">Today, we are introducing three things.</p>
 
-From inside Claude Code or Codex, in normal conversation:
+<p align="center"><b>A foreman.</b> It turns one sentence into a plan,<br>and the plan into a crew of coding agents working at the same time.</p>
 
-> Add an `/auth` endpoint with tests, and keep the handler under 100 lines.
+<p align="center"><b>An inspector.</b> It trusts nothing an agent says,<br>and checks every result twice, in rooms the agent has never touched.</p>
 
-Tyrion accepts the job, runs it under containment, verifies it twice, and reports:
+<p align="center"><b>A vault.</b> It keeps every agent sealed away<br>from your machine, your keys and your code.</p>
 
-```
-commission : verified_complete
-worker     : Arya     codex   gpt-5.6-sol                succeeded  20652ms
-worker     : Brienne  claude  claude-haiku-4-5-20251001  succeeded  20057ms
-result     : accepted | changed ['alpha.py']
-result     : accepted | changed ['beta.py']
-evidence   : candidate  passed
-evidence   : integrated passed
-```
+<br>
+
+<p align="center">
+  <b>A foreman. An inspector. A vault.</b><br>
+  <b>A foreman. An inspector. A vault.</b><br>
+  <br>
+  <i>Are you getting it?</i>
+</p>
+
+<br>
+
+<h3 align="center">These are not three separate products.<br>This is one, and we call it Tyrion.</h3>
+
+<br>
+
+## One sentence in
+
+<p align="center">
+  <img src="docs/assets/factory.svg" alt="One sentence becomes four Workers on two harnesses. The command-line tool waits for the two features it depends on. Every result is checked, and all of it merges into one branch." width="100%">
+</p>
+
+That is a real run, replayed. Someone typed one sentence. Tyrion split it into
+four pieces of work and gave them to two different agent harnesses, OpenCode
+and Codex. It held back the one piece that depended on the others, checked
+every result on its own, and checked them all again once merged. Then it
+handed back one branch.
+
+You stay in the conversation you already have. You never open a Worker window.
+You never write a line of configuration.
+
+<br>
+
+<p align="center">
+  <img src="docs/assets/numbers.svg" alt="10 agents at once on one Mac. 7 times faster than running them one at a time. 0 of 78 attacks on live agents got through. 1 branch for you to review." width="100%">
+</p>
+
+<p align="center"><sub>Every number comes from a recorded run. <a href="docs/proof/README.md">See the proof.</a></sub></p>
+
+<br>
+
+## How it works
+
+**1. You ask.** In Claude Code or Codex, in your own words:
+
+> Add monthly interest, CSV export, daily limits, and a CLI that uses them.
+
+**2. Tyrion plans.** Independent parts run at once; dependent parts wait for
+what they need. You approve the goal, the checks that will prove it done, and
+the files agents may touch. Nothing runs before you do.
+
+**3. Agents build, sealed.** Each piece goes to the harness that fits it best,
+inside its own disposable container, with a copy of your code and nothing
+else. Claude Code, Codex and OpenCode are ready after setup, and Pi works the
+same way once configured.
+
+**4. Tyrion proves it.** Every result is checked on its own, then checked again
+merged with everyone else's work, each time in a fresh container. When a check
+fails, Tyrion retries, reroutes or reconciles. When it cannot proceed, it tells
+you the one thing it needs.
 
 Then you review it like any other change:
 
@@ -47,73 +99,45 @@ git diff HEAD FETCH_HEAD
 git merge --ff-only FETCH_HEAD
 ```
 
-**Your working copy only changes when you run that last command.** Tyrion merges
-into a repository it owns, never yours.
+**Your checkout does not change until you run that last line.** Tyrion builds
+in a repository of its own, never yours.
 
-## What is proven
+## Built on proof, not promises
 
-Every claim below was measured against real models, with a checked-in record in
-[`docs/dogfood-records/`](docs/dogfood-records/).
+**Sealed rooms.** Every agent runs in its own container. It has:
 
-- **One sentence to verified work.** Typed into Codex, a request for three
-  features became a four-Assignment plan built by Codex itself: three Workers in
-  parallel, then a verification step. Verified complete on the first attempt,
-  137 seconds faster than serial, with the user's checkout untouched until
-  merge. The same sentence typed into Claude Code did the same, 96 seconds
-  faster than serial. Records:
-  [Codex host](docs/dogfood-records/2026-09-27-natural-language-plan.json),
-  [Claude host](docs/dogfood-records/2026-09-27-claude-host-plan.json).
-- Codex and Claude running **concurrently** on disjoint work, producing one
-  verified integrated artifact and beating serial execution by 20.1 seconds.
-- **The whole dogfood bar in one Commission.** Codex and OpenCode Workers
-  extended a real repository in parallel. The run also covered an approved
-  local write outside the checkout, adversarial probes of every live Worker
-  container (0 of 123 attacks reached), a planned Worker interruption,
-  Entry Session loss with replay and takeover, and a learned preference that
-  every Worker followed. Verified complete in 109 seconds.
-  [Evidence](docs/dogfood-records/2026-09-28-readiness/README.md).
-- **OpenCode and Codex** in one plan: two Workers of each, verified in 63
-  seconds against 200 seconds of serial Worker time.
-  [Record](docs/dogfood-records/2026-09-27-opencode-cross-harness.json).
-- **Tyrion plans on request.** Asked for four ledger features with no plan, a
-  contained planning Worker read the project and proposed four disjoint
-  Assignments; Tyrion validated the plan and ran them in parallel, verified on
-  the first attempt. [Record](docs/dogfood-records/2026-09-27-planning-worker.json).
-- **Ten** real Codex Workers at once on one Mac, admitted by Tyrion from the
-  machine's own capacity: 10/10 verified, 7 times faster than serial, 1.8 GiB
-  at peak. The same Mac admits 21. See [Worker capacity](docs/worker-capacity.md).
-- Candidate and integrated verification, each in a separate fresh container.
-- Interruption, and restart recovery against a Worker container genuinely
-  orphaned by killing the daemon mid-Attempt.
+- a read-only system
+- no root and no capabilities
+- 256 processes, 3 GiB of memory and 2 GiB of files at most
+- no path to your home, your keys or your checkout
 
-The containment boundary was attacked rather than described. Every escape
-attempt was blocked: reading your home directory, the host mounts, the runtime
-socket, writing outside the sandbox, becoming root, mounting, unsharing. The
-probe is `.scratch/docker-qual-20260921/escape.sh` and the results are in
-[the qualification](docs/prototypes/docker-containment-qualification.md).
+On the network, it reaches its own model provider and nothing else. This was
+not described but attacked: 26 attacks inside each of three live agents during
+a real job, and none got through. [Security](docs/security.md)
 
-A test fingerprints every path, mode and content digest in your checkout across
-a whole Commission and requires them identical afterwards.
+**Nothing consequential without you.** Writing outside the job or calling an
+outside service waits at an approval gate. You approve the exact action, with
+a credential only you hold. Change one byte and the approval no longer
+applies.
 
-## What it deliberately does not claim
+**It learns how you build.** Record a preference for a project once, such as
+"Give every public function a one-line docstring.", and every later agent on
+that project receives it. The final report shows who received it, and whether
+their work was accepted.
 
-- **Sibling Attempts are isolated at namespace strength, not VM strength.** Your
-  Mac is protected by the hypervisor; two agents are separated by container
-  walls.
-- **Tyrion does not bound model spend.** No harness gives it a hard monetary
-  ceiling, so it reports cost rather than pretending to enforce one. The cap you
-  set at your provider is the control.
-- **Local only.** One daemon, one machine, no cloud execution.
-- The record exporter reports readiness as `blocked` or `unassessed`. It never
-  certifies itself ready.
+**A record you can check.** Every job exports as one checksummed record:
 
-## Requirements
+- what you approved
+- where each piece went and why
+- every check, every approval, every recovery
 
-- macOS
-- Docker Desktop or Colima, running, with at least 2 CPUs and 8 GB of memory
-- A login for Claude Code, Codex, or both (OpenCode Workers use the Codex login)
+It never certifies itself. The judgement stays with you.
+[Proof](docs/proof/README.md)
 
-## Install
+## Get started
+
+You need macOS and Docker Desktop or Colima, with at least 2 CPUs and 8 GB of
+memory for Docker. You also need a login for Claude Code, Codex, or both.
 
 ```sh
 brew tap aneesh-sathe/tyrion https://github.com/aneesh-sathe/tyrion
@@ -121,15 +145,19 @@ brew install tyrion
 tyrion init
 ```
 
-Or from a clone: `cargo install --path . && tyrion init`.
+`tyrion init` does everything you would otherwise do by hand:
 
-`tyrion init` does the setup you would otherwise do by hand, and is safe to
-rerun:
+- It builds the image your agents run in.
+- It downloads each harness and checks it against its publisher's checksum.
+- It proves each one runs inside the sealed container.
+- It starts Tyrion on the result.
+
+It spends no model tokens, and it is safe to rerun.
 
 ```
   1/7  docker            Docker version 28.0.4, build b8034c0 (linux/arm64, 12 CPUs, 7.7 GiB)
-  2/7  worker image      sha256:a6c81da93553 (built, harnesses built in)
-  3/7  claude code       2.1.274 (Claude Code) (downloaded, checksum verified)
+  2/7  worker image      sha256:8973468e9c7b (built, harnesses built in)
+  3/7  claude code       2.1.277 (Claude Code) (downloaded, checksum verified)
   4/7  codex             codex-cli 0.156.1 (downloaded, checksum verified)
   5/7  opencode          1.18.32 (downloaded, checksum verified)
   6/7  configuration     ~/.local/state/tyrion/runtime/worker-runtime.json
@@ -143,62 +171,49 @@ rerun:
 Tyrion is ready. From any Git repository, run `tyrion claude` or `tyrion codex`.
 ```
 
-It builds the image your agents run inside, downloads the Linux builds of each
-harness and checks them against their publishers' checksums, runs each one
-inside the hardened container to prove it works there, pins everything it
-found, and starts the daemon on the result. It spends no model tokens: your
-first real Commission is your first job. When something is wrong it says what
-to do next. See [`runtime/docker/README.md`](runtime/docker/README.md) for
-what it pins and why.
+Agents sign in separately from you:
 
-Workers authenticate separately from your own harness session, so they need:
+- **Codex:** run `codex login`.
+- **OpenCode:** nothing extra. It uses your Codex login.
+- **Claude:** run `claude setup-token`, then export the result as
+  `CLAUDE_CODE_OAUTH_TOKEN`.
 
-- **Claude**: run `claude setup-token` and export the result as
-  `CLAUDE_CODE_OAUTH_TOKEN` in your shell profile, or export
-  `ANTHROPIC_API_KEY`.
-- **Codex**: run `codex login`.
-- **OpenCode**: nothing extra. It signs in with the Codex login.
-
-Rerun `tyrion init` after adding either.
-
-## Use it
+Rerun `tyrion init` after adding one. Then, from any Git repository:
 
 ```sh
-cd your-project
 tyrion claude     # or: tyrion codex
 ```
 
-That opens your normal harness with Tyrion attached. Describe the job; Tyrion
-takes it from there and reports back in the same conversation. Nothing changes
-in your checkout until you merge the result:
+That is your normal harness, with Tyrion attached. Describe the job.
 
-```sh
-git fetch ~/.local/state/tyrion/integrations/$COMMISSION_ID/repository tyrion-integration
-git diff HEAD FETCH_HEAD
-git merge --ff-only FETCH_HEAD
-```
+## What it does not claim
 
-## Where it is going
+Trust is earned by saying exactly where the edges are.
 
-Tyrion is becoming a **software factory manager**: you hand it a specification,
-it decides how to break the work apart, how many agents that is worth, and runs
-them. The plan is in
-[`docs/plans/software-factory.md`](docs/plans/software-factory.md) and the work
-is issues [#22](https://github.com/aneesh-sathe/tyrion/issues/22) through
-[#28](https://github.com/aneesh-sathe/tyrion/issues/28).
+- **Agents are separated by container walls, not virtual machines.** On macOS,
+  Docker's virtual machine protects your Mac, but agents running side by side
+  are only as far apart as containers are.
+- **Tyrion does not cap what you spend.** No harness offers a hard spending
+  limit, so Tyrion reports cost rather than pretend to enforce it. Set the cap
+  at your model provider.
+- **It is local.** One person, one machine, one daemon. It is not a hosted
+  service or a team product.
+- **It does not replace your review.** It proves what the checks prove. You
+  still decide what the checks should be.
+- **Some controls still live on the command line.** Approving an action outside
+  the job and recording a learned preference use `tyrion` directly today; your
+  harness session cannot yet ask for either.
 
-## More
+## Why "Tyrion"
 
-- [Reference](docs/reference.md): vocabulary, authority model, control commands
-- [Containment qualification](docs/prototypes/docker-containment-qualification.md): what was measured, and how
-- [Dogfood readiness](docs/dogfood-readiness.md): the honest state of the proof
-- [Issue 1](https://github.com/aneesh-sathe/tyrion/issues/1): the full product definition
+Behind every great ruler stood an adviser who actually ran the kingdom. They
+knew what to delegate, whom to trust, and what to check before it ever reached
+the throne. You are the ruler. Tyrion runs the kingdom.
 
-Tyrion is built for one person on one machine. It is not a multi-user service, a
-workflow engine, or a claim that an agent can safely act without bounded
-authority and independent checks.
+## For contributors
 
-## Verify the repository
+Tyrion is Rust: a daemon, `tyriond`, and a command-line tool, `tyrion`, over a
+local socket, with SQLite as the single source of truth.
 
 ```sh
 cargo fmt --check
@@ -206,12 +221,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-The default suite uses deterministic protocol fakes for external harnesses.
-Fakes are a convenience, not evidence: running real harnesses for the first time
-surfaced ten defects the green suite could not, every one because a fake agreed
-with the adapter instead of behaving like the real thing. Where the two now
-disagree, the fake was changed.
+The test suite runs against fakes of Docker and of each harness, rebuilt
+whenever the real ones behaved differently. The fakes are a convenience, not
+evidence. The first real runs found defects no
+green suite could see, so every claim above comes from a run with real models
+in real containers. Start with [the docs](docs/README.md).
 
 ## License
 
 [MIT](LICENSE)
+
+<sub>Tyrion is an independent open-source project. It is not affiliated with,
+sponsored by, or endorsed by HBO, Warner&nbsp;Bros.&nbsp;Discovery, or George&nbsp;R.&nbsp;R.&nbsp;Martin.</sub>

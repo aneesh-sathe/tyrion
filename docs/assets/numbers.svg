@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 290" width="1200" height="290" role="img" aria-labelledby="title desc">
+  <title id="title">Tyrion in four numbers</title>
+  <desc id="desc">10 coding agents at once on one Mac. 7 times faster than one at a time. 0 of 78 attacks on live agents got through. 1 branch to review.</desc>
+  <defs>
+    <radialGradient id="stage" cx="50%" cy="0%" r="95%">
+      <stop offset="0" stop-color="#1a1a1f"/>
+      <stop offset="0.6" stop-color="#0a0a0c"/>
+      <stop offset="1" stop-color="#000"/>
+    </radialGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#a8a8b0"/>
+    </linearGradient>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "Helvetica Neue", Arial, sans-serif; text-anchor: middle; }
+    .n { font-size: 92px; font-weight: 700; letter-spacing: -3px; fill: url(#ink); }
+    .l { font-size: 23px; font-weight: 500; fill: #a1a1aa; }
+    .up { animation: up 1s cubic-bezier(.2,.7,.2,1) both; }
+    .s1 { animation-delay: .1s; } .s2 { animation-delay: .35s; } .s3 { animation-delay: .6s; } .s4 { animation-delay: .85s; }
+    @keyframes up { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+    @media (prefers-reduced-motion: reduce) { .up { animation: none; } }
+  </style>
+
+  <rect width="1200" height="290" rx="28" fill="url(#stage)"/>
+  <rect x="0.5" y="0.5" width="1199" height="289" rx="27.5" fill="none" stroke="#2c2c31"/>
+  <g stroke="#232328">
+    <line x1="300" y1="64" x2="300" y2="226"/>
+    <line x1="600" y1="64" x2="600" y2="226"/>
+    <line x1="900" y1="64" x2="900" y2="226"/>
+  </g>
+
+  <g class="up s1">
+    <text class="n" x="150" y="146">10</text>
+    <text class="l" x="150" y="194">agents at once</text>
+    <text class="l" x="150" y="224">on one Mac</text>
+  </g>
+  <g class="up s2">
+    <text class="n" x="450" y="146">7×</text>
+    <text class="l" x="450" y="194">faster than running</text>
+    <text class="l" x="450" y="224">them one at a time</text>
+  </g>
+  <g class="up s3">
+    <text class="n" x="750" y="146" style="fill:#30d158">0</text>
+    <text class="l" x="750" y="194">of 78 attacks on live</text>
+    <text class="l" x="750" y="224">agents got through</text>
+  </g>
+  <g class="up s4">
+    <text class="n" x="1050" y="146">1</text>
+    <text class="l" x="1050" y="194">branch for you</text>
+    <text class="l" x="1050" y="224">to review</text>
+  </g>
+</svg>
