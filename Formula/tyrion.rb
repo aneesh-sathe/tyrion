@@ -6,7 +6,7 @@ class Tyrion < Formula
   desc "Runs coding agents in parallel under containment and accepts only verified work"
   homepage "https://github.com/aneesh-sathe/tyrion"
   url "https://github.com/aneesh-sathe/tyrion/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "58cfb1c5252ba36596298bf2c9e2c65e3ae45c92c256bca28d59d924a63366c0"
+  sha256 "7e92c8dac70a7b508665f73c20e165bf76abfcb7f7efcbc7ce1ad7f3b61f43e5"
   license "MIT"
   head "https://github.com/aneesh-sathe/tyrion.git", branch: "main"
 
