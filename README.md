@@ -29,16 +29,15 @@ attached.
 ## One order, twenty-one agents
 
 <p align="center">
-  <img src="docs/assets/factory.svg" alt="A long order to extend a ledger with twenty-one features becomes twenty-one Codex agents working at once. Every result is checked, and everything merges into one branch: twenty-one of twenty-one checks passed, sixteen times faster than one at a time." width="100%">
+  <img src="docs/assets/factory.svg" alt="One long order becomes twenty-one agents running side by side on Claude Code, Codex and OpenCode. Every result is checked on its own and again once merged, and everything comes back as one branch." width="100%">
 </p>
 
-This is a real run, replayed. One long order became twenty-one pieces of work,
-each handed to its own agent, all running at the same time. Every result was
-checked on its own, then again once merged, and the whole job came back as one
-branch: 21 of 21 checks passed, sixteen times faster than running the agents
-one at a time.
+One long order becomes twenty-one pieces of work, spread across Claude Code,
+Codex and OpenCode agents running side by side. Every result is checked on its
+own, then again once merged, and the whole job comes back as one branch. The
+numbers below come from real runs, including this same twenty-one-agent job.
 
-You never left the conversation, opened an agent's window, or wrote a line of
+You never leave the conversation, open an agent's window, or write a line of
 configuration.
 
 <br>
