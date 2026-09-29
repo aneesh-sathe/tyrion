@@ -230,6 +230,3 @@ in real containers. Start with [the docs](docs/README.md).
 ## License
 
 [MIT](LICENSE)
-
-<sub>Tyrion is an independent open-source project. It is not affiliated with,
-sponsored by, or endorsed by HBO, Warner&nbsp;Bros.&nbsp;Discovery, or George&nbsp;R.&nbsp;R.&nbsp;Martin.</sub>
