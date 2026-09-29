@@ -1,220 +1,264 @@
-# Project notes
+# Working on Tyrion
 
-- Domain language follows the issue tracker: Principal, Commission Proposal, Commission, Acceptance Criterion, Authority Envelope, Assignment, Attempt, Result, Evidence, Control Plane, and Verified Completion.
-- The public seam is the `tyrion` CLI over the versioned Unix-socket protocol to `tyriond`. End-to-end tests must observe only that seam and must use real SQLite state and daemon restarts.
-- `tyrion claude` and `tyrion codex` launch the installed native TUI from the current Git root, start a session-owned local daemon when needed, and inject the Tyrion stdio MCP bridge without changing persistent harness configuration. The bridge creates and accepts sequential small Commissions and exposes status, but the host TUI remains an Entry Session rather than an uncontained Worker.
-- A non-blocking private lock permits one auto-managed native Entry Session at a time because that launcher owns the daemon lifetime. Explicitly managed sockets may serve concurrent Entry Sessions.
-- Native Entry accepts multi-Assignment plans (#23); concurrency is bounded only by host admission. It still rejects competing Attempts, external destinations or effects, paid-service spend, non-deterministic verification, over 15 minutes, over 100 MiB, over $1 model spend, and actions other than `deterministic.echo` or `codex.git_change`. The Entry schema offers no `destinations`/`effects` fields at all: host models repeatedly filled `effects` with a description of the work.
-- Real natural-language test (2026-09-26): `tyrion codex -- exec --sandbox read-only "<one sentence>"` against a managed daemon. The host Codex built a 4-Assignment plan (three parallel features plus a dependent read-only verification step) with no hints. Drive the host with `--json` to see every tool call, argument, and error.
-- Claude Code needs `--allowedTools mcp__tyrion`; without it print mode reports `Claude requested permissions to use mcp__tyrion__tyrion_start_commission, but you haven't granted it yet`. Claude as host verified 2026-09-27 with the same one-sentence request: four Assignments, verified complete, honest report including the review commands.
-- Integrated verification checks only criteria whose work is in the assembled result: the integrating Assignment's and any Assignment with a non-null `results.integrated_artifact_revision`, whatever its status (#20). Narrowing to `accepted` Assignments broke restart recovery, where integrated work sits in revalidation.
-- Codex needs `mcp_servers.tyrion.default_tools_approval_mode="approve"`. `auto` still prompts for tools not marked read-only, so every Commission waited on a click and `codex exec` refused the call outright.
-- The live host test found five defects fixtures could not: routing still gated on declared model spend; `init` capped catalog Result storage at an arbitrary 10 MiB; the Worker image lacked `python`; recovery reran Workers for a verifier that could not start; and structured adapters returned no commit for a read-only Assignment. A verifier that cannot run now blocks once as `verifier_unrunnable` and keeps the Result.
-- Tyrion plans on request (#24): a proposal with `"planning": "worker"` and no plan starts with one read-only Assignment `tyrion-plan-<n>` owning no criterion. Its Result summary is parsed as a plan, filled with mandate-derived resources, validated by the same rules as a Principal plan plus ordered overlapping writers and remaining Attempts, then committed as the next plan revision (source `control_plane`, author in the `planning_worker` event provenance). A rejected plan gets one more round with the exact rejection in its goal, then blocks as `planning_failed`; the Commission can still be cancelled. Pure helpers live in `store/planning.rs`.
-- Real planner, 2026-09-27: one Codex planning Worker turned a one-line goal into four disjoint Assignments that validated first time and ran in parallel to verified completion, 162 s faster than serial. Record: `.scratch/proof-archive/2026-09-27-planning-worker.json`.
-- Inspection includes `review`: the Tyrion-owned integration repository, `tyrion-integration`, and the exact fetch/diff/merge commands. A host previously reported files as present in the user's checkout when they were only in the integration repository.
-- The native Entry MCP replays an identical in-session start request, rejects a different task while the current Commission is non-terminal, and exposes cancellation so abandoned blocked work does not wedge sequential use.
-- `tyriond` is the only authoritative writer. It holds an exclusive lock per data directory, protects the directory and socket with user-only permissions, and uses `state.sqlite3` in WAL mode.
-- Proposal creation grants no execution authority. Acceptance requires `deterministic.echo` in the Authority Envelope plus an exact expected revision and idempotency key.
-- Acceptance and Assignment readiness commit before the Worker dispatches. The acceptance response exposes that ready state; the daemon closes the response path before attempting dispatch, and a disconnected Entry Session does not revoke accepted work.
-- `deterministic-local-v1` echoes the accepted Goal. It is a replaceable test Worker configuration, not a production harness adapter.
-- Validate the deterministic Result against its storage ceiling at proposal time, then recheck attempt, elapsed-time, concurrency, and storage ceilings immediately before dispatch.
-- A hard resource-ceiling failure blocks only its Assignment, records the exact next requirement, and must not prevent the daemon from serving other Commissions.
-- Evidence is immutable and bound to criterion, accepted mandate revision, candidate Result, verifier, and artifact revision. Failed Evidence leaves a candidate Result unaccepted.
-- Evidence uses the Assignment's persisted mandate revision, and the Control Plane independently recomputes deterministic Result artifact hashes before accepting them.
-- Verified Completion, accepted Result status, passed criteria, completion briefing, and the terminal event are committed in one SQLite transaction.
-- Mutating protocol requests require idempotency keys. Identical replay returns the stored response; key reuse with a different request is rejected. A consumed attachment handshake is the credential-bearing exception: replay fails and its one-time session credential is never cached.
-- Run `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` before committing.
-- A stale socket remains after forced test shutdown. Startup may replace a socket file only after acquiring data-directory ownership and must refuse to replace any non-socket path.
-- Startup dispatch is asynchronous. End-to-end tests must poll the CLI projection for the expected Assignment or Commission state instead of assuming it is terminal as soon as the socket accepts requests.
-- Daemon startup journals cleanup before marking stranded Attempts failed, expiring Leases, revoking reservations, and returning Assignments to `ready`. Pending sandbox deletion survives repeated crashes and blocks redispatch until confirmed.
-- Keep lifecycle transactions in `store.rs`, read projections in `store/projection.rs`, and schema invariants in `store/schema.rs`.
-- After completing each tracker ticket, commit and push the current branch to `origin` before handoff.
-- Muse Code integration is deferred as future support and is not part of the MVP.
-- Commission inspection and mutation require an opaque Attachment session credential. Public Attachment IDs identify projections but grant no authority. Proposal creation makes its capable creator active; later Attachments join as observers until an explicit revision-checked takeover.
-- Launch tokens expire within 300 seconds, are single-use, and bind the expected harness, adapter identity, and adapter version. The handshake also requires an exact protocol version and native session identity.
-- Entry capability negotiation covers proposal creation, acceptance, inspection, event replay, takeover, material notifications, persistent mode display, Worker steering, and Worker interruption. Every missing capability names its affected protocol operations, practical effect, concrete alternative, and the Pi recovery harness, then derives Full, Limited, or Observer mode.
-- Attachment joins and control transfers are durable ordered events with structured payloads. Cursor replay returns only later events; observers receive the event ledger but never material notifications.
-- Resume reauthenticates the durable Attachment credential against the exact adapter, protocol, native session, and negotiated capabilities before replaying unseen events.
-- Control takeover advances a separate control revision without changing the Commission mandate revision or Authority Envelope.
-- Schema changes create one temporary SQLite backup before migration, verify database integrity and required schema afterward, then delete the backup.
-- `codex_git` proposals require a full immutable base object ID, an exact repository authority entry, normalized authorized changed paths, `codex.git_change`, command verifiers, and no destinations or effects.
-- Start the contained Worker path with `tyriond --codex-worker-config <json>`; the configuration pins Codex CLI 0.156.1, the Docker CLI hash/version, an explicit `docker_host`, a digest-pinned Worker image and its local image ID, and the fixed 2-vCPU, 3072-MiB, 2048-MiB, 256-process ceilings with 250-millicore and 640-MiB requests. Tyrion never pulls and never resolves an ambient Docker context.
-- Worker credentials are named, never valued, in the runtime configuration and default to none. Tyrion forwards them with `docker exec --env NAME`, so Docker reads each value from the daemon process and it never reaches a command line, the container's persistent environment, or durable state. Containment preflight runs before delivery, so its ambient-credential assertion stays exact. This is a documented reduction from the OpenShell provider, which kept the credential out of the Attempt entirely.
-- Git Commissions transfer verified bundles only, require a linear chain from the immutable base, authorize the union of paths touched across every candidate commit, verify the candidate in a fresh container, integrate into daemon-owned state, and verify the integrated bundle in another fresh container.
-- Passing candidate and integrated checks each create immutable Evidence. A Result remains candidate until fresh integrated verification passes and acceptance is committed with Verified Completion.
-- Dispatch each ready Assignment on its own SQLite connection and background thread so a long Worker cannot block the Control Plane listener.
-- Classify Worker-time storage breaches as `max_storage_bytes` resource Blockers with the exact required minimum; use typed Worker Lease expiry errors for durable lease status.
-- Run `cargo test --test git_commission` for contained Git lifecycle, lease expiry, boundary failure, unauthorized-path, descendant-cleanup, and malformed-transfer coverage.
-- Run the ignored `real_docker_boundary_completes_the_contained_git_assignment` test with `TYRION_REAL_CODEX_WORKER_CONFIG` to attest the Docker boundary; the default suite uses deterministic protocol fakes.
-- Harness binaries (`codex`, `codex-code-mode-host`, `claude`, `pi`) are built into the Worker image at `/opt/tyrion/harness`, read-only, so every Worker shares one copy and the image ID pins them. They are Linux guest binaries: `init` verifies publisher checksums on the host, then probes each version by running it from the image, and every sandbox re-checks the pinned version. The runtime config carries only versions, never host paths or hashes.
-- Worker containment is `docker-hardened-v1`: one disposable container per Attempt, verification run, and comparison, created with `--read-only --pids-limit 256 --memory 3072m --memory-swap 3072m --cpus 2 --cpuset-cpus <two CPUs of its own> --cap-drop ALL --security-opt no-new-privileges --security-opt seccomp=builtin --user 65534:65534`, a sized `/sandbox` tmpfs as the only writable mount, and no bind mount of any kind. See `.scratch/proof-archive/2026-09-21-containment-qualification.md`.
-- `--security-opt seccomp=builtin` is mandatory: Docker Desktop leaves seccomp **unconfined** by default and a container without it reports `Seccomp: 0`.
-- Never use `docker cp` for sandbox transfer. On Docker Desktop it exits 0 while writing underneath a tmpfs mount instead of into it. Stream through `docker exec -i` and `cat` instead, which round-trips byte-identically.
-- On macOS the containment claim is two boundaries: the hypervisor protects the host and is Docker's to maintain, while sibling Attempts are isolated at namespace strength only. Do not claim VM-strength sibling isolation. Docker Desktop's VM keeps a virtiofs channel to the host file-sharing list, so a Colima or Lima context with no host sharing removes that residual risk.
-- The memory cgroup charges tmpfs pages, so `memory_mib` bounds process memory and writable files together and must exceed `writable_storage_mib`. `--storage-opt size=` does not work on Docker Desktop's `overlayfs` driver, and a polled disk watchdog is not hard enforcement.
-- Never use `docker exec` as a post-stop liveness probe: it restarts a stopped container. Confirm removal by `docker inspect` failing.
-- Label every container and network `tyrion.attempt=<attempt id>` and clean up by that label, never by reconstructing names.
-- Entry Session path proven end to end, 2026-09-24: one persistent `tyrion entry-mcp --harness claude` process created, accepted, and watched a real `codex_git` Commission to `verified_complete` (18s, 2 cents, both Evidence scopes passed), with the Principal checkout untouched. No raw CLI and no hand-made Attachment token were involved in creating or running it.
-- An Entry Session is only meaningful as one long-lived MCP process. Each `entry-mcp` invocation is a distinct Attachment, stdin close ends the session, and a fresh Attachment observes nothing by default. Joining an existing Commission requires `attachment connect --commission-id <id> --last-event-sequence <n>`, which inserts the observer row; without it even `commission take-control` is denied. Accepted work survives the session, but re-observing it needs that explicit rejoin.
-- The Entry MCP bridge exposes `tyrion_start_commission`, `tyrion_status`, `tyrion_export_record`, and `tyrion_cancel_commission`. `tyrion_status` and the start response return a digest from `src/digest.rs` (headline, `needs_you`, one row per Assignment with state, Worker, elapsed time, activity, cost and tokens, verification, review); `{"detail": true}` returns the full projection. On the real 10-Worker record the digest is 1,743 bytes against 483,764. Relay everything under `needs_you`. Export needs only the already-negotiated `commission_inspection` capability, so the record is readable without leaving the Entry Session.
-- The Principal control credential can be bootstrapped from a shell: `mkfifo boot; tyriond --principal-control-bootstrap-fd 3 3>boot &; cred=$(head -1 boot)`. The daemon writes it once, closes the descriptor, and keeps only its hash. Verified 2026-09-24; this is the gate for approving consequential effects.
-- Cross-harness concurrency proved, 2026-09-24: one Commission ran Codex (`gpt-5.6-sol`) and Claude (Haiku) on disjoint Assignments at the same time and produced one verified integrated artifact. Measured `useful_concurrency`: 40709 ms serial against a 20652 ms parallel window, 20057 ms saved. Record at `.scratch/proof-archive/2026-09-24-cross-harness.json`.
-- A cross-harness plan cannot use one uniform spend reservation. Codex demands exactly zero because it exposes no monetary budget; Claude needs non-zero because it maps the reservation to the SDK budget. Reservations are per-Assignment, so set them per harness, and pin each Assignment with `require_configurations` when the split must be deterministic rather than routed.
-- Codex proved end to end, 2026-09-24: one `gpt-5.6-sol` Commission reached `verified_complete` in the Docker boundary (30s, 20s Worker execution, zero reported cost on subscription auth, candidate and integrated Evidence both passed). Both Tier 1 Worker harnesses now run real models under the same containment profile.
-- With a ChatGPT account the model is not a free choice: `gpt-5.3-codex` returns `400 ... not supported when using Codex with a ChatGPT account`. Ask the host with `codex doctor`, which reports the account's actual model, auth mode, and auth file. There is no mini tier, so cost is controlled by `reasoning_effort`, not model choice.
-- Codex 0.156.1 delegates file edits and shell work to a companion `codex-code-mode-host` binary shipped as a separate release artifact. Without it the Worker reasons correctly and then reports the workspace execution host is unavailable. It is built into the image beside `codex`, where Codex finds it.
-- OpenAI structured output rejects an array schema with no `items`; Claude accepts one. Both adapters declared `known_effects` without `items` and only Codex surfaced it, after six green Claude runs. The Rust `result_schema()` had it right all along. The second harness is what audits the first, so treat cross-harness support as a correctness mechanism and not only a feature.
-- Codex warns that bubblewrap is absent and falls back to a bundled copy. Harmless so far: Tyrion's container is already the boundary, so do not add bubblewrap to nest sandboxes.
-- Codex prep for #19, 2026-09-24: `codex-cli 0.156.1` linux/arm64 is statically linked musl and runs unchanged in the hardened container. The pin moved from the stale `0.147.0` to `0.156.1`; that constant is checked by `validate_config`, so a mismatch makes `tyriond` exit before binding its socket and every end-to-end test reports "daemon exited before creating its socket".
-- Codex reads its subscription login from a file, not the environment. `codex_auth_file` names the host login; Tyrion reads it at dispatch, copies exactly `tokens.{id_token,access_token,refresh_token,account_id}` plus `last_refresh` into `/sandbox/.codex/auth.json` at mode 600, and streams it from memory through `upload_bytes` so the secret never reaches host disk or a command line. Delivery happens after preflight, so the ambient-credential assertion stays exact.
-- Subscription Codex egress is `chatgpt.com:443` for the API and `auth.openai.com:443` for token refresh, confirmed from the binary. Both need a relay; one destination is not enough.
-- First real model run, 2026-09-22: one Claude Haiku Commission reached `verified_complete` in the Docker boundary (2 cents, 13.8s, candidate and integrated Evidence both passed). It found seven defects that a passing fixture suite could not, because each fake agreed with the adapter instead of behaving like the real harness. When a fake and a real harness disagree, change the fake.
-- Docker mounts a tmpfs `noexec` by default. `/sandbox` is the only writable mount and holds every streamed-in artifact, so it needs explicit `exec`; the containment preflight now proves a file written there can run.
-- The Claude Agent SDK waits for an async iterable to finish before writing, so an open-ended input generator never delivers its first message: Claude blocks reading stdin while the adapter blocks reading its output. Send each turn as its own `client.query`.
-- Claude exposes a `StructuredOutput` tool whenever an output format is requested. It is induced by the adapter, not granted by the Commission, so expect it in the reported inventory without granting it in `allowed_tools`.
-- A Worker image built locally and never pushed has no registry digest, only an image id. Both are content addressed; accept either and reject a tag.
-- `--watchdog-stall-milliseconds` defaults to 600000 and is a production setting, not a test knob. A real model is routinely silent for minutes.
-- Adapter stderr streams into the Worker control record as it arrives. A Watchdog containment never joins the reader thread, so anything buffered there is lost exactly when it is most needed.
-- Tyrion does not gate on model spend, as of 2026-09-25. No harness gives it a hard monetary ceiling, so reserving and accumulating a pre-execution guess blocked real work without preventing any overspend. `frontier::Resources` carries only concurrency and storage, which Tyrion genuinely enforces; acceptance no longer checks cumulative spend; and reservations are no longer summed for it.
-- Each number has exactly one owner who can enforce it. Commission ceilings are attempts, elapsed time, concurrency and storage. A budget a harness can honour is a setting on that Worker Configuration: Claude takes `settings.max_budget_usd` and passes it to the SDK. Reported cost stays in the run report as observation, never as a control. **The provider-side cap is the real spend control**, and the claim set must say so rather than implying Tyrion bounds spend.
-- Removing that gating deleted defect #8 outright and the cross-harness asymmetry with it: Codex no longer needs a zero reservation and Claude no longer needs a non-zero one, so a single plan can drive both harnesses without per-harness budget juggling.
-- `max_model_spend_cents` and `max_paid_service_spend_cents` remain in the protocol and schema as declared-only fields. Dropping them needs table rewrites across four tables, which is migration risk for cosmetic gain; do it in its own change.
-- Restart reconciliation is verified against a real orphaned Worker: killing the daemon mid-Attempt leaves the container running, and restart deletes it and its relay, expires the Lease, fails the Attempt with `revision_disposition: retained`, records the proof set it could not establish (process identity, native session, acknowledgement, containment), and returns the Assignment to `ready`. Cleanup takes a few seconds after the socket binds, so inspect twice before reporting a surviving container.
-- Adapter runtime dependencies (`native_skill`, the Claude Agent SDK) live in the pinned Worker image and are reached through `PYTHONPATH=/opt/tyrion`, not transferred per Attempt. The image digest Tyrion already verifies at launch is then their pin, with no second artifact to keep in step. Build the image from the repository root so `adapters/` is in context.
-- The fixture adapter is a shell script, so no test exercises a Python import. Assert the sandbox provides `PYTHONPATH` explicitly, and verify a built image can `import native_skill, claude_agent_sdk` before trusting a real Attempt.
-- A candidate Result is rejected if any tree entry is a symlink whose target is absolute or resolves above the repository root. Authorized path scope alone does not catch this, because the symlink's own path can be authorized while its target is not.
-- The Principal checkout is an input, never a workspace: `a_completed_commission_leaves_the_principal_checkout_byte_identical` fingerprints every path, mode, and content digest across a full Commission. `.scratch/docker-qual-20260921/escape.sh` is the adversarial container probe behind the boundary claims.
-- Brokered egress is a per-Attempt `--internal` bridge plus one relay container per authorized destination. The relay forwards TCP to exactly one `host:port` without terminating TLS, so no CA is injected and the credential stays end-to-end encrypted; the Worker reaches it through `--add-host`.
-- Every proposal must explicitly name required Evidence, verifier type, and standard or independent depth for each Acceptance Criterion; persisted versions also bind exact verifier configuration, procedure, and environment.
-- External model and Principal Evidence enters through `commission record-evidence`; the daemon issues its Verification Attempt ID and binds verifier identity to the authenticated Attachment. Deterministic Evidence is daemon-owned and cannot be overridden by an Entry Session.
-- Principal criteria create durable revision-bound verification gates. Atomic Verified Completion checks passed criteria, closed current gates, and the absence of material contradictions in one transaction.
-- Independent depth counts current passes from distinct daemon-bound verifier identities and distinct Verification Attempts.
-- Failed or uncertain Evidence must diagnose a Result, verifier, environment, or criterion defect. Durable verification recovery records track rework, retry, reroute, escalation, and exhausted-attempt blocking through their concrete Evidence, takeover, and amendment paths.
-- `commission amend-verification` is revision-checked and may replace only the complete verification definition for the existing criterion identifiers. It retains criterion versions and Evidence, supersedes the current Result, and routes re-verification without widening authority.
-- Multi-Assignment Git proposals use an optional explicit `plan`. Each planned Assignment owns criteria, a useful dispatch purpose, dependency IDs, artifact scopes, and a complete Attempt reservation; every criterion must have exactly one owner.
-- Dispatch claims use an immediate SQLite transaction. Attempt creation, Worker Lease issuance, status transition, and concurrency, storage, model-spend, and paid-service reservation commit atomically. Concurrency and storage capacity are released; model and paid-service reservations remain cumulative Commission spend commitments.
-- The public `execution_frontier` contains only conflict-free work whose complete budget currently fits. `frontier_holds` explains declared write overlap or unavailable resources.
-- Planned writers start from the current integrated revision once it exists. Disjoint candidates from a shared ancestor integrate by serialized cherry-pick; a writer dispatched later from the current artifact retains fast-forward Integration.
-- Read-only planned Assignments may return an empty Git commit for candidate verification, but Integration preserves the authoritative artifact revision.
-- Competition members share one dependency frontier and cannot depend on each other. Their comparison reservation covers the member storage budgets plus one output budget and must fit the Commission ceiling.
-- Competing candidates stop before Integration; the versioned comparison Assignment receives every contender bundle and its Evidence before applying the declared rule.
-- Unexpected artifact scope, stale base, Git conflict, or assembled-state regression creates a dispatchable versioned reconciliation Assignment and never silently accepts or partially advances the candidate. Regression Evidence is retained before the integration worktree rolls back.
-- Generic reconciliation reserves the full Commission storage ceiling and the source Assignment's concurrency and spend budgets because its sandbox holds the source candidate plus fresh output.
-- `useful_concurrency_observed` events use the union of accepted and explicitly planned contender execution intervals to compare verified Worker execution time with its parallel window and refresh end-to-end elapsed time through final assembly.
-- Start structured cross-harness routing with both `tyriond --worker-catalog <json>` and `--codex-worker-config <json>`. A Worker Configuration is one indivisible harness, adapter artifact digest, model and settings, tools, Skills, context, limits, capabilities, authority, Assignment constraints, containment, availability, and metrics record.
-- Route through hard capability, authority, tool, Skill, exact context strategy and capacity, Assignment, and full resource-vector gates. Structured adapters accept only `fresh` or `fresh_with_retrieval` and reject any strategy they cannot honor. Rank eligible configurations lexicographically by verified correctness, preference adherence, first-pass acceptance, elapsed contribution, cost, continuity, and stable ID. Entry harness is rationale only and never a preference.
-- An unavailable first choice may fall back only within the same replacement class and within 100 basis points on correctness, preference adherence, and first-pass acceptance. Otherwise persist an `attention_required` Assignment and exact Attention Condition.
-- Re-evaluate every ready or `attention_required` route immediately before dispatch. Resolve the open routing Attention Condition and return the Assignment to `ready` only after a currently available configuration is selected.
-- Derive the built-in contained Codex configuration from the validated runtime file. Inspection must retain its exact model, pinned runtime settings, resource boundary, and configuration fingerprint.
-- Every Attempt receives a durable Commission-local Worker Handle. Inspection exposes its exact configuration, Assignment, Worker-execution elapsed time, latest activity, rationale, usage, native session ID, and only currently available controls. Available controls intersect Active Attachment capability, selected Worker Configuration support, live delivery state, open recovery state, and remaining Attempt budget.
-- A Full Entry Session requires `worker_steering` and `worker_interruption`. Control commands authenticate the Active Attachment, require the current mandate revision and an idempotency key, commit a pending outbox record before delivery, and forward idempotent typed clarification-only or interruption messages without changing the mandate. `worker retry` explicitly recovers an interrupted Attention Condition when Attempt budget remains.
-- Available Codex app-server, Claude Agent SDK, and qualified Pi RPC configurations require an absolute executable plus its SHA-256. Tyrion streams the pinned adapter into a preflighted Docker sandbox and launches it only through `docker exec --interactive`. The child receives one revision-bound `tyrion.assignment.launch` JSON Lines message, the exact configuration fingerprint, and non-secret identity and sandbox-local artifact bindings.
-- Codex, Claude, and Pi structured Workers share the one hardened container profile and are distinguished only by their separately pinned native CLI artifacts. Every available Claude or Pi catalog entry requires its matching runtime profile. Qualified Pi requires `settings.production_qualified: true` and an exact match to the runtime's pinned `openai` provider/model; otherwise loading or routing fails closed.
-- Structured launch payloads carry the exact per-Attempt spend reservation. Claude maps it to the native SDK budget; Codex app-server fails closed unless model spend is zero because it exposes no hard monetary budget.
-- Apply Codex `reasoning_effort` through both `thread/start.config.model_reasoning_effort` and `turn/start.effort`, then validate the thread's effective effort. A turn-only override must not be compared against an unrelated thread default.
-- Structured `codex_git` execution requires the pinned contained runtime. Tyrion creates the base and candidate bundle paths, then independently validates candidate ancestry, changed scope, storage, Integration, and contained candidate and assembled Evidence.
-- Codex app-server, Claude Agent SDK, and Pi RPC Worker traces share one structured contract for lifecycle, native Skills, effective configuration, semantic interruption, token usage, Result submission, and terminal state. Tyrion injects containment evidence after its own preflight rather than trusting child attestation. A completed typed Result must match the Commission, Assignment, Attempt, mandate revision, and plan revision and may report no unauthorized effects.
-- Required Skills need native inventory and exact-package preparation proof followed by an observed native invocation. Codex invokes each with an explicit typed Skill input and native path; Claude records only native Skill tool-use blocks.
-- A structured configuration that fails before native readiness is Assignment-locally unavailable. Re-route with the same approximate-equality rule without charging an Attempt or spend reservation; otherwise open routing Attention.
-- Stream active structured adapter session identity, meaningful activity, and usage through the in-memory Worker control record for inspection, then persist validated final telemetry. Bound adapter event output by the Assignment storage ceiling.
-- Schema v10 adds the pending Worker command outbox, durable sandbox cleanup, and per-Assignment Worker Configuration availability failures.
-- Schema v11 adds recovery decisions, restart proof records, Watchdog findings, pause and cancellation states, and revision dispositions for Attempts and Results.
-- Schema v12 adds revision-bound operation requests, single-use Approval Gates, Commission Amendments, and Worker Lease mandate revisions.
-- Schema v13 adds revision-bound Credential Grants and single-use Credential Exposure Grants for credentialed effects.
-- Protocol v2 represents native Skill requirements and inventory as exact lowercase `sha256:` content identities; optional selections are persisted with their Principal, plan, or Worker provenance only after the adapter reports their first observed invocation.
-- When bumping `PROTOCOL_VERSION`, advance the incompatible-handshake fixture and assert the offered version against the current required version in that order.
-- Persist contract-validated Skill invocations from terminal telemetry before handling success, failure, or interruption so the first observed version survives rerouting.
-- Schema v14 adds immutable Assignment Skill defaults, per-Result Skill execution facts, and scoped non-causal Skill associations with Evidence, confidence, and recency.
-- Schema v15 adds verified project identities, immutable Profile Claim versions with mutable heads, bounded per-Attempt Worker Context Packets, exact application records, Result outcomes, and Learning Receipts.
-- Schema v16 adds inferred learning observations, soft promotion and decay, visible claim lifecycle history, Learning Boundaries, content-free deletion receipts, scoped memory portability, and temporary-material retention.
-- Schema v16 migration must resume any residual `legacy:` Profile Claim fingerprint backfill, and verification rejects the database until every fingerprint is canonical.
-- Schema v17 adds durable `attachment_capabilities_changed` events. Attachment capability updates may only remove negotiated capabilities and must expose the resulting mode and missing controls.
-- Launch Pi Entry Sessions through `tyrion pi`; the embedded extension consumes a single-use launch token, uses a user-owned private no-follow cache beside a socket parent chain that other users cannot modify, persists Attachment Mode and role, advances replay monotonically, renders complete actionable Commission state, and exposes native Commission and Worker control commands. Direct or degraded Pi sessions fail closed.
-- Pi RPC dispatch supports one exact native Skill per Assignment. Validate the native command source, canonical path, and package digest before readiness; clear its queue before abort; and use `get_session_stats` totals as the authoritative zero-cost usage record before `agent_settled`.
-- Memory import uses a strict field whitelist, requires complete audit histories and transitive Commission provenance, rejects Learning Boundary reactivation, and keeps source project identifiers out of authoritative repository identity tables.
-- Imported Commission Records are immutable by source ID. Imported affected Attempt records must name a present claim version, use the outcome enum, and have unique Attempt IDs before they are retained for inspection and re-export.
-- A reusable preference requires both independent Principal authentication and the source Commission's Active Attachment. Project scope requires canonical repository device/inode Evidence bound to the stable `project_id`; additions require an already-bound anchor. Exclude versions sourced from the current Commission and never turn `commission_constraints` into memory.
-- Promote project soft memory only after independent Commission support with a Principal edit or explained rejection. Principal-scope candidates require three Commissions across two projects plus explicit confirmation. Contradiction, suppression, decay, and forgetting remain distinct controls.
-- Explicit correction can resolve a contradicted claim while retaining its prior lifecycle. Temporary material is retained by claims only when its source Commission contributed a linked learning observation.
-- Create a Learning Boundary only after forgetting every matching applicable claim. Boundary checks cover explicit creation, correction, confirmation, inference, and import at both Project and Principal scope.
-- Terminal raw Worker material contains bounded adapter events plus actual output or error. Inspection exposes only capture metadata, and the 30-day retention purge clears its content unless a defined retention exception applies.
-- Enforce Profile and packet token limits with serialized UTF-8 byte length as a conservative tokenizer-independent upper bound, including injected claim metadata.
-- Worker Context Packets order current Principal instructions, Commission constraints, Acceptance Criteria, Authority, ceilings, and repository Evidence ahead of advisory claims. Memory never changes routing, Approval Gates, credentials, or ceilings.
-- Run `cargo test --test learning` for explicit and inferred preferences, promotion, correction, suppression, forgetting, boundaries, portability, retention, restart durability, scoped retrieval, packet budgets, provenance, authority isolation, and Learning Receipts.
-- Codex hashes the package returned by native Skill discovery before typed invocation. Claude retains native setting-source discovery, resolves personal before project package paths for identity checks, exposes all native Skills plus the Skill tool, and hashes Worker-selected ToolUse invocations against the configured inventory. Both delegate the native package unchanged and emit typed Required Skill failures.
-- A Required Skill failure is Assignment-local unavailability: preserve the exact default across reroute, use only an approximately equal eligible configuration, and never infer a global ban.
-- Run `cargo test --test cross_harness_routing` and `cargo test --test production_adapters` for version pinning, provenance, native delegation, Result facts, associations, and Required Skill failure recovery.
-- `--principal-control-bootstrap-fd` accepts only a dedicated inherited FIFO descriptor numbered 3 or greater. The daemon emits the ephemeral Principal credential once, closes the descriptor, retains only its hash, and never persists, projects, or writes the secret to standard output. Principal commands receive it through stdin; Attachments and Workers never receive it.
-- Classify every authorized operation as silent and journaled, non-blocking notification, Approval Gate, or prohibited. An approved operation must match its canonical digest and current Assignment, Attempt, Worker Lease, mandate, plan, authority, consequences, and limits at execution.
-- Commission Amendments replace the complete Authority Envelope and resource ceilings, present an exact diff, advance the mandate revision only after independent Principal acceptance, invalidate pending effect grants, and revalidate active Worker Leases.
-- `filesystem.write` binds the canonical repository, directory and target identities plus the before-content digest, uses descriptor-relative no-follow access, and conditionally replaces by moving and verifying the approved inode before a no-replace rename. A stranded started effect pauses its Commission, preserves execution idempotency across restart, and requires exact Principal digest reconciliation before resume.
-- Control requests use a bounded 16-worker, 64-request executor. External effect I/O runs outside SQLite write transactions under a Commission-scoped lock, checks its monotonic and authority deadlines before every write phase and before conditional commit, and cannot block unrelated Commission mutations.
-- Recovery retries one clearly transient or repairable failure on the same Worker Configuration, reroutes unavailable or poor-fit configurations immediately, and records a plan revision after a second equivalent failure.
-- `commission pause` preserves the mandate and stops new dispatch; `commission resume` restarts safe frontier work; `commission cancel` revokes live Leases and reservations while retaining integrated artifacts, Evidence, effects, and history.
-- Restart never reattaches an in-memory Worker. It records the failed process, native-session, acknowledgement, lease, authority, and containment proof set, expires the Lease, deletes its sandboxes, restores the Tyrion-owned Integration repository to the durable Commission artifact, and only then retries when the Attempt ceiling permits.
-- Exclude an Assignment with pending sandbox cleanup from both dispatch and the projected Execution Frontier. A resumed Commission remains an actionable Blocker until containment is confirmed.
-- Keep live Attempt control registered through execution, candidate verification, Integration, and integrated verification. A Watchdog timeout commits its cleanup fence before control delivery, marks the Attempt terminal, explicitly deletes every execution and verification sandbox, restores Integration when needed, and only then clears the fence.
-- Serialize each Commission's Integration against Principal cancellation, revalidate current repository, path, action, and effect authority after every external phase, and retain any already-integrated reality without reviving cancelled state.
-- Recovery must not re-execute an acknowledged integrated Result after restart or live Watchdog containment. Retain it as requiring revalidation and expose the exact revalidation requirement as a Blocker.
-- When recovery supersedes a logical Assignment, retarget its downstream dependency edges to the replacement before advancing the safe Execution Frontier.
-- Inspection derives a resumable Blocker only when unresolved criteria have no running Attempt or safe Execution Frontier, and includes the exact next requirement plus retained Evidence, artifacts, failed approaches, and resource use.
-- Run `cargo test --test commission_effects` for operation classification, exact approval, amendment, ceiling, cancellation, and adversarial authority coverage.
-- Start credentialed effects with `tyriond --credential-runtime <json>`. The runtime pins macOS Keychain, curl, destination aliases, and the repaired OpenShell boundary used by exceptional one-shot exposure.
-- Credential values stay outside SQLite and reach only pinned effect executors over standard input. Execution revokes the Keychain item, destroys any fresh Effect Sandbox and descendants, scans for leaks, and persists a redacted receipt.
-- Credentialed lost-ack recovery pauses the Commission and permits only exact read-only reconciliation or an actionable blocker. It never automatically retries the write.
-- Derive one-shot Effect Sandbox names from the durable operation ID. Startup and reconciliation must delete that exact sandbox and revoke its Credential Grant before read-only observation; any post-delivery timeout is uncertain, never failed.
-- Register brokered effect process groups durably before credential delivery. Use a host-local operation marker that is never transmitted to the destination. Restart and reconciliation scan the marker, reject PID reuse, terminate the exact group, and independently verify Keychain revocation before observation.
-- Credentialed requests must approve both confirmed and not-applied reconciliation digests before their Approval Gate can open.
-- Run `cargo test --test credentialed_effects` for brokered delivery, one-shot isolation and cleanup, leak absence, no-replay reconciliation, and approved-destination isolation on macOS.
-- `docker exec` forwards no stdin without `--interactive`. That is the path delivering the secret to the one-shot adapter, so omitting it makes the adapter receive nothing and the failure is reported as `uncertain` rather than as a missing flag. `docker logs` also takes `--tail 300 NAME`, not `NAME -n 300`.
-- Run `cargo test --test cross_harness_routing` for hard gates, ranking visibility, Entry Session neutrality, cross-harness Assignment routing, approximately equal fallback, Attention Conditions, stable Handles, steering, and interruption.
-- Synchronize structured-control failure tests on an explicit fixture signal after stdin closes. Fixed sleeps can let the adapter finish and reject the command before the durable outbox record exists.
-- A structured adapter session ID is published by `tyrion.adapter.ready` before the harness start event. Tests asserting started activity must wait for both signals instead of treating session identity as lifecycle readiness.
-- `commission export-record` requires an authenticated Commission-inspection Attachment and returns a versioned `tyrion.commission` bundle whose checksum covers only the stable public record. The final briefing reports Approval Gates, planned controls, unplanned interventions, corrections, context transfer, reconciliation, useful concurrency, conflicts, cost, timing, failures, and recovery separately. A planned Worker control must use `--planned-uncertainty` with an exact known uncertainty from the accepted mandate. Export never independently attests containment, identifies fixture-backed Worker evidence explicitly, and reports dogfood readiness only as `blocked` or `unassessed`, never automatically `ready`.
-- After verified issue-backed work is committed and pushed, close the completed issue and confirm its final state.
-- `tyrion init` is the only setup path; `runtime/docker/generate-config.sh` and the zero-config prototype binary are deleted. It writes `worker-runtime.json` and `worker-catalog.json` to `$TYRION_DATA_DIR/runtime/`, and `tyrion claude`/`tyrion codex` pass both to the daemon they start, with no flags.
-- Init trusts publishers' checksums, never a hard-coded digest: Claude Code's per-release `manifest.json` (channel resolved from `downloads.claude.ai/claude-code-releases/stable`), and Codex's `codex-package_SHA256SUMS` for the package archive at Tyrion's own `CODEX_VERSION` pin, not the latest release. That archive carries both `bin/codex` and `bin/codex-code-mode-host`.
-- The Worker image tag is a digest of the embedded Dockerfile and `native_skill.py`, so an upgrade that changes either builds a new image instead of reusing a stale one.
-- The deterministic Worker is registered only when the daemon has no runtime at all; any contained runtime replaces it. A configured daemon therefore cannot run a `deterministic.echo` Commission, so init proves readiness by starting a daemon on the generated runtime and attaching an Entry Session, and spends no model tokens.
-- Wait for a daemon with `daemon_is_ready`, never for the socket file: the socket binds before startup finishes, and a request sent then gets an empty reply that surfaces as a JSON EOF.
-- A debug `tyriond` takes about 17 seconds to answer on a real runtime because it hashes roughly 550 MB of pinned binaries. The launcher's readiness deadline is 30 seconds and it logs daemon stderr to `$TYRION_DATA_DIR/tyriond.log`.
-- Catalog adapters must be executable (mode 700); the daemon rejects a mode-600 adapter before binding its socket.
-- Host admission (#22): the daemon records Docker's `NCPU`/`MemTotal` (or `--host-cpus`/`--host-memory-mib`) in the schema v18 `host_capacity` row at startup, keeps 1024 MiB back, and admits an Assignment only while the sum of every active reservation's routed `containment_resources` fits, across all Commissions. Holds surface as `host_capacity_unavailable` in `frontier_holds`; a profile that could never fit blocks with code `host_capacity`.
-- Before #22 every Worker container was started with `--cpuset-cpus 0-1`, so all concurrent Workers shared two CPUs whatever the host had. Each sandbox now takes the least-loaded CPUs from an in-memory allocator; once Workers outnumber cores they share CPUs, so do not claim exclusive cores.
-- A Worker Configuration may declare `containment_resources` smaller than the pinned runtime profile; routing resolves an absent one to the pinned profile, so every contained route JSON carries its profile and host usage is summed in SQL.
-- The inspection projection's frontier holds the second of two ready Assignments before either dispatches when only one fits. A test waiting for a host hold must also wait for a running Attempt before asserting in-use capacity.
-- Worker profile decided 2026-09-26 from measurement (`docs/capacity.md`): ceilings 2 vCPU / 3072 MiB / 2048 MiB files / 256 processes, requests 250 millicores / 320 MiB. Admission sums requests, the runtime enforces ceilings. With the harnesses built into the image, ten real concurrent Codex Workers each peaked at 255-293 MiB and 0.1 cores, 1.8 GiB together; this 12-CPU, 7.7 GiB Docker VM admits 21. Claude Workers are unmeasured and reserve 1024 MiB.
-- Streaming harness binaries into each Worker's tmpfs cost 328 MiB of memory-charged shmem per Worker. Building them into the image cut a Worker from about 565 MiB to about 280 MiB and made daemon startup 0.5 s instead of 1.5 s, because it no longer hashes 550 MB of host binaries.
-- The CPU allocator must be sized from Docker's real `NCPU`, never the declared `--host-cpus`: asking Docker for a CPU that does not exist fails container creation (`Requested CPUs are not available`), which surfaced as `worker_configuration_unavailable`. The fake Docker now refuses CPUs at or above 16 the same way.
-- Worker adapters stage with `git add -A`, so without help a correct Worker that ran its tests failed as an unauthorized change on `__pycache__` in a repository with no `.gitignore`. Every Worker clone now appends Tyrion's runtime byproduct patterns to `.git/info/exclude`; `native_skill.py` and `contained_codex.rs` carry the same list and a test keeps them identical.
-- Docker Sandboxes (`sbx`) was evaluated and rejected: no process-ceiling or storage flag exists at all, `--allow-network` and `--ttl` are cloud-only so deny-by-default plus provider-only egress is inexpressible locally, `--skills` defaults to a writable mount, `--clone` bind-mounts the host repository, and the local flag surface moved from 0.42.1 to 0.45.0 in ten days. The evaluation lives in git history (deleted from `docs/prototypes/` on 2026-09-28). `sbx` is still installed but unused.
-- Plain Docker replaced the repaired OpenShell MicroVM as the Worker containment boundary on 2026-09-21, removing Tyrion's custom-kernel distribution burden. The qualification and the complete claim set are in `.scratch/proof-archive/2026-09-21-containment-qualification.md`.
-- The resource contract changed with that replacement: 2 vCPU / 2048 MiB memory / 4096 MiB overlay became 2 vCPU / 6144 MiB combined memory-and-files / 4096 MiB writable storage / 256 processes. Same host envelope, one hard combined ceiling plus a hard storage sub-ceiling. Superseded 2026-09-26 by the measured request-and-ceiling profile below; the Principal delegated that decision to measurement.
-- OpenShell is fully retired as of 2026-09-25. `runtime/openshell/` and both OpenShell fixtures are deleted, and the credentialed one-shot Effect Sandbox runs under `docker-hardened-v1` like every other boundary.
-- An Effect Sandbox reaches exactly its approved destination through a per-operation `--internal` bridge plus a relay pinned to that one `host:port`, with `--add-host` mapping the destination name to a fixed relay address so TLS still terminates at the real destination. The lost OpenShell policy check is replaced by `an_effect_sandbox_reaches_only_its_approved_destination`, which proves the shape rather than trusting configuration.
-- `parse_destination_origin` accepts a bare scheme and authority only. A resolved effect URL carries a path, so pass it through `destination_origin_of` first; handing it the full URL silently fails the whole egress setup before any network is created.
-- Accepting the Xcode license (`sudo xcodebuild -license accept`) is a prerequisite on this host: `git` exits 69 under the daemon's cleared environment until it is done, and the linker fails the same way.
-- OpenCode (#28) is the fourth Worker harness: `adapters/opencode_server.py` drives `opencode serve` over `prompt_async` plus the SSE `/event` stream, steers with a queued `prompt_async`, interrupts with `/abort`, and reads usage from `/session/{id}/message`. `opencode run --attach` buffers output and ignores abort; do not go back to it. See `docs/reference/opencode.md`.
-- OpenCode is pinned by `OPENCODE_VERSION` and signs in with the Codex login, so its runtime profile is refused without `codex_auth_file`. It publishes no checksum file, so `init` pins GitHub's asset digests in source per platform (x64 uses the `baseline` build).
-- The `skills` adapter capability is required for every structured kind except `opencode_server`, which delivers no native Skills and so never claims them. Routing keeps Skill-requiring work away through its empty inventory; do not declare the capability to pass the check.
-- The `init` probe container must carry the Worker's `TMPDIR=/sandbox/tmp` and `XDG_CONFIG_HOME`: under a read-only root, OpenCode cannot even print its version without them.
-- Mixed-harness proof, 2026-09-27: two OpenCode and two Codex Workers ran one plan concurrently to `verified_complete` in 63 s against 200 s serial, zero failed Evidence. Record at `.scratch/proof-archive/2026-09-27-opencode-cross-harness.json`. The opt-in real test is `real_opencode_worker_completes_the_contained_git_assignment` with `TYRION_REAL_WORKER_RUNTIME` and `TYRION_REAL_WORKER_CATALOG`.
-- Worker egress is scoped per harness: an `egress.destinations[]` entry may carry `harnesses`, and each Attempt network gets relays only for destinations that serve its Worker's harness (empty list means every harness). `init` scopes `api.anthropic.com` to Claude and the OpenAI pair to Codex and OpenCode. Before this, every Worker could reach every configured provider. `each_worker_reaches_only_its_own_harness_destinations` proves it.
-- The fake Docker `logs` once redirected `2>/dev/null >&2`, discarding everything, so no Worker egress relay could ever look ready and no test had exercised Worker egress at all. Relays are hardened but carry no `--tmpfs` or `--cpus`; the fake recognises them by the `-net-r<N>` name.
-- The built-in (catalog-less) Codex path now receives the subscription login in `CODEX_HOME=/sandbox/.codex` like the structured adapter. It previously supported only API-key credentials, so `real_docker_boundary_completes_the_contained_git_assignment` failed on an `init` runtime.
-- A codex_git Commission may carry exactly one consequential effect kind: a local `filesystem.write` the daemon performs itself behind an Approval Gate (effects `["filesystem.write"]`, destinations `["local"]`, action `filesystem.write`). Every non-checkout repository in the envelope is an effect target and must resolve wholly outside the Principal checkout. Workers never receive the effect. Effect targets share `authority.paths` with Worker write paths, so name a target that does not exist in the Git repository.
-- The Codex, Claude and OpenCode adapters, and the built-in Codex prompt, used to drop the Worker Context Packet: binding Commission constraints and learned preferences never reached those models, while Learning Receipts recorded the claims as applied. `native_skill.context_packet_lines` (mirrored by `context_packet_text` in Rust) now renders constraints then advisory preferences for every harness. Changing `native_skill.py` changes the image tag, so rerun `tyrion init`.
-- Issue #16 readiness proof, 2026-09-28: Its mandate, record, live-container probes and `run.sh`/`driver.py` (which reproduce it from a Git bundle of the base project) live in the local, git-ignored `.scratch/proof-archive/`, because exported records carry machine paths. It found seven defects the fixtures could not; rerun it after any change to routing, effects, learning, or containment. The driver drives the protocol Attachment, not a native TUI, because native Entry deliberately offers no effect or project fields.
-- `commission_constraints` is the proposal field; the projection calls it `constraints`. Proposal, criterion, authority and ceiling JSON refuse unknown fields.
-- A reusable preference must be one atomic sentence: no `and`, commas, semicolons or second sentence.
-- `init` prunes older `tyrion-worker:<12 hex>` images after its daemon check proves the new runtime, never by force; other tags (hand-built images) are left alone. Every change to the Dockerfile, `native_skill.py`, or a harness binary builds a new 1.8 GB image, so without this they accumulate.
-- Docs layout, 2026-09-28: newcomer guides at `docs/how-it-works.md`, `docs/security.md`, `docs/capacity.md`; contributor reference under `docs/reference/`; run summaries in `docs/results.md`; exported records stay local in `.scratch/proof-archive/` because they carry machine paths. Finished plans, rejected-option write-ups and resolved reassessments were deleted; git history keeps them. Keep every README claim traceable to a `docs/results.md` entry, never commit an exported record, and keep internal jargon (dogfood, MVP, slice) out of user-facing prose.
-- Commission record export format is version 2: `dogfood_readiness` was renamed `readiness`. Checked-in records before that keep the old key; never rewrite a checked-in record.
-- Worker handles are star names (`Vega`, `Rigel`, ...), not franchise characters. The project name stays Tyrion, but the README and docs use no Game of Thrones names, quotes, imagery or phrases such as "Hand of the King".
-- Attempt networks get explicit /28 subnets from `10.213.0.0/16` via `SubnetAllocator`, skipping any subnet Docker reports as overlapping. Docker Desktop's predefined pool holds about 30 networks and every Worker with egress needs two, so before this the sixteenth concurrent Worker failed with "all predefined address pools have been fully subnetted" and sat in `attention_required` forever. The fake Docker now models that pool (`$state/address-pool-size`) and overlap refusal.
-- Measured at this Mac's full capacity, 2026-09-29: 21 concurrent Codex Workers, 21/21 verified, 956 s of Worker execution in a 58 s window (16.6x), 85 s end to end, each Worker under 300 MiB. The once-a-second sampler cannot visit 21 containers per second, so do not report a total-memory figure from it at that scale.
-- Admission ceilings are specifications, not measurements: min(cores x 4, (Docker MiB - 1024) / 320). 12 cores and 7.7 GiB gives 21; 16 GiB gives 48; 16 cores and 32 GiB gives 64; 32 cores and 64 GiB gives 128. Label them as ceilings wherever they appear.
-- Read-only projections (`inspect_commission`, `export_commission_record`, amendment inspection) read through one deferred transaction. On the bare connection each SELECT saw its own snapshot, so a commit landing between them showed an interrupted Worker whose Attempt still read `running`; it surfaced as a rare flake in `structured_adapters_receive_steering_and_interruption`.
-- History was rewritten on 2026-09-29 with `git filter-repo` to purge `docs/proof` and `docs/dogfood-records` (exported records carried machine paths) and a personal path in `tests/fixtures/fake_codex.sh`, then force-pushed with both tags. A pre-rewrite bundle is kept locally at `.scratch/history-before-rewrite.bundle`. Never commit an exported record or any absolute home path; the brew formula checksum had to be re-pinned because rewriting the tagged commits changed the release tarball.
-- `tyrion uninstall` (`src/uninstall.rs`) takes the daemon's `control-plane.lock` itself, so it refuses while any session runs and no daemon can start mid-delete. It lists finished results whose `tyrion-integration` commit is on no branch of their repository (a fast-forward merge keeps the commit, so it counts as merged), asks for a typed `delete` unless `--yes`, removes `tyrion.attempt`/`tyrion.init` containers, labelled networks and `tyrion-worker` images through the pinned Docker, then deletes the data folder. Removing the program is left to Homebrew or Cargo.
+Notes for contributors and the coding agents they work with. The README says
+what Tyrion is; `docs/how-it-works.md` explains a job end to end; this file is
+about changing the code without breaking what it promises.
+
+## Before you commit
+
+```sh
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+All four must pass. A flaky test is a bug to fix, not to retry. Use commit
+messages of the form `feat: ...`, `fix: ...`, `docs: ...`, `test: ...` or
+`refactor: ...`.
+
+Focused suites, by area:
+
+| Suite | Covers |
+| --- | --- |
+| `git_commission` | contained Git jobs: lifecycle, leases, containment failures, path authority, transfer, integration, planning, capacity, uninstall |
+| `cross_harness_routing` | routing gates and ranking, fallback, attention, Worker handles, steering and interruption, per-harness egress |
+| `production_adapters` | the real Python adapters against fake harness processes |
+| `commission_effects` | operation classification, approval gates, amendments, cancellation |
+| `credentialed_effects` | brokered credentials, one-shot sandboxes, leak checks, no-replay recovery (macOS) |
+| `commission_recovery`, `commission_lifecycle` | recovery, restart, verification and completion |
+| `learning` | preferences: promotion, correction, forgetting, boundaries, packets, receipts |
+
+Two opt-in tests exercise the real boundary and real models. Run `tyrion init`
+with a Codex login first:
+
+```sh
+TYRION_REAL_CODEX_WORKER_CONFIG=~/.local/state/tyrion/runtime/worker-runtime.json \
+  cargo test --test git_commission real_docker -- --ignored
+TYRION_REAL_WORKER_RUNTIME=~/.local/state/tyrion/runtime/worker-runtime.json \
+TYRION_REAL_WORKER_CATALOG=~/.local/state/tyrion/runtime/worker-catalog.json \
+  cargo test --test git_commission real_opencode -- --ignored
+```
+
+On macOS, accept the Xcode license (`sudo xcodebuild -license accept`) first:
+until then `git` exits 69 under the daemon's cleared environment.
+
+## Code map
+
+| Path | Responsibility |
+| --- | --- |
+| `src/bin/tyrion.rs`, `src/bin/tyriond.rs` | CLI and daemon entry points |
+| `src/daemon.rs` | socket server, data-directory lock, startup recovery |
+| `src/store.rs` | every lifecycle transaction |
+| `src/store/projection.rs` | read projections (inspection, export) |
+| `src/store/schema.rs` | schema (v18), migrations, integrity checks |
+| `src/store/frontier.rs`, `src/store/planning.rs` | dispatch frontier and admission; the planning Worker |
+| `src/worker/contained_codex.rs` | Docker sandboxes, networks, transfer, verification |
+| `src/worker/routing.rs` | Worker catalog and routing |
+| `src/worker/adapter_contract.rs`, `src/worker/structured_process.rs` | the shared adapter trace contract |
+| `adapters/*.py` | Codex, Claude, OpenCode and Pi adapters; `native_skill.py` is shared and lives in the Worker image |
+| `src/entry_mcp.rs`, `src/native_entry_launcher.rs`, `src/digest.rs` | the Claude Code and Codex Entry Session bridge and its status digest |
+| `src/credential.rs` | brokered credentials and effect sandboxes |
+| `src/init.rs`, `src/uninstall.rs` | machine setup and removal |
+| `runtime/docker/` | the Worker image and runtime file reference |
+
+Keep lifecycle writes in `store.rs`, reads in `store/projection.rs`, and schema
+rules in `store/schema.rs`.
+
+## Vocabulary
+
+Code, protocol and CLI output use these terms precisely: Principal (the user),
+Commission (one delegated job), Commission Proposal, Acceptance Criterion,
+Authority Envelope, Assignment (one planned piece), Attempt (one Worker's run
+of an Assignment), Worker, Result, Evidence, Control Plane, Blocker and
+Verified Completion. User-facing prose says "job" and "agent" instead.
+
+## Invariants
+
+These are the promises. A change that weakens one needs its own discussion.
+
+**The seam and the store**
+
+- The public seam is the `tyrion` CLI over the versioned Unix-socket protocol
+  to `tyriond`. End-to-end tests observe only that seam, with real SQLite state
+  and real daemon restarts.
+- `tyriond` is the only writer. It holds an exclusive lock per data directory,
+  keeps the directory and socket user-only, and runs SQLite in WAL mode.
+- Read-only projections read through one deferred transaction, so every query
+  sees the same snapshot.
+- Mutating requests carry idempotency keys. An identical replay returns the
+  stored response; reusing a key for a different request is refused. A used
+  attachment handshake is the exception: it never replays its credential.
+- Proposal, criterion, authority and ceiling JSON refuse unknown fields. The
+  proposal field is `commission_constraints`.
+- Schema changes back the database up once, migrate, verify integrity, then
+  delete the backup. Bumping `PROTOCOL_VERSION` also advances the
+  incompatible-handshake test fixture.
+
+**Authority**
+
+- Creating a proposal grants nothing. Acceptance needs the exact expected
+  revision and an idempotency key.
+- Harness capability is a ceiling, never a grant. Effective authority is the
+  intersection of harness capability, the accepted Authority Envelope, and the
+  Attempt's current, expiring Worker Lease.
+- Every operation is classified as silent and journaled, a non-blocking
+  notification, an Approval Gate, or prohibited. An approved operation must
+  match its canonical digest and current revisions at execution time.
+- Only the Principal approves, with a credential the daemon hands out once
+  over an inherited descriptor numbered 3 or higher
+  (`--principal-control-bootstrap-fd`). It never persists, logs or reaches an
+  Attachment or Worker.
+- A `codex_git` Commission may carry exactly one effect kind, a local
+  `filesystem.write` the daemon performs itself, and only to a directory
+  outside the Principal's checkout.
+
+**Verification and completion**
+
+- Evidence is immutable and bound to criterion, mandate revision, candidate
+  Result, verifier and artifact revision. The Control Plane recomputes artifact
+  hashes itself.
+- A Result stays a candidate until fresh integrated verification passes.
+  Verified Completion, the accepted Result, passed criteria, the briefing and
+  the terminal event commit in one transaction.
+- Integrated verification checks only criteria whose work is in the assembled
+  artifact (any Assignment with an `integrated_artifact_revision`).
+- A verifier that cannot run blocks once as `verifier_unrunnable`; it never
+  reruns the Worker.
+- Accepting a Result, planned or not, records its Profile Claim outcomes, so
+  every accepted Attempt gets a Learning Receipt.
+
+**Recovery**
+
+- Acceptance and readiness commit before dispatch. A disconnected Entry
+  Session never revokes accepted work.
+- Each ready Assignment dispatches on its own connection and thread.
+- Restart never reattaches a Worker in memory. It records what it could not
+  prove, expires the Lease, deletes the sandboxes, restores the integration
+  repository, and only then retries. Pending sandbox deletion blocks dispatch.
+- Recovery retries a transient failure once on the same configuration,
+  reroutes an unavailable one immediately, and revises the plan after a second
+  equivalent failure. An acknowledged integrated Result is never re-executed.
+- An effect whose outcome is uncertain is reconciled read-only or becomes a
+  Blocker. It is never retried blindly.
+
+**Containment (`docker-hardened-v1`)**
+
+- One disposable container per Attempt, verification run and comparison:
+  `--read-only --pids-limit 256 --memory 3072m --memory-swap 3072m --cpus 2
+  --cpuset-cpus <two least-loaded> --cap-drop ALL --security-opt
+  no-new-privileges --security-opt seccomp=builtin --user 65534:65534`, one
+  sized `/sandbox` tmpfs as the only writable mount, and no bind mount.
+- The runtime file accepts only that profile, with requests of 250 millicores
+  and 320 MiB. Admission sums requests across every Commission, keeping 1 GiB
+  back; the container runtime enforces the ceilings.
+- The Principal's checkout is an input, never a workspace. Code moves in and
+  out as verified Git bundles. A candidate is rejected if it touches an
+  unauthorized path or contains a symlink that escapes the repository.
+- A containment preflight proves the profile from inside before any Worker
+  code runs. A failed preflight is a Security Invariant failure.
+- Siblings are isolated at namespace strength. Never claim virtual-machine
+  isolation between Workers.
+- Harness binaries are built into the Worker image, which the image ID pins.
+  Every sandbox rechecks the pinned version (`CODEX_VERSION`,
+  `OPENCODE_VERSION`) before launch.
+
+**Egress and credentials**
+
+- A Worker's network is a per-Attempt `--internal` bridge plus one relay per
+  allowed destination. Relays forward TCP to exactly one `host:port` without
+  terminating TLS. Destinations are scoped per harness.
+- Attempt networks get explicit `/28` subnets from `10.213.0.0/16`. Docker's
+  default pool holds only about 30 networks.
+- Worker credentials are named, never valued, in configuration, and delivered
+  after preflight: environment variables by `docker exec --env NAME`, the Codex
+  login as token fields streamed from memory. Nothing secret reaches a command
+  line, a file on the host, or the database.
+
+**Learning**
+
+- Learned preferences are advisory. Commission constraints, criteria,
+  authority and ceilings always win, and memory never changes routing,
+  approvals, credentials or ceilings.
+- Every adapter renders the Worker Context Packet into the model's prompt:
+  binding constraints first, then advisory preferences
+  (`native_skill.context_packet_lines`, mirrored by `context_packet_text` in
+  Rust).
+- A reusable preference is one atomic sentence, with no "and", commas or
+  semicolons.
+
+## Pitfalls that cost real debugging time
+
+**Docker**
+
+- `--security-opt seccomp=builtin` is mandatory: Docker Desktop leaves seccomp
+  unconfined by default.
+- Never use `docker cp` into a sandbox: on Docker Desktop it exits 0 while
+  writing underneath the tmpfs. Stream with `docker exec -i ... cat`.
+- `docker exec` forwards no stdin without `--interactive`.
+- Never probe liveness with `docker exec`; it restarts a stopped container.
+  Confirm removal by `docker inspect` failing.
+- Docker mounts tmpfs `noexec` by default; `/sandbox` needs `exec`.
+- The memory cgroup charges tmpfs pages, so the memory ceiling must exceed
+  writable storage. `--storage-opt size=` does not work on `overlayfs`.
+- Label every container and network `tyrion.attempt=<id>` and clean up by
+  label, never by reconstructing names.
+- Size the CPU allocator from Docker's real `NCPU`; asking for a CPU that does
+  not exist fails container creation.
+- Worker clones exclude runtime byproducts (`__pycache__/`, `node_modules/`,
+  and so on). The list lives in both `native_skill.py` and
+  `contained_codex.rs`, and a test keeps them identical.
+- A locally built image has an image ID but no registry digest. Accept either,
+  never a tag.
+
+**Harnesses**
+
+- Codex needs its companion `codex-code-mode-host` binary to edit files, and
+  reads its login from `auth.json`, not the environment. Its subscription
+  egress is `chatgpt.com:443` plus `auth.openai.com:443`.
+- Apply Codex `reasoning_effort` to both the thread and the turn, and validate
+  the thread's effective effort.
+- OpenAI structured output rejects an array schema without `items`; Claude
+  accepts it. A second harness is what audits the first.
+- The Claude Agent SDK waits for an input iterable to finish, so send each
+  turn with its own `client.query`. Expect its `StructuredOutput` tool in the
+  inventory without granting it.
+- In Claude Code print mode the Entry bridge needs `--allowedTools
+  mcp__tyrion`; Codex needs `default_tools_approval_mode="approve"`.
+- OpenCode runs as `opencode serve`, driven by `prompt_async` and its SSE
+  event stream. `opencode run --attach` buffers output and ignores abort. It
+  needs `TMPDIR` under `/sandbox`, and it delivers no native Skills, so it never
+  claims the `skills` capability.
+- Pi RPC supports one native Skill per Assignment and must clear its queue
+  before abort.
+
+**Daemon and tests**
+
+- Wait for the daemon with `daemon_is_ready`, not for the socket file: the
+  socket binds before startup finishes.
+- Startup dispatch is asynchronous; poll the projection for the state you
+  expect. A structured adapter reports its session ID before its start event,
+  so wait for both.
+- Synchronize control tests on explicit fixture signals, never on sleeps.
+- `--watchdog-stall-milliseconds` defaults to ten minutes on purpose: real
+  models are silent for minutes.
+
+## Fakes and evidence
+
+The default suite runs against fakes of Docker and each harness
+(`tests/fixtures/`). A fake that agrees with the adapter instead of behaving
+like the real program hides real defects, and the first run against each real
+harness found several. When a fake and reality disagree, change the fake.
+When a new test passes first time, break the code once to prove the test can
+fail.
+
+## Docs
+
+- User-facing docs use plain words ("agent", "job") and keep internal
+  vocabulary for the reference pages.
+- Every number in the README must trace to an entry in `docs/results.md`.
+  Ceilings computed from the admission rule are labelled as ceilings, never
+  presented as measurements.
+- Never commit an exported Commission record, a timeline, or any absolute home
+  path: they carry machine-specific details.
+- Keep project-internal notes in `CLAUDE.local.md`, which git ignores.
