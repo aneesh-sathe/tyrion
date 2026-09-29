@@ -3692,7 +3692,8 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| TyrionError::NotFound(approval_gate_id.to_owned()))?;
-        let projection = project_commission(&self.connection, &commission_id)?;
+        let projection =
+            project_commission(&*self.connection.unchecked_transaction()?, &commission_id)?;
         let gate = projection["approval_gates"]
             .as_array()
             .and_then(|gates| gates.iter().find(|gate| gate["id"] == approval_gate_id))
@@ -4818,7 +4819,8 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| TyrionError::NotFound(amendment_id.to_owned()))?;
-        let projection = project_commission(&self.connection, &commission_id)?;
+        let projection =
+            project_commission(&*self.connection.unchecked_transaction()?, &commission_id)?;
         let amendment = projection["commission_amendments"]
             .as_array()
             .and_then(|amendments| {
@@ -5480,6 +5482,10 @@ impl Store {
         Ok(result)
     }
 
+    // Projections read through a deferred transaction so every query sees one
+    // snapshot. Without it, a commit landing between two SELECTs let an
+    // inspection or an exported record show an interrupted Worker whose
+    // Attempt still read as running.
     pub fn inspect_commission(
         &self,
         request: &Request,
@@ -5493,7 +5499,8 @@ impl Store {
             commission_id,
             attachment::COMMISSION_INSPECTION,
         )?;
-        let mut projection = project_commission(&self.connection, commission_id)?;
+        let mut projection =
+            project_commission(&*self.connection.unchecked_transaction()?, commission_id)?;
         apply_attachment_worker_controls(
             &self.connection,
             &attachment_id,
@@ -5517,7 +5524,7 @@ impl Store {
             commission_id,
             attachment::COMMISSION_INSPECTION,
         )?;
-        let record = project_commission(&self.connection, commission_id)?;
+        let record = project_commission(&*self.connection.unchecked_transaction()?, commission_id)?;
         let checksum = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&record)?));
         let fixture_backed = record["workers"]
             .as_array()
