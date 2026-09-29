@@ -1,13 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 648" width="1200" height="648" role="img" aria-labelledby="title desc">
-  <title id="title">One sentence becomes four Workers and one verified branch</title>
-  <desc id="desc">A request to add monthly interest, CSV export, daily limits and a CLI is split across four Workers. Vega and Altair run on OpenCode, Rigel and Lyra on Codex. The CLI waits for interest and export. Each result is checked, and the work merges into one branch: five of five checks passed, 122 seconds faster than running the work one piece at a time.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 740" width="1200" height="740" role="img" aria-labelledby="title desc">
+  <title id="title">One order becomes twenty-one agents and one verified branch</title>
+  <desc id="desc">A long request to extend a ledger with twenty-one features is split across twenty-one Codex agents: Vega, Rigel and Altair are shown in full, eighteen more are compressed into a row of seals that light up as each finishes, and Sirius 2 finishes last. Every result is checked, and the work merges into one branch: twenty-one of twenty-one checks passed, sixteen times faster than running them one at a time.</desc>
   <defs>
     <radialGradient id="stage" cx="50%" cy="0%" r="95%">
       <stop offset="0" stop-color="#2a150e"/>
       <stop offset="0.6" stop-color="#140a07"/>
       <stop offset="1" stop-color="#090504"/>
     </radialGradient>
-    <clipPath id="promptClip"><rect x="80" y="104" width="1040" height="60"/></clipPath>
+    <clipPath id="line1"><rect x="80" y="112" width="1040" height="34"/></clipPath>
+    <clipPath id="line2"><rect x="80" y="146" width="1040" height="34"/></clipPath>
   </defs>
   <style>
     text { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
@@ -15,135 +16,147 @@
     .caption { font-size: 14px; font-weight: 600; letter-spacing: 2.4px; fill: #9a8062; }
     .prompt { font-size: 21px; fill: #f3e8d6; }
     .handle { font-size: 24px; font-weight: 700; fill: #f8efe0; letter-spacing: -0.3px; }
-    .harness { font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+    .harness { font-size: 15px; font-weight: 600; letter-spacing: 0.2px; fill: #e6b75f; }
     .task { font-size: 20px; font-weight: 500; fill: #e9dcc6; }
     .path { font-size: 14px; fill: #8f7659; }
-    .wait { font-size: 14px; font-weight: 500; fill: #b39b7c; letter-spacing: 0.2px; }
     .result { font-size: 21px; font-weight: 600; fill: #f8e3b4; letter-spacing: -0.2px; }
     .result-dim { font-size: 21px; font-weight: 500; fill: #c9a878; }
-
-    .anim { animation-duration: 14s; animation-iteration-count: infinite; animation-fill-mode: both; }
+    .anim { animation-duration: 15s; animation-iteration-count: infinite; animation-fill-mode: both; }
     .fb { transform-box: fill-box; }
     .left { transform-origin: left center; }
     .center { transform-origin: center; }
-
     .scene { animation-name: scene; }
     .cap { animation-name: cap; }
     .box { animation-name: box; }
-    .cover { animation-name: type; }
-    .caret { animation: blink 1s steps(1) infinite; }
-    .l1 { animation-name: lane1; } .l2 { animation-name: lane2; } .l3 { animation-name: lane3; } .l4 { animation-name: lane4; }
-    .b1 { animation-name: bar1; } .b2 { animation-name: bar2; } .b3 { animation-name: bar3; } .b4 { animation-name: bar4; }
-    .c1 { animation-name: check1; } .c2 { animation-name: check2; } .c3 { animation-name: check3; } .c4 { animation-name: check4; }
-    .waiting { animation-name: waiting; }
+    .t1 { animation-name: type1; }
+    .t2 { animation-name: type2; }
+    .caret1 { animation-name: caret1; }
+    .caret2 { animation-name: caret2; }
     .res { animation-name: res; }
-
     @keyframes scene { 0%, 93% { opacity: 1; } 99%, 100% { opacity: 0; } }
     @keyframes cap { 0% { opacity: 0; } 3%, 100% { opacity: 1; } }
     @keyframes box { 0% { opacity: 0; transform: translateY(8px); } 5%, 100% { opacity: 1; transform: none; } }
-    @keyframes type { 0%, 6% { transform: translateX(0); animation-timing-function: steps(73, end); } 21%, 100% { transform: translateX(919.8px); } }
-    @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-    @keyframes lane1 { 0%, 22% { opacity: 0; transform: translateY(14px); } 25%, 100% { opacity: 1; transform: none; } }
-    @keyframes lane2 { 0%, 23.5% { opacity: 0; transform: translateY(14px); } 26.5%, 100% { opacity: 1; transform: none; } }
-    @keyframes lane3 { 0%, 25% { opacity: 0; transform: translateY(14px); } 28%, 100% { opacity: 1; transform: none; } }
-    @keyframes lane4 { 0%, 26.5% { opacity: 0; transform: translateY(14px); } 29.5%, 100% { opacity: 1; transform: none; } }
-    @keyframes bar1 { 0%, 29% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 53%, 100% { transform: scaleX(1); } }
-    @keyframes bar2 { 0%, 29.5% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 46%, 100% { transform: scaleX(1); } }
-    @keyframes bar3 { 0%, 30% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 66%, 100% { transform: scaleX(1); } }
-    @keyframes bar4 { 0%, 54% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 72%, 100% { transform: scaleX(1); } }
-    @keyframes waiting { 0%, 27% { opacity: 0; } 30%, 52% { opacity: 1; } 55%, 100% { opacity: 0; } }
-    @keyframes check1 { 0%, 53% { opacity: 0; transform: scale(.4); } 55% { opacity: 1; transform: scale(1.18); } 57%, 100% { opacity: 1; transform: scale(1); } }
-    @keyframes check2 { 0%, 46% { opacity: 0; transform: scale(.4); } 48% { opacity: 1; transform: scale(1.18); } 50%, 100% { opacity: 1; transform: scale(1); } }
-    @keyframes check3 { 0%, 66% { opacity: 0; transform: scale(.4); } 68% { opacity: 1; transform: scale(1.18); } 70%, 100% { opacity: 1; transform: scale(1); } }
-    @keyframes check4 { 0%, 72% { opacity: 0; transform: scale(.4); } 74% { opacity: 1; transform: scale(1.18); } 76%, 100% { opacity: 1; transform: scale(1); } }
-    @keyframes res { 0%, 76% { opacity: 0; transform: translateY(12px); } 80%, 100% { opacity: 1; transform: none; } }
-
+    @keyframes type1 { 0%, 6% { transform: translateX(0); animation-timing-function: steps(68, end); } 16%, 100% { transform: translateX(856.8px); } }
+    @keyframes type2 { 0%, 16% { transform: translateX(0); animation-timing-function: steps(73, end); } 26%, 100% { transform: translateX(919.8px); } }
+    @keyframes caret1 { 0%, 15.9% { opacity: 1; } 16%, 100% { opacity: 0; } }
+    @keyframes caret2 { 0%, 15.9% { opacity: 0; } 16%, 100% { opacity: 1; } }
+    @keyframes res { 0%, 74% { opacity: 0; transform: translateY(12px); } 78%, 100% { opacity: 1; transform: none; } }
+    @keyframes lane1 { 0%, 25.5% { opacity: 0; transform: translateY(14px); } 28.5%, 100% { opacity: 1; transform: none; } }
+    @keyframes bar1 { 0%, 33.0% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 64.2%, 100% { transform: scaleX(1); } }
+    @keyframes check1 { 0%, 64.2% { opacity: 0; transform: scale(.4); } 66.2% { opacity: 1; transform: scale(1.18); } 68.2%, 100% { opacity: 1; transform: scale(1); } }
+    @keyframes lane2 { 0%, 27.0% { opacity: 0; transform: translateY(14px); } 30.0%, 100% { opacity: 1; transform: none; } }
+    @keyframes bar2 { 0%, 33.0% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 60.0%, 100% { transform: scaleX(1); } }
+    @keyframes check2 { 0%, 60.0% { opacity: 0; transform: scale(.4); } 62.0% { opacity: 1; transform: scale(1.18); } 64.0%, 100% { opacity: 1; transform: scale(1); } }
+    @keyframes lane3 { 0%, 28.5% { opacity: 0; transform: translateY(14px); } 31.5%, 100% { opacity: 1; transform: none; } }
+    @keyframes bar3 { 0%, 33.0% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 63.2%, 100% { transform: scaleX(1); } }
+    @keyframes check3 { 0%, 63.2% { opacity: 0; transform: scale(.4); } 65.2% { opacity: 1; transform: scale(1.18); } 67.2%, 100% { opacity: 1; transform: scale(1); } }
+    @keyframes lane4 { 0%, 30.0% { opacity: 0; transform: translateY(14px); } 33.0%, 100% { opacity: 1; transform: none; } }
+    @keyframes bar4 { 0%, 33.0% { transform: scaleX(0); animation-timing-function: cubic-bezier(.45,.05,.55,.95); } 55.5%, 100% { transform: scaleX(1); } }
+    @keyframes check4 { 0%, 55.5% { opacity: 0; transform: scale(.4); } 57.5% { opacity: 1; transform: scale(1.18); } 59.5%, 100% { opacity: 1; transform: scale(1); } }
+    @keyframes laneM { 0%, 30% { opacity: 0; transform: translateY(14px); } 33%, 100% { opacity: 1; transform: none; } }
+    @keyframes seal0 { 0%, 51.8% { fill: #3a2718; } 53.3%, 100% { fill: #d9a441; } }
+    @keyframes seal1 { 0%, 55.0% { fill: #3a2718; } 56.5%, 100% { fill: #d9a441; } }
+    @keyframes seal2 { 0%, 55.8% { fill: #3a2718; } 57.3%, 100% { fill: #d9a441; } }
+    @keyframes seal3 { 0%, 57.6% { fill: #3a2718; } 59.1%, 100% { fill: #d9a441; } }
+    @keyframes seal4 { 0%, 57.6% { fill: #3a2718; } 59.1%, 100% { fill: #d9a441; } }
+    @keyframes seal5 { 0%, 57.8% { fill: #3a2718; } 59.3%, 100% { fill: #d9a441; } }
+    @keyframes seal6 { 0%, 60.9% { fill: #3a2718; } 62.4%, 100% { fill: #d9a441; } }
+    @keyframes seal7 { 0%, 62.3% { fill: #3a2718; } 63.8%, 100% { fill: #d9a441; } }
+    @keyframes seal8 { 0%, 62.3% { fill: #3a2718; } 63.8%, 100% { fill: #d9a441; } }
+    @keyframes seal9 { 0%, 62.5% { fill: #3a2718; } 64.0%, 100% { fill: #d9a441; } }
+    @keyframes seal10 { 0%, 63.9% { fill: #3a2718; } 65.4%, 100% { fill: #d9a441; } }
+    @keyframes seal11 { 0%, 64.3% { fill: #3a2718; } 65.8%, 100% { fill: #d9a441; } }
+    @keyframes seal12 { 0%, 65.7% { fill: #3a2718; } 67.2%, 100% { fill: #d9a441; } }
+    @keyframes seal13 { 0%, 67.1% { fill: #3a2718; } 68.6%, 100% { fill: #d9a441; } }
+    @keyframes seal14 { 0%, 67.2% { fill: #3a2718; } 68.7%, 100% { fill: #d9a441; } }
+    @keyframes seal15 { 0%, 67.5% { fill: #3a2718; } 69.0%, 100% { fill: #d9a441; } }
+    @keyframes seal16 { 0%, 69.0% { fill: #3a2718; } 70.5%, 100% { fill: #d9a441; } }
     @media (prefers-reduced-motion: reduce) {
       .anim { animation: none; }
-      .caret, .waiting, .cover { display: none; }
+      .cover { display: none; }
     }
   </style>
 
-  <rect width="1200" height="648" rx="28" fill="url(#stage)"/>
-  <rect x="0.5" y="0.5" width="1199" height="647" rx="27.5" fill="none" stroke="#4a3420"/>
+  <rect width="1200" height="740" rx="28" fill="url(#stage)"/>
+  <rect x="0.5" y="0.5" width="1199" height="739" rx="27.5" fill="none" stroke="#4a3420"/>
 
   <g class="anim scene">
     <text class="caption anim cap" x="64" y="70">A REAL RUN, REPLAYED</text>
     <text class="caption anim cap" x="1136" y="70" text-anchor="end" style="fill:#6a5540">TIMES COMPRESSED</text>
 
-    <!-- The request -->
     <g class="anim box">
-      <rect x="64" y="96" width="1072" height="76" rx="18" fill="#1a0f0b" stroke="#3d2b1d"/>
-      <text class="mono prompt" x="96" y="142">› Add monthly interest, CSV export, daily limits, and a CLI that uses them.</text>
-      <g clip-path="url(#promptClip)">
-        <g class="anim cover">
-          <rect x="121.2" y="108" width="1010" height="52" fill="#1a0f0b"/>
-          <rect class="caret" x="122.2" y="122" width="2" height="26" fill="#f3e8d6"/>
-        </g>
-      </g>
+      <rect x="64" y="96" width="1072" height="98" rx="18" fill="#1a0f0b" stroke="#3d2b1d"/>
+      <text class="mono prompt" x="96" y="136">› Extend the ledger: interest, overdrafts, daily limits, budgets, tax,</text>
+      <text class="mono prompt" x="121.2" y="170">CSV and JSON export, audits, statements, recurring deposits, and 11 more.</text>
+      <g clip-path="url(#line1)"><g class="anim t1 cover">
+        <rect x="121.2" y="112" width="1010" height="34" fill="#1a0f0b"/>
+        <rect class="anim caret1" x="122.2" y="116" width="2" height="26" fill="#f3e8d6"/>
+      </g></g>
+      <g clip-path="url(#line2)"><g class="anim t2 cover">
+        <rect x="121.2" y="146" width="1010" height="34" fill="#1a0f0b"/>
+        <rect class="anim caret2" x="122.2" y="150" width="2" height="26" fill="#f3e8d6"/>
+      </g></g>
     </g>
 
-    <!-- Lane 1: Vega, OpenCode, interest -->
-    <g class="anim l1 fb">
-      <text class="handle" x="96" y="232">Vega</text>
-      <text class="harness" x="96" y="256" fill="#e2575f">OpenCode</text>
-      <text class="task" x="262" y="232">Monthly interest</text>
-      <text class="mono path" x="262" y="256">ledger/interest.py</text>
-      <rect x="500" y="236" width="530" height="8" rx="4" fill="#2e1d14"/>
-      <rect class="anim b1 fb left" x="500" y="236" width="530" height="8" rx="4" fill="#c8323b"/>
-      <g class="anim c1 fb center">
-        <circle cx="1078" cy="240" r="17" fill="#d9a441"/>
-        <path d="M1070 240.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <g class="anim fb" style="animation-name:lane1">
+      <text class="handle" x="96" y="254">Vega</text>
+      <text class="harness" x="96" y="278">Codex</text>
+      <text class="task" x="262" y="254">Monthly interest</text>
+      <text class="mono path" x="262" y="278">ledger/interest.py</text>
+      <rect x="520" y="258" width="510" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim fb left" style="animation-name:bar1" x="520" y="258" width="510" height="8" rx="4" fill="#d9a441"/>
+      <g class="anim fb center" style="animation-name:check1">
+        <circle cx="1078" cy="262" r="17" fill="#d9a441"/>
+        <path d="M1070 262.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
-
-    <!-- Lane 2: Rigel, Codex, export -->
-    <g class="anim l2 fb">
-      <text class="handle" x="96" y="316">Rigel</text>
-      <text class="harness" x="96" y="340" fill="#e6b75f">Codex</text>
-      <text class="task" x="262" y="316">CSV export</text>
-      <text class="mono path" x="262" y="340">ledger/export.py</text>
-      <rect x="500" y="320" width="530" height="8" rx="4" fill="#2e1d14"/>
-      <rect class="anim b2 fb left" x="500" y="320" width="530" height="8" rx="4" fill="#d9a441"/>
-      <g class="anim c2 fb center">
-        <circle cx="1078" cy="324" r="17" fill="#d9a441"/>
-        <path d="M1070 324.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <g class="anim fb" style="animation-name:lane2">
+      <text class="handle" x="96" y="334">Rigel</text>
+      <text class="harness" x="96" y="358">Codex</text>
+      <text class="task" x="262" y="334">CSV export</text>
+      <text class="mono path" x="262" y="358">ledger/export.py</text>
+      <rect x="520" y="338" width="510" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim fb left" style="animation-name:bar2" x="520" y="338" width="510" height="8" rx="4" fill="#d9a441"/>
+      <g class="anim fb center" style="animation-name:check2">
+        <circle cx="1078" cy="342" r="17" fill="#d9a441"/>
+        <path d="M1070 342.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
-
-    <!-- Lane 3: Altair, OpenCode, limits -->
-    <g class="anim l3 fb">
-      <text class="handle" x="96" y="400">Altair</text>
-      <text class="harness" x="96" y="424" fill="#e2575f">OpenCode</text>
-      <text class="task" x="262" y="400">Daily limits</text>
-      <text class="mono path" x="262" y="424">ledger/limits.py</text>
-      <rect x="500" y="404" width="530" height="8" rx="4" fill="#2e1d14"/>
-      <rect class="anim b3 fb left" x="500" y="404" width="530" height="8" rx="4" fill="#c8323b"/>
-      <g class="anim c3 fb center">
-        <circle cx="1078" cy="408" r="17" fill="#d9a441"/>
-        <path d="M1070 408.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <g class="anim fb" style="animation-name:lane3">
+      <text class="handle" x="96" y="414">Altair</text>
+      <text class="harness" x="96" y="438">Codex</text>
+      <text class="task" x="262" y="414">Daily limits</text>
+      <text class="mono path" x="262" y="438">ledger/limits.py</text>
+      <rect x="520" y="418" width="510" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim fb left" style="animation-name:bar3" x="520" y="418" width="510" height="8" rx="4" fill="#d9a441"/>
+      <g class="anim fb center" style="animation-name:check3">
+        <circle cx="1078" cy="422" r="17" fill="#d9a441"/>
+        <path d="M1070 422.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
-
-    <!-- Lane 4: Lyra, Codex, CLI, which depends on interest and export -->
-    <g class="anim l4 fb">
-      <text class="handle" x="96" y="484">Lyra</text>
-      <text class="harness" x="96" y="508" fill="#e6b75f">Codex</text>
-      <text class="task" x="262" y="484">Command-line tool</text>
-      <text class="mono path" x="262" y="508">ledger/cli.py</text>
-      <rect x="500" y="488" width="530" height="8" rx="4" fill="#2e1d14"/>
-      <text class="wait anim waiting" x="500" y="476">waits for interest and export</text>
-      <rect class="anim b4 fb left" x="500" y="488" width="530" height="8" rx="4" fill="#d9a441"/>
-      <g class="anim c4 fb center">
-        <circle cx="1078" cy="492" r="17" fill="#d9a441"/>
-        <path d="M1070 492.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <g class="anim fb" style="animation-name:lane4">
+      <text class="handle" x="96" y="574">Sirius 2</text>
+      <text class="harness" x="96" y="598">Codex</text>
+      <text class="task" x="262" y="574">Money formatting</text>
+      <text class="mono path" x="262" y="598">ledger/money_format.py</text>
+      <rect x="520" y="578" width="510" height="8" rx="4" fill="#2e1d14"/>
+      <rect class="anim fb left" style="animation-name:bar4" x="520" y="578" width="510" height="8" rx="4" fill="#d9a441"/>
+      <g class="anim fb center" style="animation-name:check4">
+        <circle cx="1078" cy="582" r="17" fill="#d9a441"/>
+        <path d="M1070 582.5 l5.5 5.5 l10.5 -11" fill="none" stroke="#3a1206" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
     </g>
+    <g class="anim fb" style="animation-name:laneM">
+      <text class="handle" x="96" y="494">17 more</text>
+      <text class="harness" x="96" y="518">agents, Codex</text>
+      <text class="task" x="262" y="494">Overdrafts, budgets,</text>
+      <text class="task" x="262" y="518" style="font-size:17px;fill:#b39b7c">tax, audits, and more</text>
+      <circle class="anim" style="animation-name:seal0" cx="520.0" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal1" cx="551.9" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal2" cx="583.8" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal3" cx="615.6" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal4" cx="647.5" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal5" cx="679.4" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal6" cx="711.2" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal7" cx="743.1" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal8" cx="775.0" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal9" cx="806.9" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal10" cx="838.8" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal11" cx="870.6" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal12" cx="902.5" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal13" cx="934.4" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal14" cx="966.2" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal15" cx="998.1" cy="502" r="7" fill="#d9a441"/><circle class="anim" style="animation-name:seal16" cx="1030.0" cy="502" r="7" fill="#d9a441"/>
+    </g>
 
-    <!-- One branch -->
     <g class="anim res fb">
-      <rect x="64" y="544" width="1072" height="56" rx="16" fill="#241208" stroke="#7a5427"/>
-      <text x="600" y="579" text-anchor="middle"><tspan class="result">One branch to review</tspan><tspan class="result-dim">   ·   5 of 5 checks passed on the merged code   ·   122 s faster than serial</tspan></text>
+      <rect x="64" y="630" width="1072" height="56" rx="16" fill="#241208" stroke="#7a5427"/>
+      <text x="600" y="665" text-anchor="middle"><tspan class="result">One branch to review</tspan><tspan class="result-dim">   ·   21 of 21 checks passed   ·   16× faster than one at a time</tspan></text>
     </g>
   </g>
 </svg>

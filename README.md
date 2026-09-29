@@ -26,16 +26,17 @@ attached.
 
 <br>
 
-## One order, four agents
+## One order, twenty-one agents
 
 <p align="center">
-  <img src="docs/assets/factory.svg" alt="One sentence becomes four agents on two harnesses. The command-line tool waits for the two features it depends on. Every result is checked, and everything merges into one branch." width="100%">
+  <img src="docs/assets/factory.svg" alt="A long order to extend a ledger with twenty-one features becomes twenty-one Codex agents working at once. Every result is checked, and everything merges into one branch: twenty-one of twenty-one checks passed, sixteen times faster than one at a time." width="100%">
 </p>
 
-This is a real run, replayed. One sentence became four pieces of work, shared
-between two harnesses, OpenCode and Codex. The piece that depended on two
-others waited for them. Every result was checked on its own, then checked again
-once merged, and the whole job came back as a single branch.
+This is a real run, replayed. One long order became twenty-one pieces of work,
+each handed to its own agent, all running at the same time. Every result was
+checked on its own, then again once merged, and the whole job came back as one
+branch: 21 of 21 checks passed, sixteen times faster than running the agents
+one at a time.
 
 You never left the conversation, opened an agent's window, or wrote a line of
 configuration.
