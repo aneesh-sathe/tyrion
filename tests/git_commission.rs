@@ -576,6 +576,50 @@ fn a_misspelled_mandate_field_is_refused_rather_than_ignored() {
 }
 
 #[test]
+fn concurrent_workers_never_exhaust_docker_address_pools() {
+    let fixture = ParallelFixture::new();
+    // Every Worker gets an internal bridge and an egress bridge. Docker's own
+    // pool holds only about 30 networks, so at scale Tyrion must place every
+    // network in a subnet of its own choosing. Here the pool holds one, and a
+    // foreign network already sits on the first subnet Tyrion would try.
+    let mut config: Value = serde_json::from_slice(&fs::read(&fixture.runtime).unwrap()).unwrap();
+    config["egress"] = json!({"destinations": [{"host": "chatgpt.com", "port": 443}]});
+    fs::write(
+        &fixture.runtime,
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    fs::write(fixture.fake_state.join("address-pool-size"), "1").unwrap();
+    let foreign = fixture.fake_state.join("networks/foreign");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("subnet"), "10.213.0.0/28\n").unwrap();
+
+    let daemon = RunningDaemon::start(&fixture.data_dir, &fixture.runtime, &fixture.fake_state);
+    let attachment_token = connect_full_entry(&daemon);
+    let proposal = fixture.temp.path().join("parallel.json");
+    write_parallel_git_proposal(
+        &proposal,
+        &fixture.principal_checkout,
+        &fixture.base_revision,
+    );
+    let commission_id = create_and_accept(&daemon, &attachment_token, &proposal);
+    let completed = wait_for_completion(&daemon, &attachment_token, &commission_id);
+    assert_eq!(completed["commission"]["status"], "verified_complete");
+
+    // Concurrent Workers can interleave within one log line, so count the
+    // commands themselves rather than lines.
+    let log = fs::read_to_string(fixture.fake_state.join("commands.log")).unwrap();
+    let creates = log.matches("network create").count();
+    let explicit = log.matches("network create --internal --subnet").count()
+        + log.matches("network create --subnet").count();
+    assert!(
+        creates >= 4,
+        "two Workers need four networks, saw {creates}"
+    );
+    assert_eq!(explicit, creates, "every network needs an explicit subnet");
+}
+
+#[test]
 fn contained_codex_result_is_verified_integrated_and_verified_again() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let principal_checkout = temp.path().join("principal-checkout");

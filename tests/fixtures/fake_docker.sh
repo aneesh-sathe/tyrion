@@ -263,7 +263,28 @@ case "$operation" in
         case "$action" in
             create)
                 name=${*: -1}
+                subnet=
+                previous=
+                for argument in "$@"; do
+                    [[ $previous == --subnet ]] && subnet=$argument
+                    previous=$argument
+                done
+                # Real Docker draws a network without --subnet from a small
+                # predefined pool (about 30 on Docker Desktop) and refuses
+                # an explicit subnet that overlaps one already in use.
+                if [[ -z $subnet ]]; then
+                    pool=$(cat "$state/address-pool-size" 2>/dev/null || echo 30)
+                    drawn=$(find "$state/networks" -mindepth 1 -maxdepth 1 -type d ! -exec test -e '{}/subnet' ';' -print | wc -l)
+                    if ((drawn >= pool)); then
+                        printf '%s\n' 'Error response from daemon: all predefined address pools have been fully subnetted' >&2
+                        exit 1
+                    fi
+                elif grep -qxF "$subnet" "$state"/networks/*/subnet 2>/dev/null; then
+                    printf '%s\n' 'Error response from daemon: Pool overlaps with other one on this address space' >&2
+                    exit 1
+                fi
                 mkdir -p "$state/networks/$name"
+                [[ -z $subnet ]] || printf '%s\n' "$subnet" >"$state/networks/$name/subnet"
                 printf '%s\n' "$name"
                 ;;
             connect) printf '\n' ;;

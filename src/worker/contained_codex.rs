@@ -240,6 +240,7 @@ pub(super) struct ContainedCodexRuntime {
     fingerprint: String,
     host: HostCapacity,
     cpus: CpuAllocator,
+    subnets: SubnetAllocator,
 }
 
 /// Containers currently pinned to each CPU the container runtime really has.
@@ -247,6 +248,35 @@ pub(super) struct ContainedCodexRuntime {
 /// CPUs of its own; when the Principal declares more CPUs than exist, Workers
 /// share real ones evenly. It is sized by the real count, never the declared
 /// one, because Docker refuses a CPU that does not exist.
+/// Subnets for Attempt networks, chosen by Tyrion. Docker's predefined pool
+/// holds only about thirty networks, and every Worker with egress needs two,
+/// so without explicit subnets the sixteenth concurrent Worker cannot start.
+/// A /28 holds a Worker and its relays; the /16 below holds 4096 of them.
+#[derive(Default)]
+struct SubnetAllocator(Mutex<std::collections::BTreeSet<u32>>);
+
+const SUBNET_SLOTS: u32 = 4096;
+
+impl SubnetAllocator {
+    fn cidr(slot: u32) -> String {
+        format!("10.213.{}.{}/28", slot / 16, (slot % 16) * 16)
+    }
+
+    /// Reserve the lowest free slot, or none when every slot is in use.
+    fn reserve(&self) -> Option<u32> {
+        let mut used = self.0.lock().ok()?;
+        let slot = (0..SUBNET_SLOTS).find(|slot| !used.contains(slot))?;
+        used.insert(slot);
+        Some(slot)
+    }
+
+    fn release(&self, slot: u32) {
+        if let Ok(mut used) = self.0.lock() {
+            used.remove(&slot);
+        }
+    }
+}
+
 struct CpuAllocator(Mutex<Vec<u32>>);
 
 impl CpuAllocator {
@@ -457,6 +487,7 @@ impl ContainedCodexRuntime {
         let fingerprint = format!("{:x}", Sha256::digest(&encoded));
         Ok(Self {
             cpus: CpuAllocator::new(real_cpus),
+            subnets: SubnetAllocator::default(),
             config,
             data_dir: data_dir.to_owned(),
             fingerprint,
@@ -1868,6 +1899,7 @@ struct AttemptNetwork<'a> {
     egress: String,
     relays: Vec<String>,
     aliases: Vec<String>,
+    subnets: Vec<u32>,
 }
 
 impl<'a> AttemptNetwork<'a> {
@@ -1885,6 +1917,7 @@ impl<'a> AttemptNetwork<'a> {
             egress: format!("{name}-out"),
             relays: Vec::new(),
             aliases: Vec::new(),
+            subnets: Vec::new(),
         };
         if let Err(error) = network.build(&label, destinations, deadline) {
             let _ = network.remove();
@@ -1899,21 +1932,10 @@ impl<'a> AttemptNetwork<'a> {
         destinations: &[&EgressDestination],
         deadline: i64,
     ) -> Result<(), TyrionError> {
-        self.runtime.docker_checked(
-            &[
-                "network",
-                "create",
-                "--internal",
-                "--label",
-                label,
-                &self.internal,
-            ],
-            deadline,
-        )?;
-        self.runtime.docker_checked(
-            &["network", "create", "--label", label, &self.egress],
-            deadline,
-        )?;
+        let internal = self.internal.clone();
+        let egress = self.egress.clone();
+        self.create_network(&["--internal"], label, &internal, deadline)?;
+        self.create_network(&[], label, &egress, deadline)?;
         for (index, destination) in destinations.iter().enumerate() {
             let relay = format!("{}-r{index}", self.internal);
             let port = destination.port.to_string();
@@ -2003,6 +2025,52 @@ impl<'a> AttemptNetwork<'a> {
         self.aliases.iter().map(String::as_str).collect()
     }
 
+    /// Create one network in a subnet Tyrion chose. A subnet another network
+    /// already holds, perhaps one Tyrion does not own, stays reserved and the
+    /// next free one is tried.
+    fn create_network(
+        &mut self,
+        flags: &[&str],
+        label: &str,
+        name: &str,
+        deadline: i64,
+    ) -> Result<(), TyrionError> {
+        let allocator = &self.runtime.subnets;
+        let mut taken_elsewhere = Vec::new();
+        let result = loop {
+            let Some(slot) = allocator.reserve() else {
+                break Err(TyrionError::InvalidRequest(
+                    "every Attempt network subnet in 10.213.0.0/16 is in use".into(),
+                ));
+            };
+            let cidr = SubnetAllocator::cidr(slot);
+            let mut arguments = vec!["network", "create"];
+            arguments.extend_from_slice(flags);
+            arguments.extend_from_slice(&["--subnet", &cidr, "--label", label, name]);
+            let output = self.runtime.docker(&arguments, deadline)?;
+            if output.status.success() {
+                self.subnets.push(slot);
+                break Ok(());
+            }
+            if String::from_utf8_lossy(&output.stderr).contains("overlaps") {
+                taken_elsewhere.push(slot);
+                continue;
+            }
+            allocator.release(slot);
+            break Err(command_failure(
+                "Docker network creation",
+                output.status,
+                &output.stderr,
+            ));
+        };
+        // Subnets held by someone else are released once this call is done,
+        // so a later Attempt can retry them after they are freed.
+        for slot in taken_elsewhere {
+            allocator.release(slot);
+        }
+        result
+    }
+
     fn delete(mut self) -> Result<(), TyrionError> {
         self.remove()
     }
@@ -2023,6 +2091,9 @@ impl<'a> AttemptNetwork<'a> {
                     &output.stderr,
                 ));
             }
+        }
+        for slot in std::mem::take(&mut self.subnets) {
+            self.runtime.subnets.release(slot);
         }
         Ok(())
     }
