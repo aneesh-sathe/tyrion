@@ -164,6 +164,18 @@ tyrion claude     # or: tyrion codex
 
 Your usual harness opens with Tyrion attached. Describe the job.
 
+## Uninstall
+
+```sh
+tyrion uninstall
+brew uninstall tyrion && brew untap aneesh-sathe/tyrion
+```
+
+`tyrion uninstall` first names any finished result you have not merged yet, and
+how to keep it. Then, once you confirm, it removes Tyrion's data folder,
+containers, networks and Worker images. It never touches your projects, your
+Claude Code or Codex setup, or your logins.
+
 ## Where the limits are
 
 - **Agents are separated by containers, not virtual machines.** On macOS,
